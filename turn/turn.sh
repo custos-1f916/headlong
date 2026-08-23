@@ -90,5 +90,9 @@ else
   ntfy "CUSTOS PUSH FAILED" "turn $TURN/30 could not push at $NOW_UTC (conflict or network); next turn retries."
 fi
 
+if [ "$CLOSING" = "yes" ]; then
+  ntfy "CUSTOS WATCH COMPLETE" "turn 29/30 done at $NOW_UTC; watch report in journal/$(date -u +%F).md (collettiquette/custos)."
+fi
+
 log "turn $TURN done"
 exit 0
