@@ -1,7 +1,7 @@
 #!/bin/sh
 # /opt/custos/turn.sh — Custos night-watch entrypoint (fired by cron).
-# Deliberately dumb: window guard, flock (no overlap), git sync, one pi turn,
-# commit+push, watch log. The discipline of a turn lives in the repo's
+# Deliberately dumb: window guard, flock (no overlap), git sync, one pi turn
+# (no slot cap; dawn backstop only), commit+push, watch log. The discipline of a turn lives in the repo's
 # AGENTS.md — so the persona can evolve in-repo without touching this file.
 set -u
 
@@ -11,7 +11,16 @@ REPO=/opt/custos/repo
 LOGDIR=/var/log/custos
 LOCK=/var/lock/custos-turn.lock
 PI=/opt/node/bin/pi
-TURN_TIMEOUT=540   # 9 min < 10-min period: a live turn can never outgrow its slot
+
+# --- turn budget: no per-slot cap. Cron keeps firing every 10 min, but the
+# flock makes those fires skip while a turn is live, so a long turn simply
+# absorbs the following slots. The only cut is the dawn backstop: nothing
+# survives past 05:30 local, so a wedged pi (hung socket, stuck read) can
+# cost at most the rest of the night — never johan's day, never the flock
+# into the next night.
+DAWN=$(date -d "$(date +%F) 05:30" +%s)
+TURN_TIMEOUT=$(( DAWN - $(date +%s) ))
+[ "$TURN_TIMEOUT" -lt 300 ] && TURN_TIMEOUT=300   # floor for manual late fires
 
 mkdir -p "$LOGDIR" "$REPO/.state"
 ts()  { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
@@ -45,7 +54,7 @@ NOW_UTC=$(date -u '+%Y-%m-%d %H:%M UTC')
 NOW_LOCAL=$(date '+%Y-%m-%d %H:%M %Z')
 TLG="$LOGDIR/turn-$(date -u +%Y%m%d-%H%M).log"
 
-log "turn $TURN/30 start (closing=$CLOSING, $NOW_UTC)"
+log "turn $TURN/30 start (closing=$CLOSING, budget=${TURN_TIMEOUT}s, $NOW_UTC)"
 log "pi: $("$PI" --version 2>/dev/null | head -1) ($PI)"
 cd "$REPO"
 
@@ -61,13 +70,13 @@ fi
 
 # --- the turn: one line; AGENTS.md in the cwd carries the rest ---------------
 PROMPT="Night watch, turn $TURN of 30; closing watch: $CLOSING. It is $NOW_UTC ($NOW_LOCAL). Read AGENTS.md and follow it."
-if timeout "$TURN_TIMEOUT" "$PI" -p "$PROMPT" --provider ninfer --model qwen3.8-27b \
+if timeout -k 30 "$TURN_TIMEOUT" "$PI" -p "$PROMPT" --provider ninfer --model qwen3.8-27b \
      --mode text --no-session --offline >> "$TLG" 2>&1; then
   log "turn $TURN pi ok"
 else
   RC=$?
-  if [ "$RC" = "124" ]; then
-    log "turn $TURN TIMED OUT"; ntfy "CUSTOS TURN TIMEOUT" "turn $TURN/30 timed out after ${TURN_TIMEOUT}s at $NOW_UTC; next fire retries."
+  if [ "$RC" = "124" ] || [ "$RC" = "137" ]; then
+    log "turn $TURN HIT DAWN BACKSTOP (rc=$RC after ${TURN_TIMEOUT}s)"; ntfy "CUSTOS DAWN BACKSTOP" "turn $TURN/30 was cut at the 05:30 backstop (started with ${TURN_TIMEOUT}s, rc=$RC). Either deep work ran to dawn or pi wedged; check /var/log/custos on LXC 122."
   else
     log "turn $TURN pi rc=$RC"; ntfy "CUSTOS TURN FAILED" "turn $TURN/30 exited rc=$RC at $NOW_UTC; see /var/log/custos on LXC 122."
   fi

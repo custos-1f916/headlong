@@ -7,7 +7,7 @@ locations; the repo is the source of truth.
 
 | File | Active location | Purpose |
 |---|---|---|
-| `turn.sh` | `/opt/custos/turn.sh` | cron entrypoint: window guard → flock (no overlap) → git pull → one `pi -p` turn (9-min timeout) → commit+push → watch log |
+| `turn.sh` | `/opt/custos/turn.sh` | cron entrypoint: window guard → flock (no overlap) → git pull → one `pi -p` turn (no slot cap — a working turn absorbs later fires; hard dawn backstop at 05:30 local) → commit+push → watch log |
 | `cron.custos` | `/etc/cron.d/custos` | `*/10 0-4 * * *` — 30 turns/night, 00:00–04:50 local |
 | `models.json` | `/root/.pi/agent/models.json` | pi provider `ninfer` → johan `:8080/v1`, model `qwen3.8-27b` (128K ctx) |
 | `settings.json` | `/root/.pi/agent/settings.json` | defaults: provider ninfer, thinking medium, no telemetry |
@@ -50,11 +50,19 @@ $SSH 'sudo -n pct exec 122 -- sh /opt/custos/bootstrap.sh'
 ## Troubleshooting
 
 - `turns.log` says `skip: previous turn still running` — the flock is held;
-  check `/var/log/custos/turn-*.log` for the in-flight turn. It ends by
-  timeout at 9 min. If a stale lock file is the cause (turn.sh crashed
+  check `/var/log/custos/turn-*.log` for the in-flight turn. Since the
+  slot cap was removed (2026-08-23) this is normal during deep work: a live
+  turn holds the lock as long as it needs and later fires yield; the only
+  cut is the 05:30-local dawn backstop. Consequence to know: a turn that
+  runs through 04:50 absorbs the closing-watch fire, so that night gets no
+  seal/watch report — the next closing watch reconciles. If a stale lock
+  file is the cause (turn.sh crashed
   hard), the lock is on an fd of a live process — nothing to clean by hand.
-- `pi rc=124` — timed out; the turn was cut mid-work. The journal entry the
-  agent wrote (if any) says where it stopped; the next turn picks up.
+- `rc=124`/`137` (`HIT DAWN BACKSTOP` in turns.log) — the turn ran to the
+  05:30 hard stop: either dawn-adjacent deep work, or pi wedged (hung
+  socket) and held the flock for the rest of the night — check when the
+  turn started. The journal entry the agent wrote (if any) says where it
+  stopped; the next night picks up.
 - `push FAILED` — usually the Mac committed in the same second; the next
   turn's `git pull --rebase` resolves it. Persistent failures: check the
   deploy key (`ssh -i /opt/custos/git-deploy.key -T git@github.com`).
