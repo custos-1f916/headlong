@@ -6,6 +6,7 @@
 set -u
 
 export PATH=/opt/node/bin:$PATH   # pi's launcher needs node on PATH (cron + manual fires)
+export GIT_SSH_COMMAND="ssh -i /opt/custos/git-deploy.key -o StrictHostKeyChecking=no"  # in-turn pull/push
 REPO=/opt/custos/repo
 LOGDIR=/var/log/custos
 LOCK=/var/lock/custos-turn.lock
