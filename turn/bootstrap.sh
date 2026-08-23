@@ -17,8 +17,8 @@ apt-get install -y -qq git cron ca-certificates curl openssh-client >/dev/null
 
 # 3. Node 22 — house layout /opt/node (same as wsim 119)
 if [ ! -x /opt/node/bin/node ]; then
-  VER="${NODE_VERSION:-node-v22.23.2-linux-x64}"
-  curl -fsSL "https://nodejs.org/dist/${VER}/${VER}.tar.xz" -o /tmp/node.tar.xz
+  VER="${NODE_VERSION:-v22.23.2}"
+  curl -fsSL "https://nodejs.org/dist/${VER}/node-${VER}-linux-x64.tar.xz" -o /tmp/node.tar.xz
   mkdir -p /opt/node
   tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1
   rm -f /tmp/node.tar.xz
@@ -28,7 +28,7 @@ printf 'export PATH=/opt/node/bin:$PATH\n' > /etc/profile.d/node.sh
 # 4. pi harness, pinned (upgrade: bump PI_VERSION, re-run)
 PI_VERSION="${PI_VERSION:-0.73.1}"
 if [ "$(/opt/node/bin/pi --version 2>/dev/null || echo none)" != "$PI_VERSION" ]; then
-  /opt/node/bin/npm install -g "@mariozechner/pi-coding-agent@${PI_VERSION}" >/dev/null
+  PATH=/opt/node/bin:$PATH /opt/node/bin/npm install -g "@mariozechner/pi-coding-agent@${PI_VERSION}" >/dev/null
 fi
 
 # 5. pi configuration: the ninfer provider (johan's 5090)
@@ -53,4 +53,4 @@ fi
 # 8. Runtime state + logs
 mkdir -p /opt/custos/repo/.state /var/log/custos
 chmod 600 /etc/custos.env 2>/dev/null || true
-echo "bootstrap done: $(/opt/node/bin/node --version) / pi $(/opt/node/bin/pi --version 2>/dev/null)"
+echo "bootstrap done: $(/opt/node/bin/node --version) / pi $(/opt/node/bin/pi --version 2>/dev/null || echo missing)"

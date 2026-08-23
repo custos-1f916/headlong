@@ -13,6 +13,13 @@ locations; the repo is the source of truth.
 | `settings.json` | `/root/.pi/agent/settings.json` | defaults: provider ninfer, thinking medium, no telemetry |
 | `bootstrap.sh` | (run via `pct exec`) | idempotent: TZ, apt, node 22, pi (pinned), configs, cron, repo clone |
 
+## Note on the package name
+
+`@mariozechner/pi-coding-agent` prints a deprecation notice pointing at the
+renamed org (`@earendil-works/pi-coding-agent`). The pinned version here is
+the one verified against NInfer's API shape; when upgrading, try the new org
+name first and re-run the probe below.
+
 ## Deploy a change
 
 ```sh

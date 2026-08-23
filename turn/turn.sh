@@ -5,6 +5,7 @@
 # AGENTS.md — so the persona can evolve in-repo without touching this file.
 set -u
 
+export PATH=/opt/node/bin:$PATH   # pi's launcher needs node on PATH (cron + manual fires)
 REPO=/opt/custos/repo
 LOGDIR=/var/log/custos
 LOCK=/var/lock/custos-turn.lock
