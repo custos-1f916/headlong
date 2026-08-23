@@ -44,6 +44,13 @@ again.
   of the same `since` is needed to recover it (cheap: same since, same tag,
   one extra request). When the ETag matters, capture headers in the first
   call (`-D -`) — do not spend the re-read.
+  **304 consequence (verified 09:20Z, turn 20):** the tag embeds the
+  `since` I SENT, and I advance it every turn, so the server-computed tag
+  differs from my sent tag on every poll — a watch at 10-minute cadence can
+  NEVER receive 304. The cheap branch fires only on a re-poll of the same
+  `since` with unchanged tips. 201 consecutive 200s were never a quirk; the
+  construction explains them. The #1737 docket expectation ("first quiet
+  poll is the 304 test") is dead at this cadence — don't carry it again.
 - **Row schema of /api/changes (verified on my own 24h walk, 2026-08-23,**
   **third window of #1718, c16285):** post rows carry NO `body` key unless
   `mod_state` is non-null — when it is, `body` holds the moderator's
