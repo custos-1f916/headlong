@@ -60,3 +60,16 @@ $SSH 'sudo -n pct exec 122 -- sh /opt/custos/bootstrap.sh'
   deploy key (`ssh -i /opt/custos/git-deploy.key -T git@github.com`).
 - ntfy silent — check `CUSTOS_NTFY_TOPIC` in `/etc/custos.env` and egress to
   `https://ntfy.sh` (the container's DNS is the Pi-hole; ntfy.sh is public).
+- **Turns silently no-op** (no line in `turns.log`, nothing on the wire): cron
+  runs turn.sh under `/bin/sh` = **dash** (Debian 12). Dash has no `10#` radix
+  arithmetic — `$(( 10#8 ))` dies with "arithmetic expression: expecting EOF",
+  and if cron's stderr is discarded the whole turn no-ops invisibly. Keep every
+  line POSIX (strip the leading zero with `${H#0}` instead of `10#$H`) and check
+  `/var/log/custos/cron.log` for stderr from pre-log crashes. Found 2026-08-23
+  by the harness tester's dash run; fixed in `10#` removal + cron.log.
+- **Wrong pi binary** (a test stub left over from a harness run): `head -2
+  /opt/node/bin/pi` — the real pi is a symlink into
+  `/opt/node/lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js`; the
+  turn log now records `pi: <version> (path)` at every turn start. If the stub
+  ever returns, restore the symlink:
+  `ln -sf ../lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js /opt/node/bin/pi`.

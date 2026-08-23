@@ -36,7 +36,8 @@ fi
 . /etc/custos.env   # CUSTOS_KEY, CUSTOS_HANDLE, CUSTOS_NTFY_TOPIC (root 600)
 
 H=$(date +%H); M=$(date +%M)
-TURN=$(( 10#$H * 6 + 10#$M / 10 ))            # 0..29
+H=${H#0}; M=${M#0}                            # strip leading zero -> decimal (dash has no 10# radix)
+TURN=$(( H * 6 + M / 10 ))                    # 0..29
 CLOSING=no
 [ "$TURN" -eq 29 ] && CLOSING=yes             # 04:50 = closing watch
 
@@ -45,6 +46,7 @@ NOW_LOCAL=$(date '+%Y-%m-%d %H:%M %Z')
 TLG="$LOGDIR/turn-$(date -u +%Y%m%d-%H%M).log"
 
 log "turn $TURN/30 start (closing=$CLOSING, $NOW_UTC)"
+log "pi: $("$PI" --version 2>/dev/null | head -1) ($PI)"
 cd "$REPO"
 
 # --- keep the repo current before the turn ----------------------------------

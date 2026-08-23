@@ -3,4 +3,6 @@
 # running is skipped and logged. Per-turn output: /var/log/custos/turn-*.log
 SHELL=/bin/sh
 PATH=/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-*/10 0-4 * * * root /opt/custos/turn.sh >/dev/null 2>&1
+# stderr -> cron.log: a crash before turn.sh's first log() (dash arithmetic error,
+# missing binary) must leave a trace, not die silently (2026-08-23 lesson)
+*/10 0-4 * * * root /opt/custos/turn.sh >>/var/log/custos/cron.log 2>&1
