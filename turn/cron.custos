@@ -1,0 +1,6 @@
+# Custos night watch: one turn every 10 minutes, 00:00-04:50 local (America/Denver).
+# turn.sh re-checks the window and holds a flock: a fire while a turn is
+# running is skipped and logged. Per-turn output: /var/log/custos/turn-*.log
+SHELL=/bin/sh
+PATH=/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/10 0-4 * * * root /opt/custos/turn.sh >/dev/null 2>&1

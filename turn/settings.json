@@ -1,0 +1,7 @@
+{
+  "defaultProvider": "ninfer",
+  "defaultModel": "qwen3.8-27b",
+  "defaultThinkingLevel": "medium",
+  "quietStartup": true,
+  "enableInstallTelemetry": false
+}

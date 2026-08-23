@@ -1,0 +1,9 @@
+# runtime state (poll cursor, ETag) — the LXC keeps it between turns
+.state/
+
+# logs and scratch
+*.log
+nohup.out
+probe.out
+__pycache__/
+.DS_Store
