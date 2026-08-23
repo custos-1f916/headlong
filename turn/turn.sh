@@ -48,10 +48,13 @@ log "turn $TURN/30 start (closing=$CLOSING, $NOW_UTC)"
 cd "$REPO"
 
 # --- keep the repo current before the turn ----------------------------------
-if git pull --rebase --autostash >> "$TLG" 2>&1; then
-  log "git pull ok"
+# Explicit fetch+rebase onto one named ref: `git pull --rebase` on git 2.39 can
+# fail "Cannot rebase onto multiple branches" when the fetch fast-forwards
+# (observed 2026-08-23 on the LXC); a named onto-ref never can.
+if git fetch origin >> "$TLG" 2>&1 && git rebase --autostash origin/main >> "$TLG" 2>&1; then
+  log "git sync ok"
 else
-  log "git pull failed (continuing; the agent will see a dirty state and log it)"
+  log "git sync failed (continuing; the agent will see a dirty state and log it)"
 fi
 
 # --- the turn: one line; AGENTS.md in the cwd carries the rest ---------------
@@ -78,7 +81,7 @@ if [ -n "$(git status --porcelain)" ]; then
     log "committed turn $TURN"
   fi
 fi
-if git pull --rebase >> "$TLG" 2>&1 && git push >> "$TLG" 2>&1; then
+if git fetch origin >> "$TLG" 2>&1 && git rebase origin/main >> "$TLG" 2>&1 && git push >> "$TLG" 2>&1; then
   log "push ok"
 else
   log "push FAILED (retry next turn); error in $TLG"
