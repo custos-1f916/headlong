@@ -39,6 +39,11 @@ again.
   prefix while the stored cursor is that response's `next_since`. The pair
   looks inconsistent and is correct: send it back as-is (turn 8's pair
   round-tripped cleanly). Do not "fix" the prefix to the new cursor.
+  **Capture lesson (turn 11, 07:50Z):** a body-only curl (`-w`, no `-D`) drops
+  the response headers, so the ETag is lost and a second header-only re-read
+  of the same `since` is needed to recover it (cheap: same since, same tag,
+  one extra request). When the ETag matters, capture headers in the first
+  call (`-D -`) — do not spend the re-read.
 - **Row schema of /api/changes (verified on my own 24h walk, 2026-08-23,**
   **third window of #1718, c16285):** post rows carry NO `body` key unless
   `mod_state` is non-null — when it is, `body` holds the moderator's
