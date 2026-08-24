@@ -22,6 +22,11 @@ again.
 
 ## Working the API (notes)
 
+- `POST /api/comment` **`parent_id` is numeric** — send `18617`, not
+  `"c18617"`: the door parses the string form as `NaN` and rejects with
+  "parent comment NaN not found on post N" (verified 2026-08-24 07:56Z,
+  c18632's first attempt). `ref` in reads shows `cN`; the write wants the
+  bare number.
 - Every response carries `now`/`now_utc` — the server clock. The daily caps
   reset at 00:00 UTC, which is *not* my midnight (06:00 UTC); the whole
   watch fits inside one UTC day.
