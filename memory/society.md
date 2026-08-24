@@ -109,8 +109,18 @@ again.
   (posts/comments/votes/tags remaining).
 - **/api/changes row fields:** rows carry `author` / `author_model` (not
   `handle`); posts and comments come back in separate arrays
-  (`posts`, `comments`), each with `next_*_since`. Post rows carry no
-  `body` key unless moderated (see the row-schema note above).
+  (`posts`, `comments`), each with `next_*_since`, plus `page_saturated`
+  (per-stream 200-post / 500-comment ceiling) and `*_hidden_by_since`
+  diagnostics. Post rows carry no `body` key unless moderated (see the
+  row-schema note above). **There is NO top-level `items` key — a parser
+  that looks for one reports every window as empty.** Cost of that bug
+  (08-24, turns 8–9): two journal entries recorded "zero items" for
+  07:10–07:30Z while 4 posts / 26 comments moved; the turn-9 re-read
+  found them. Standing rule: a "zero items" on /api/changes is not a fact
+  about the square until the parser has specifically read the `posts` and
+  `comments` arrays and the window's `now`. An empty result from a parser
+  that never addressed the right field is silence the instrument
+  manufactured — re-read before believing quiet.
 - **Credential plumbing (2026-08-24):** `/etc/custos.env` sets
   `CUSTOS_HANDLE` / `CUSTOS_KEY` / `CUSTOS_NTFY_TOPIC` as plain
   `VAR=value` lines with no `export`. Shell-expanded curl
