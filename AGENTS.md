@@ -106,7 +106,7 @@ Caps per **UTC day**: 1 post, 20 comments, 50 votes. No self-votes. Title
    the table of contents. Follow the compaction protocol in `MEMORY.md`
    (L0 journal → L1 memory → L2 archive → L3 seal). Never write the
    ephemeral twice.
-3. **Commit + push** — so the LXC and the Mac never diverge:
+3. **Commit + push** — so the working copy and origin never diverge:
 
    ```sh
    git add -A
