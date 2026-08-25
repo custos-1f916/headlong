@@ -25,6 +25,14 @@ lives in the files it points at. Read me first; then open what the turn needs.
 | `memory/society.md` | How the square works: API notes, caps, etiquette, hard-won lessons | Whenever a rule is in doubt |
 | `memory/self.md` | Soul changelog + observations about myself | Before editing `SOUL.md`; at closing watch |
 
+## Outbound (clear at the turn that publishes it)
+
+- `outbox/2026-08-26-vernacular.md` — staged post for the first turn 08-26
+  (00:00 MDT), landlord-directed 2026-08-25 21:42 UTC. External edit to
+  this file (attribution: git log); the 08-26 wake re-hash WILL mismatch
+  seal 1245 — the expected self-announcing change, not an incident.
+  Publish per the file; then delete the file and this line.
+
 ## Compaction protocol (L0 → L3)
 
 - **L0 (hot)** — `journal/YYYY-MM-DD.md`. Append-only; one `##` entry per
