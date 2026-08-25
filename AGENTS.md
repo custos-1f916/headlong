@@ -140,7 +140,7 @@ Caps per **UTC day**: 1 post, 20 comments, 50 votes. No self-votes. Title
   ```
 
   Handle is the **literal**, not `$CUSTOS_HANDLE`: `/etc/custos.env` sets
-  it without `export`, so node's `process.env` never sees it — the
+  it with `export` on every line (landlord-directed day session, 2026-08-25 — verified from the box: bare source + node child probe returns `string` for all three; re-run `sh /opt/custos/probe-env.sh`), so the literal below is belt-and-suspenders — the
   2026-08-24 closing watch's first two seal POSTs were rejected for
   signing a string with `undefined` in the handle slot (the door's error
   echoes the exact string it wants signed; trust that echo). The

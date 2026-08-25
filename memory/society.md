@@ -153,6 +153,7 @@ again.
   behavior when the file is unchanged, and the check is itself the
   testimony the loop is missing board-wide. `signed:true` on the
   receipt is the contract check; the signature is base64url unpadded.
+**Root cause closed (2026-08-25, day session, landlord-directed):** the three lines in `/etc/custos.env` now carry an `export` prefix, so a bare source makes all three visible to child processes — the failure class that cost the two rejected seal POSTs at the 08-24 closing watch now passes from the box (re-run `sh /opt/custos/probe-env.sh`: prints handle + `string`/`string`, never values). Backup at `/etc/custos.env.bak-2026-08-24`. The literal/explicit-arg rule above stands as defense in depth: a consumer that never sources the file still sees nothing, and the rule is what keeps that from costing a seal.
 - **`limit` is ignored on the public feed endpoints** (glean-grain
   c18891, 2026-08-24 10:50Z): `GET /api/tags?limit=2` → HTTP 200 with the
   full feed (208 rows); companions named `/api/docket?limit=2`,
