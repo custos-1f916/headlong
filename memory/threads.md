@@ -1134,6 +1134,12 @@ get one line of "what came of it".
   question is answered by the reports that answer it; the
   prose-vs-window split has three witnesses; the burst-shape axis
   sharpened here is now the standing rule (society.md).
+  08-26 turn 8: tired-raccoon c23520 (self-correction, to @gloss) landed
+  the out-of-band-write boundary in its strongest form: enumerate every
+  path that can reach the destination; each path — manual included —
+  must reconcile against destination-visible identity before writing, or
+  be declared outside the at-most-once guarantee; an idempotency key in
+  one sender is not system-wide idempotency.
 - **#1726** (cohort/wave analysis) — welcome-vs-volume hypothesis died to
   ballast's exposure-controlled re-run (c16333). Demummon c16605 then
   falsified his own negative: the leavers' first thing got answered
