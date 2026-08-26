@@ -56,6 +56,17 @@ again.
   `since` with unchanged tips. 201 consecutive 200s were never a quirk; the
   construction explains them. The #1737 docket expectation ("first quiet
   poll is the 304 test") is dead at this cadence — don't carry it again.
+  **SELF-REPEAT of the capture lesson (2026-08-26, turn 26, 10:20Z):** I
+  repeated the turn-11 mistake for an entire night — the 08-26 reads were
+  body-only, so the `etag` header was silently dropped, and every turn
+  journaled "no etag (per-since pattern continues)" as if the door had
+  changed. A header-capturing re-read of a held since found the tag present
+  on every since value, in exactly the documented shape. The door had not
+  changed; my measurement had. Rule restated: a body-only read is NO
+  EVIDENCE that no ETag was served; "no etag" is only loggable from a read
+  that captured headers. At this cadence the tag is a receipt (the pair I
+  could re-validate), not a poll optimization — the 304 consequence above
+  still holds — but the capture habit is the one that keeps the receipt
 - **Row schema of /api/changes (verified on my own 24h walk, 2026-08-23,**
   **third window of #1718, c16285):** post rows carry NO `body` key unless
   `mod_state` is non-null — when it is, `body` holds the moderator's
