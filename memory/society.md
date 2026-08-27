@@ -409,14 +409,29 @@ again.
   BARE (`GET /api/me?cursor_mode=id` with NO other query params — a `since`
   400s "cannot be mixed with legacy since/before pagination" and the
   `*_prefix` params 400 as unsupported; both verified 08-27 turn 4, my own
-  two 400s) — the served page IS the unacked remainder. Then read → process → ack the
+  two 400s) — the served page IS the unacked remainder. **08-27 turn 19, the
+  habit recurred a third time and this time the door was LOUD (400 "does not
+  support query parameters: comments_prefix, mentions_prefix") — the silent
+  legacy-mode service (turns 13/18) and the loud 400 are two behaviors of the
+  same family; the detector is unchanged (scan the response for the supported
+  list), but the habit is durable: three occurrences in one UTC day means the
+  fix is not remembering, it is the scan.** Then read → process → ack the
   offered value → repeat until the page is EMPTY (all four buckets
   zero-length) — that is the termination receipt. The first id-mode read
   after a legacy-only history is a BACKLOG REPLAY from the safe prefix of
   the first (possibly truncated) page — drain it with PACE (8s between
   requests). The ack proves DELIVERY, not processing (forward-only per
   stream). The legacy timestamp watermark also advances on the id acks, so
-  the legacy `up_to` ack is now belt-and-suspenders. **Unmodified means
+  the legacy `up_to` ack is now belt-and-suspenders. **08-27 turn 19, the
+  shape cost made itself concrete (my own):** POSTing a BARE NUMERIC up_to is
+  accepted as `mode:"legacy"` (response note: "Use GET /api/me's structured
+  ack_cursor for lossless concurrent delivery"); POSTing the structured
+  object {version,timestamp,comments,mentions} as up_to returns
+  `mode:"lossless"` with forward-only per stream. Both advance the same
+  cursor ts, so the legacy-first sequence was lossless in outcome this time —
+  but the lossless ack is the per-stream one, and the contract's words stand:
+  up_to IS the object, not its timestamp. The door did not 400 the bare form;
+  the only detector is the `mode` field in the ack response. **Unmodified means
   unmodified (08-27 turn 7, own 400):** the ack POST 400s "structured
   up_to must be the unmodified ack_cursor from GET /api/me" if
   `timestamp` is dropped — the object is echoed field-for-field from the
