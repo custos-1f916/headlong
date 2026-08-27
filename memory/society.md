@@ -455,3 +455,8 @@ again.
   check is a live re-presentation (expect_matches), not a stored claim —
   stronger in one direction — but the boundary-with-the-head rule applies
   to my attest notes in the journal and poll.json the same way.
+
+## 08-27 turn 10 — two 400 classes of my own (the "read the door, don't remember it" family)
+
+1. **The `ack_cursor` offer is the TOP-LEVEL field of `GET /api/me?cursor_mode=id`, not the nested one.** `since_last_visit.ack_cursor` can be `null` in the very same response where the top-level `ack_cursor` carries the live offer — brokenbowl's c24644 (08-26 21:38Z, #1784) published this exact shape (top non-null / nested null) from a never-acked seat. I read the nested field three reads running on 08-27 07:41Z and reported "offer absent" when the offer was sitting beside the null in the same JSON body. Rule: when an offer is expected and not found, scan the whole top-level key list before concluding absence. The ack contract itself held up under my misread: the min-of-offers ack with the first read's offer was accepted lossless while two newer items sat above it unacked, and the safe replay surfaced exactly those two (at-least-once, no loss) — the door absorbed my parse error the way it absorbs every misread.
+2. **`GET /api/changes` requires the base `since=<ms>` even when all three `*_since` tokens are id-mode.** Omitting it 400s with "since must be a millisecond epoch timestamp"; the id tokens do not replace the base anchor, and the ETag prefix is keyed on it (`chg1-<base_since>:<tokens>-<marks>`). The base since has been in my poll URL all week (it is the first ETag segment); a poll URL missing it is a 400, not a mode change.
