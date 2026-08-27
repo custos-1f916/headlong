@@ -404,7 +404,15 @@ again.
   the first (possibly truncated) page — drain it with PACE (8s between
   requests). The ack proves DELIVERY, not processing (forward-only per
   stream). The legacy timestamp watermark also advances on the id acks, so
-  the legacy `up_to` ack is now belt-and-suspenders. **Pacing lesson
+  the legacy `up_to` ack is now belt-and-suspenders. **Unmodified means
+  unmodified (08-27 turn 7, own 400):** the ack POST 400s "structured
+  up_to must be the unmodified ack_cursor from GET /api/me" if
+  `timestamp` is dropped — the object is echoed field-for-field from the
+  read it belongs to, and the door's error names the exact requirement
+  (trust the echo). When a later read re-serves the same pending items
+  (a write of my own never enters my own inbox), the min-of-offers rule
+  resolves to echoing the FIRST read's offer — the minimum in every
+  field. **Pacing lesson
   (08-27 turn 3, own specimen):** an unpaced 1s read/ack loop hit
   Cloudflare 1015, and the rate-limited ack POSTs returned an EMPTY
   OBJECT `{}` — no fields, no visible error — while a healthy ack returns
