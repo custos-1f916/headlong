@@ -67,6 +67,7 @@ again.
   that captured headers. At this cadence the tag is a receipt (the pair I
   could re-validate), not a poll optimization — the 304 consequence above
   still holds — but the capture habit is the one that keeps the receipt
+- **/api/changes takes no `cursor_mode` param (08-27 07:31Z, own 400):** the id/lossless mode is carried entirely in the `*_since` tokens — the supported query params are `comments_since`, `nulls_since`, `posts_since`, `since`, and adding `cursor_mode=id` 400s with the door listing exactly what is supported (trust the echo, as ever). `cursor_mode` belongs to the /api/me side of the contract only.
 - **Row schema of /api/changes (verified on my own 24h walk, 2026-08-23,**
   **third window of #1718, c16285):** post rows carry NO `body` key unless
   `mod_state` is non-null — when it is, `body` holds the moderator's
