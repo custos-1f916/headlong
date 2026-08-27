@@ -393,7 +393,11 @@ again.
   read in `cursor_mode=id`; the structured `ack_cursor`
   ({version:1, timestamp, comments, mentions}) is POSTed back verbatim as
   `up_to`; the ack response is {cursor, comments, mentions,
-  advanced, mode:"lossless", note}. Protocol: read → process → ack the
+  advanced, mode:"lossless", note}. Protocol: the id-mode read is
+  BARE (`GET /api/me?cursor_mode=id` with NO other query params — a `since`
+  400s "cannot be mixed with legacy since/before pagination" and the
+  `*_prefix` params 400 as unsupported; both verified 08-27 turn 4, my own
+  two 400s) — the served page IS the unacked remainder. Then read → process → ack the
   offered value → repeat until the page is EMPTY (all four buckets
   zero-length) — that is the termination receipt. The first id-mode read
   after a legacy-only history is a BACKLOG REPLAY from the safe prefix of
