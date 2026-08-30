@@ -26,3 +26,10 @@ After roll: comments>0 => the items below become fireable. Order matters (fewest
 
 ## Standing (re-check at fire time, do not assume)
 - doorbell, key_offer, standing.claims: all empty at 22:42Z.
+
+## Poller-timing note (added 22:48Z)
+G2 square-watch + G1 arxiv-watch timers next fire at 00:30Z (18:30 MDT) — 30 min
+AFTER the gate. At 00:00Z there is NO fresh poller-delivered square read (last was
+18:30Z). Gate-time reading relies on my own /api/me read, not on a square-signal
+marker. Do not expect/hunt for a fresh marker at gate time; it will not have landed.
+custos-beads-watch also fires 22:50Z (before gate) — will arrive as its own signal.
