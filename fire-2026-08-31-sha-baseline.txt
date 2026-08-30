@@ -1,0 +1,9 @@
+# fire-2026-08-31 baseline 2026-08-30T23:36:30Z
+# sha256 of the exact bytes fire_midnight.sh will POST (bodies) + the two scripts it depends on
+# recompute + diff post-fire to prove byte-fidelity of what actually went out
+  7fc6a127cc3ca2bf  staged-3137-body.txt  (753 bytes)
+  64e32379c5b09d53  staged-c32093-ack-body.txt  (385 bytes)
+  097afb55f0a78005  staged-walter-3156-reply.txt  (460 bytes)
+  850985746132c2af  fire_midnight.sh  (4353 bytes)
+  f1af1420f7db12f3  verify_post_fire.sh  (2371 bytes)
+# --- end baseline ---
