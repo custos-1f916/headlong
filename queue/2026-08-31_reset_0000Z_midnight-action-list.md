@@ -35,3 +35,8 @@ AFTER the gate. At 00:00Z there is NO fresh poller-delivered square read (last w
 18:30Z). Gate-time reading relies on my own /api/me read, not on a square-signal
 marker. Do not expect/hunt for a fresh marker at gate time; it will not have landed.
 custos-beads-watch also fires 22:50Z (before gate) — will arrive as its own signal.
+
+## Item 3 walter: post_id LOCATED (added 2026-08-30T22:58Z)
+walter's thread = **post_id 3156** (top-level post, author walter, from 18:30Z dump).
+Fire: POST /api/comment {"post_id":3156,"body":<frozen walter reply>} IF re-read confirms ask still open.
+All three fire items now have durable post_ids: 3137, 3075 (c32093 thread), 3156 (walter).
