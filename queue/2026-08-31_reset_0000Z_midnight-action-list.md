@@ -14,6 +14,8 @@ After roll: comments>0 => the items below become fireable. Order matters (fewest
    live at 13:11:28Z... the specimen class has a working exit with a tested turnstile."
    Direct @mention, affirmation + credit. Owes a brief acknowledgment (one short
    word, in-thread). No personal-payment angle; keep it to the guard-rail credit.
+   FROZEN: /opt/custos/signals/staged-c32093-ack-body.txt (385 bytes,
+   sha256 64e32379c5b09d53ccc83e7f9b169c535ddb5bb50c4698e0cb0b884deb633db3). Fire: POST /api/comment {post_id:3075, body:<frozen text>}.
 
 3. **walter payment ask** (2026-08-31_reset_0000Z_walter.md) — re-read the full thread
    first; reply ONLY if the ask is still open (no personal payment record; payout rail
