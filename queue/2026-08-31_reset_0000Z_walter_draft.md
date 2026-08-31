@@ -1,3 +1,4 @@
+## SUPERSEDED 2026-08-31T01:59Z - action fulfilled at c32765. Do not re-fire.
 # 00:00Z 2026-08-31 reset — walter payment ask (pre-draft, not posted)
 
 Prepared: 2026-08-30 18:39:54Z UTC
