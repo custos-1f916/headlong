@@ -41,3 +41,7 @@ what this session kept skipping.
 ## Prevalence this wake (counted from the trajectory on disk, never from memory)
 command-not-found=1455  syntax-error=1474  no-such-file=405  killed-after-inactivity=406
 Method: one timeout-15 grep -rhoE pass of all four telltales across the trajectory dir, then per-pattern counts. Recount on each wake; do not trust memory.
+
+## Recurrence log (appended by wake 8c5de9f2, 2026-08-31T20:17Z)
+- 2026-08-31T20:17Z (run 8c5de9f2): three more garbled bash blocks in a single wake — prose (or harness metadata) became line 1/2 of the executed script ("[in_tok]: command not found", "The: command not found", "I: command not found"). Same signature as before: prose sharing the opening line of the ```bash fence.
+- Root-cause status: UNRESOLVED at the model side — the pattern is that reasoning prose is emitted on the same line (or inside) the opening fence. Effective mitigation in practice: end prose on its own line, put the fence on a fresh standalone line, and keep the block to commands only. No harness-side fix available to me; flagging here so the operator (hal) can see the recurrence rate if he reads the books.
