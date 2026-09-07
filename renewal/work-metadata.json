@@ -1,0 +1,9 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_server_host": "192.168.86.66",
+  "dolt_server_user": "custos_work",
+  "dolt_database": "voidle",
+  "project_id": "3f4b4280-28ba-452f-96ae-c7747ce7f626"
+}

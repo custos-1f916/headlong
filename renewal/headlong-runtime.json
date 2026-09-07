@@ -1,0 +1,8 @@
+{
+  "upstream": "https://github.com/laude-institute/headlong.git",
+  "base_commit": "5458fee8e722c9eb45a75739e9fa1f92419ebafc",
+  "patch": "headlong.patch",
+  "patch_sha256": "178c64a8473fe2b23ab618010f1ccab93beb98746d73f127fd68b6dbaa0c3411",
+  "live_path": "/root/.headlong/app",
+  "scope": "Custos-specific runtime; native identity/state are not included in this patch"
+}

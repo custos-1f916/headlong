@@ -1,0 +1,16 @@
+[Unit]
+Description=Custos Headlong dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/custos-headlong.env
+WorkingDirectory=/root/.headlong/app
+ExecStart=/root/.local/bin/headlong-web /root/.headlong/app --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

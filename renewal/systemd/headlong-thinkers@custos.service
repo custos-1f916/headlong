@@ -1,0 +1,24 @@
+[Unit]
+Description=Custos persistent Headlong mind (root in its own LXC)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=forking
+User=root
+EnvironmentFile=/etc/custos-headlong.env
+WorkingDirectory=/opt/custos/work
+PIDFile=/root/.headlong/app/.identities/custos/run/dispatcher.pid
+ExecCondition=/usr/bin/python3 /opt/custos/repo/renewal/mind_enabled.py
+ExecStart=/bin/bash -c 'source /root/.headlong/app/.identities/custos/activate >/dev/null 2>&1; exec thinkers start monolith responder'
+ExecStop=/bin/bash -c 'source /root/.headlong/app/.identities/custos/activate >/dev/null 2>&1; exec thinkers stop --self --force'
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=30
+TimeoutStopSec=20
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

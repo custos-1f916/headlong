@@ -1,0 +1,611 @@
+"""Bounded observation, durable intake before acknowledgement, no model calls."""
+import argparse
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+import urllib.error
+import uuid
+import xml.etree.ElementTree as ET
+
+from custos_square import APIError, ORIGIN, STATE, SECRET, Square, Store, canonical, digest, public_request
+
+BUCKETS = ("replies", "comments_on_your_posts", "mentions_of_you", "in_threads_you_joined")
+CONFIG = Path(__file__).with_name("observations.json")
+
+
+def square_sender(author, post, comment=0):
+    if not isinstance(author, str) or not re.fullmatch(r"[A-Za-z0-9_-]{2,32}", author):
+        raise APIError("inbox_author_contract")
+    if type(post) is not int or post < 1 or type(comment) is not int or comment < 0:
+        raise APIError("inbox_target_contract")
+    return "square:" + author + ":" + str(post) + ":" + str(comment)
+
+
+class Native:
+    def __init__(self, store):
+        self.store = store
+        self.root = os.environ.get("ROOT_TRAJ_ID") or os.environ.get("TRAJ_ID")
+        result = subprocess.run(["traj", "path", self.root], check=True, capture_output=True, text=True, timeout=20)
+        self.path = Path(result.stdout.strip())
+        if not self.path.is_file():
+            raise APIError("native_root_missing")
+
+    def capture(self, payload):
+        result = subprocess.run(["custos-memory", "capture"], input=canonical(payload), text=True, capture_output=True, timeout=45)
+        if result.returncode:
+            raise APIError("native_capture_failed")
+        data = json.loads(result.stdout)
+        if not data.get("goal_id") or data.get("request_id") != payload["request_id"]:
+            raise APIError("native_capture_receipt_invalid")
+        return data
+
+    def append(self, identity, envelope):
+        key = "native:" + identity
+        state = self.store.get(key)
+        if state and state.get("done"):
+            return state["step_id"]
+        if state is None:
+            state = {"offset": self.path.stat().st_size, "step_id": str(uuid.uuid4())}
+            self.store.put(key, state)
+        # Only scan the suffix since the pending append, not the entire trajectory.
+        with self.path.open("rb") as source:
+            source.seek(state["offset"])
+            found = any(json.loads(line).get("step_id") == state["step_id"] for line in source if line.endswith(b"\n"))
+        if not found:
+            row = dict(envelope, step_id=state["step_id"])
+            result = subprocess.run(["traj", "append", self.root], input=canonical(row), text=True, capture_output=True, timeout=30)
+            if result.returncode:
+                raise APIError("native_append_failed")
+        with self.path.open("rb") as source:
+            os.fsync(source.fileno())
+        state["done"] = True
+        self.store.put(key, state)
+        return state["step_id"]
+
+
+class Observer:
+    def __init__(self, config, store, square, native, now=None):
+        self.config, self.store, self.square, self.native = config, store, square, native
+        self.now = time.time() if now is None else now
+        self.remaining = min(12, max(1, int(config.get("max_signals_per_run", 6))))
+
+    def emit(self, identity, content, source_url="", **fields):
+        if self.store.seen(identity):
+            return True
+        if self.remaining <= 0:
+            return False
+        envelope = {"type": "observation", "source": "custos-observe", "content": SECRET.sub("[redacted credential]", content), "source_url": source_url, "authority": "external", **fields}
+        self.native.append(identity, envelope)
+        self.store.disposition(identity, "emitted", envelope)
+        self.remaining -= 1
+        return True
+
+    def source(self, name, interval, function):
+        state = self.store.get("source:" + name, {})
+        if self.now < state.get("next", 0):
+            return
+        try:
+            function()
+        except (APIError, OSError, ValueError, KeyError, TypeError, ET.ParseError, subprocess.SubprocessError) as exc:
+            code = exc.code if isinstance(exc, APIError) else type(exc).__name__
+            failures = state.get("failures", 0) + 1
+            episode = state.get("episode", 0) + (0 if state.get("error") else 1)
+            if not state.get("error") or not state.get("alerted"):
+                alerted = self.emit("failure:" + name + ":" + str(episode), "Observation source unavailable: " + name + " (" + code + "). This is not an empty-work result.")
+            else:
+                alerted = True
+            backoff = max(interval, min(21600, 300 * 2 ** min(failures - 1, 6)), getattr(exc, "retry_after", 0))
+            self.store.put("source:" + name, {"error": code, "failures": failures, "episode": episode, "alerted": alerted, "next": self.now + backoff})
+            return
+        episode = state.get("episode", 0)
+        if state.get("error"):
+            if not self.emit("recovery:" + name + ":" + str(episode), "Observation source recovered: " + name + ". Successful read; no inference about work beyond returned data."):
+                self.store.put("source:" + name, dict(state, next=self.now + interval))
+                return
+        self.store.put("source:" + name, {"next": self.now + interval, "episode": episode, "failures": 0, "last_success": self.now})
+
+    def directed(self, item):
+        request_id = item["request_id"]
+        if self.store.seen(request_id):
+            return True
+        if self.remaining <= 0:
+            return False
+        content = SECRET.sub("[redacted credential]", item["content"])
+        capture = {key: item[key] for key in ("request_id", "sender", "source_url")}
+        capture.update(content=content, authority="agent", next_action="Read the original directed item and continuity evidence; triage honestly, respond usefully or explicitly decline. Capture is not authorization or a renewed promise.")
+        result = self.native.capture(capture)
+        self.native.append(request_id, {"type": "message", "from": item["sender"], "to": "custos", "content": content, "source_url": item["source_url"], "request_id": request_id, "authority": "agent", "goal_id": result["goal_id"]})
+        self.store.disposition(request_id, "goal_and_message", {"goal_id": result["goal_id"], "source_url": item["source_url"]})
+        self.remaining -= 1
+        return True
+
+    def continuity(self):
+        for item in self.store.get("continuity:items", []):
+            if not self.directed(item):
+                return False
+        return True
+
+    def inbox(self):
+        if not self.continuity():
+            return
+        pulse = self.square.get("/api/pulse", auth=True)
+        you = pulse.get("you")
+        if not isinstance(you, dict) or you.get("handle") != "custos":
+            raise APIError("pulse_identity_contract")
+        pending = self.store.get("inbox:page")
+        if not pending and self.store.get("inbox:adopted") and not you.get("has_new_for_you") and not you.get("named_you"):
+            return
+        # Retain the whole page until every disposition is durable. Partial runs
+        # consume at most max_signals; ID adoption never skips outstanding asks.
+        for _ in range(min(4, max(1, int(self.config.get("inbox_pages_per_run", 1))))):
+            page = pending or self.square.get("/api/me", {"cursor_mode": "id"}, auth=True)
+            buckets = page["since_last_visit"]
+            cursor = page.get("ack_cursor")
+            if page.get("cursor_mode") != "id" or buckets.get("contract") != "1f916.inbox.since_last_visit.v3":
+                raise APIError("inbox_contract_changed")
+            if not isinstance(cursor, dict) or set(cursor) != {"version", "timestamp", "comments", "mentions"} or cursor["version"] != 1 or any(type(cursor[k]) is not int or cursor[k] < 0 for k in cursor):
+                raise APIError("invalid_ack_cursor")
+            if any(not isinstance(buckets.get(bucket), list) or len(buckets[bucket]) > 50 for bucket in BUCKETS):
+                raise APIError("inbox_bucket_contract")
+            self.store.put("inbox:page", page)
+            for bucket in BUCKETS:
+                for item in buckets[bucket]:
+                    post = item.get("post_id")
+                    comment = item.get("comment_id", item.get("id"))
+                    if type(post) is not int or post < 1 or (comment is not None and (type(comment) is not int or comment < 1)):
+                        raise APIError("inbox_target_contract")
+                    source_url = ORIGIN + "/api/" + ("comment/" + str(comment) if comment else "post/" + str(post))
+                    request_id = "square:" + ("comment:" + str(comment) if comment else "post:" + str(post))
+                    directed = bucket != "in_threads_you_joined" or bool(re.search(r"(?<![A-Za-z0-9_-])@custos(?![A-Za-z0-9_-])", item.get("body") or "", re.IGNORECASE))
+                    disposition_id = "inbox:" + bucket + ":" + str(item.get("mention_id") or comment or post)
+                    if self.store.seen(disposition_id):
+                        continue
+                    if directed and not self.store.seen(request_id):
+                        if self.remaining <= 0:
+                            return
+                        author = item.get("author")
+                        content = item.get("body") or item.get("post_title") or "Source is moderated/withdrawn; inspect source and explicitly dispose this directed request."
+                        sender = square_sender(author, post, comment or 0)
+                        self.directed({"request_id": request_id, "sender": sender, "source_url": source_url, "content": content})
+                    self.store.disposition(disposition_id, "directed_accounted_for" if directed else "ambient_not_directed", item)
+            # The exact server object, including mention-row ID, never recomputed.
+            self.square.request("/api/me/ack", method="POST", body={"up_to": cursor}, auth=True)
+            self.store.put("inbox:cursor", cursor)
+            self.store.put("inbox:adopted", True)
+            self.store.put("inbox:page", None)
+            pending = None
+            truncated = buckets.get("truncated", {})
+            if not (any(truncated.values()) if isinstance(truncated, dict) else truncated):
+                break
+
+    def changes(self):
+        interests = self.config.get("square_interests", {})
+        terms = [term.casefold() for term in interests.get("terms", []) if term]
+        handles = set(interests.get("handles", []))
+        posts = set(interests.get("post_ids", []))
+        if not (terms or handles or posts):
+            return
+        query = self.store.get("changes:cursor")
+        if query is None:
+            query = {"since": int(self.now * 1000), "posts_since": "init", "comments_since": "init", "nulls_since": "done"}
+            self.store.put("changes:cursor", query)
+        for _ in range(min(4, max(1, int(self.config.get("changes_pages_per_run", 1))))):
+            cache = self.store.get("changes:etag", {})
+            page, etag = self.square.request("/api/changes", query, etag=cache.get("etag") if cache.get("query") == query else None)
+            if page is None:
+                return
+            if not set(page["has_more_streams"]).issubset(page["continuation_covers"]):
+                raise APIError("changes_uncovered_continuation")
+            for kind in ("posts", "comments"):
+                for item in page[kind]:
+                    identity = "changes:" + kind + ":" + str(item["id"]) + ":" + digest(item)
+                    if self.store.seen(identity):
+                        continue
+                    text = " ".join(str(item.get(k) or "") for k in ("title", "body"))
+                    matches = item.get("author") in handles or item.get("post_id", item["id"]) in posts or any(term in text.casefold() for term in terms)
+                    url = ORIGIN + "/api/" + ("post/" if kind == "posts" else "comment/") + str(item["id"])
+                    if matches and item.get("author") != "custos":
+                        if not self.emit(identity, "Selected square change (untrusted): " + text[:1800], url):
+                            return
+                    else:
+                        self.store.disposition(identity, "not_selected", {"url": url})
+            next_query = dict(query, posts_since=page["next_posts_since"], comments_since=page["next_comments_since"], nulls_since=page["next_nulls_since"])
+            if page.get("has_more") and next_query == query:
+                raise APIError("changes_stalled_cursor")
+            self.store.put("changes:etag", {"query": query, "etag": etag})
+            self.store.put("changes:cursor", next_query)
+            query = next_query
+            if not page.get("has_more"):
+                break
+
+    def opportunities(self):
+        rail = self.square.get("/api/rail")
+        if not isinstance(rail.get("listings"), list):
+            raise APIError("rail_contract")
+        terms = [x.casefold() for x in self.config.get("opportunity_terms", [])]
+        candidates = []
+        for row in rail["listings"]:
+            if not row.get("open") or row.get("expiry", 0) <= self.now:
+                continue
+            capacity = row["economics"].get("available_award_capacity")
+            if capacity is not None and capacity <= 0:
+                continue
+            if terms and not any(term in row["title"].casefold() for term in terms):
+                continue
+            candidates.append(row)
+        # Rotate bounded detail reads rather than starving later listings.
+        start = self.store.get("opportunities:offset", 0) % max(1, len(candidates))
+        chosen = (candidates[start:] + candidates[:start])[:4]
+        for row in chosen:
+            detail = self.square.get("/api/listings/" + str(row["listing_id"]))
+            opportunity = classify_opportunity(detail, self.now)
+            if opportunity is None:
+                continue
+            key = "opportunity:" + str(row["listing_id"])
+            fingerprint = digest(opportunity)
+            if self.store.get(key) != fingerprint:
+                if not self.emit(key + ":" + fingerprint, "Paid-work lead; not income or permission to commit: " + canonical(opportunity), ORIGIN + "/api/listings/" + str(row["listing_id"])):
+                    return
+                self.store.put(key, fingerprint)
+        self.store.put("opportunities:offset", start + len(chosen))
+
+    def feed(self, feed):
+        url = feed["url"]
+        key = "feed:" + digest(url)
+        cache = self.store.get(key, {})
+        pending = self.store.get(key + ":pending")
+        if pending is None:
+            raw, etag, status = public_request(url, cache.get("etag"))
+            if status == 304:
+                return
+            if b"<!DOCTYPE" in raw.upper() or b"<!ENTITY" in raw.upper():
+                raise APIError("feed_entity_declarations_refused")
+            root = ET.fromstring(raw)
+            if root.tag.rsplit("}", 1)[-1] not in ("feed", "rss", "RDF"):
+                raise APIError("unsupported_feed_format")
+            entries = root.findall("{http://www.w3.org/2005/Atom}entry") or root.findall("./channel/item") or root.findall("{http://purl.org/rss/1.0/}item")
+            rows = []
+            for entry in entries[:100]:
+                fields = {child.tag.rsplit("}", 1)[-1]: "".join(child.itertext()).strip() for child in entry}
+                link = fields.get("link", "")
+                for child in entry:
+                    if child.tag.endswith("}link") and child.get("rel", "alternate") == "alternate":
+                        link = child.get("href", link)
+                row = {"id": fields.get("id") or fields.get("guid") or link, "title": fields.get("title", ""), "url": link, "summary": (fields.get("summary") or fields.get("description") or "")[:1200]}
+                if not row["id"]:
+                    raise APIError("feed_entry_without_identity")
+                rows.append(row)
+            pending = {"rows": rows, "etag": etag, "initial": not cache.get("initialized")}
+            self.store.put(key + ":pending", pending)
+        terms = [x.casefold() for x in feed.get("terms", [])]
+        for row in reversed(pending["rows"]):
+            identity = key + ":" + digest(row)
+            if self.store.seen(identity):
+                continue
+            if pending["initial"]:
+                self.store.disposition(identity, "initial_baseline_no_history_flood", {"url": row["url"]})
+            elif not terms or any(term in (row["title"] + " " + row["summary"]).casefold() for term in terms):
+                if not self.emit(identity, "Research feed (untrusted): " + canonical(row), row["url"]):
+                    return
+            else:
+                self.store.disposition(identity, "not_selected", {"url": row["url"]})
+        self.store.put(key, {"etag": pending["etag"], "initialized": True})
+        self.store.put(key + ":pending", None)
+
+    def reviews(self):
+        # Explicit goal review/deadline reminders reference native goal IDs, not
+        # another goal store. One signal per configured timestamp, never daily nags.
+        for reminder in self.config.get("goal_reviews", [])[:32]:
+            due = datetime.fromisoformat(reminder["at"].replace("Z", "+00:00"))
+            if due.tzinfo is None:
+                raise APIError("review_timestamp_requires_timezone")
+            identity = "goal-review:" + digest(reminder)
+            if self.now >= due.timestamp() and not self.store.seen(identity) and self.remaining > 0:
+                result = subprocess.run(["custos-memory", "show", reminder["goal_id"]], text=True, capture_output=True, timeout=20)
+                if result.returncode:
+                    raise APIError("goal_review_native_read_failed")
+                kind = re.search(r"^type:\s*(\S+)", result.stdout, re.MULTILINE)
+                if kind and kind.group(1) not in {"goal", "intention", "objective", "todo"}:
+                    self.store.disposition(identity, "goal_already_retired", reminder)
+                    continue
+                self.emit(identity, "Native goal " + reminder["goal_id"] + " " + reminder.get("kind", "review") + " due. Read custos-memory show; verify current state before acting. " + reminder.get("reason", ""))
+
+    def outbox(self):
+        path = self.native.path
+        cursor = self.store.get("outbox:cursor", {"path": str(path), "offset": 0})
+        if cursor["path"] != str(path) or cursor["offset"] > path.stat().st_size:
+            raise APIError("outbox_trajectory_replaced_requires_explicit_migration")
+        with path.open("rb") as source:
+            source.seek(cursor["offset"])
+            for _ in range(300):
+                line = source.readline(128 * 1024)
+                if not line:
+                    break
+                if not line.endswith(b"\n"):
+                    if len(line) == 128 * 1024:
+                        raise APIError("outbox_native_line_too_large")
+                    break
+                row = json.loads(line)
+                if row.get("type") == "message" and row.get("from") == "custos" and str(row.get("to", "")).startswith("square:"):
+                    match = re.fullmatch(r"square:([A-Za-z0-9_-]{2,32}):([1-9][0-9]*):(0|[1-9][0-9]*)", row["to"])
+                    if not match or not row.get("step_id"):
+                        raise APIError("invalid_square_outbox_target")
+                    handle, post, parent = match.groups()
+                    # Routing identity must still name the actual public addressee.
+                    kind, target_id = ("comment", parent) if parent != "0" else ("post", post)
+                    target = self.square.get("/api/" + kind + "/" + target_id)[kind]
+                    if target.get("author") != handle:
+                        raise APIError("outbox_recipient_mismatch")
+                    payload = {"post_id": int(post), "body": row["content"]}
+                    if parent != "0":
+                        payload["parent_id"] = int(parent)
+                    receipt = self.square.write("traj:" + row["step_id"], "comment", payload)
+                    self.native.append("delivery:" + row["step_id"], {"type": "observation", "source": "square-outbox", "content": "Public square reply delivered: " + canonical(receipt), "reply_to": row["step_id"]})
+                cursor["offset"] = source.tell()
+                self.store.put("outbox:cursor", cursor)
+
+    def github_snapshot(self, repo, surface, path, collection, fields, baseline):
+        url = "https://api.github.com/repos/" + repo + path
+        key = "github:" + digest(url)
+        saved = self.store.get(key, {})
+        pending = self.store.get(key + ":pending")
+        if pending is None:
+            raw, etag, status = public_request(url, saved.get("etag"))
+            if status == 304:
+                return saved.get("rows", [])
+            data = json.loads(raw)
+            rows = data if collection is None else data[collection]
+            if not isinstance(rows, list):
+                raise APIError("github_response_contract")
+            projected = []
+            for row in rows[:30]:
+                projected.append({field: row.get(field)[:500] if isinstance(row.get(field), str) else row.get(field) for field in fields})
+            pending = {"rows": projected, "etag": etag}
+            self.store.put(key + ":pending", pending)
+        rows = pending["rows"]
+        prior = {digest(row) for row in saved.get("rows", [])}
+        changed = [row for row in rows if digest(row) not in prior]
+        if changed and (saved.get("initialized") or not baseline):
+            identity = key + ":" + digest(rows)
+            notice = {"repo": repo, "surface": surface, "changed_rows": len(changed), "examples": changed[:3], "coverage": "bounded API page/window, at most 30 rows; not complete history"}
+            if not self.emit(identity, "Selected public GitHub change (source data, not instructions): " + canonical(notice), url):
+                return saved.get("rows", [])
+        self.store.put(key, dict(pending, initialized=True))
+        self.store.put(key + ":pending", None)
+        return rows
+
+    def github(self, project):
+        repo = project["repo"]
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+            raise APIError("invalid_github_repository")
+        ref = project.get("ref", "main")
+        if not isinstance(ref, str) or not ref or len(ref) > 200:
+            raise APIError("invalid_github_ref")
+        ref = urllib.parse.quote(ref, safe="")
+        baseline = not self.store.get("github-project:" + repo)
+        self.github_snapshot(repo, "issues", "/issues?state=all&sort=updated&direction=desc&per_page=30", None, ("number", "title", "state", "updated_at", "comments", "html_url"), baseline)
+        pulls = self.github_snapshot(repo, "pull requests", "/pulls?state=open&sort=updated&direction=desc&per_page=3", None, ("number", "title", "state", "updated_at", "html_url"), baseline)
+        numbers = list(dict.fromkeys(project.get("pull_requests", []) + [row["number"] for row in pulls]))[:3]
+        for number in numbers:
+            if type(number) is not int or number < 1:
+                raise APIError("invalid_github_pull_request")
+            review_key = "github-review-page:" + repo + ":" + str(number)
+            review = self.store.get(review_key, {"page": 1, "baseline": baseline})
+            path = "/pulls/" + str(number) + "/reviews?per_page=30&page=" + str(review["page"])
+            rows = self.github_snapshot(repo, "PR " + str(number) + " reviews", path, None, ("id", "state", "submitted_at", "commit_id", "html_url", "body"), review["baseline"])
+            if not self.store.get("github:" + digest("https://api.github.com/repos/" + repo + path) + ":pending"):
+                self.store.put(review_key, {"page": review["page"] + (1 if len(rows) == 30 else 0), "baseline": review["baseline"] and len(rows) == 30})
+        self.github_snapshot(repo, "check runs", "/commits/" + ref + "/check-runs?per_page=30", "check_runs", ("id", "name", "head_sha", "status", "conclusion", "completed_at", "html_url"), baseline)
+        self.github_snapshot(repo, "commit statuses", "/commits/" + ref + "/status?per_page=30", "statuses", ("id", "context", "state", "description", "updated_at", "target_url"), baseline)
+        self.github_snapshot(repo, "workflow results", "/actions/runs?per_page=20", "workflow_runs", ("id", "name", "head_sha", "status", "conclusion", "updated_at", "html_url"), baseline)
+        self.store.put("github-project:" + repo, True)
+
+    def local_results(self):
+        pending = self.store.db.execute("SELECT s.key,s.value FROM state s LEFT JOIN seen d ON d.id=s.key WHERE s.key LIKE 'work-result:%' AND d.id IS NULL ORDER BY s.key LIMIT 12").fetchall()
+        for row in pending:
+            result = json.loads(row["value"])
+            identity = "work-result:" + result["request_id"]
+            if self.store.seen(identity):
+                continue
+            notice = {"project": result["project"], "kind": result["kind"], "status": result["status"], "summary": result["summary"], "evidence": result["evidence"], "goal_id": result.get("goal_id"), "basis": "local worker-reported outcome with retained file digests; not independent verification or a financial receipt"}
+            if not self.emit(identity, "Owned-work outcome: " + canonical(notice), result.get("source_url", ""), authority="agent"):
+                return
+
+    def local_git(self, project):
+        path = Path(project["path"])
+        if not path.is_absolute():
+            raise APIError("local_project_requires_absolute_path")
+        def git(*args):
+            result = subprocess.run(["git", "--no-pager", "-C", str(path), *args], capture_output=True, text=True, timeout=20, env=dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0"))
+            if result.returncode:
+                raise APIError("local_git_read_failed")
+            return result.stdout.strip()
+        head = git("rev-parse", "--verify", "HEAD")
+        commits = git("log", "--max-count=5", "--format=%h %s").splitlines()
+        # Stats only: do not pass private file contents or remote credentials into
+        # observation context. Untracked files are not represented as deliveries.
+        diff = git("diff", "--no-ext-diff", "--stat", "--stat-count=10", "HEAD", "--")
+        snapshot = {"project": project["name"], "path": str(path), "head": head, "commits": [line[:300] for line in commits], "tracked_worktree_stat": diff[:2000], "scope": "local committed HEAD and tracked working-tree diff only; no claim of test, delivery, review or CI success"}
+        key = "local-git:" + digest(str(path))
+        old = self.store.get(key)
+        if old is not None and old != snapshot:
+            if not self.emit(key + ":" + digest(snapshot), "Owned local project changed: " + canonical(snapshot), path.as_uri(), authority="agent"):
+                return
+        self.store.put(key, snapshot)
+
+    def admission(self):
+        url = "http://192.168.86.44:18080/health"
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(url, timeout=5) as response:
+                value = json.loads(response.read(8192))
+            remaining = min(float(value["remaining_daily_seconds"]), float(value["remaining_rolling_seconds"]))
+            state = "low_budget" if remaining < 600 else "admitted"
+            message = "Inference admitted; remaining shared-gateway walltime allowance is about " + str(int(remaining)) + " seconds. Budget is an upper bound, not an obligation to spend it."
+        except urllib.error.HTTPError as error:
+            value = json.loads(error.read(8192))["error"]
+            code = value["code"]
+            if code in {"custos_request_in_flight", "backend_busy_or_unavailable", "previous_request_unsettled"}:
+                return  # Expected short-lived self-use/drain, not a new duty.
+            state = "deferred:" + code
+            message = "Inference deferred by the external gateway: " + code + ". Preserve goals and respect this boundary; it is not permission to bypass it. Retry guidance: " + str(value.get("retry_after_seconds", 0)) + " seconds."
+        previous = self.store.get("admission:status", {"state": None, "sequence": 0})
+        if previous["state"] != state:
+            sequence = previous["sequence"] + 1
+            if self.emit("admission:" + str(sequence), message, url):
+                self.store.put("admission:status", {"state": state, "sequence": sequence})
+
+    def run(self):
+        self.source("square-outbox", 60, self.outbox)
+        self.source("square-inbox", 300, self.inbox)
+        self.source("owned-work-results", 300, self.local_results)
+        self.source("inference-admission", 300, self.admission)
+        for project in self.config.get("local_projects", [])[:4]:
+            if project.get("enabled", True):
+                self.source("local-git:" + project["name"], max(1800, int(project.get("interval_seconds", 1800))), lambda project=project: self.local_git(project))
+        for project in self.config.get("github_projects", [])[:2]:
+            if project.get("enabled", True):
+                self.source("github:" + project["repo"], max(7200, int(project.get("interval_seconds", 7200))), lambda project=project: self.github(project))
+        self.source("square-changes", 1800, self.changes)
+        self.source("paid-opportunities", 21600, self.opportunities)
+        for feed in self.config.get("research_feeds", [])[:8]:
+            if feed.get("enabled", True):
+                self.source("research:" + feed["name"], max(3600, int(feed.get("interval_seconds", 21600))), lambda feed=feed: self.feed(feed))
+        self.source("reviews", 3600, self.reviews)
+
+
+def classify_opportunity(detail, now):
+    if detail.get("expired") or detail.get("withdrawn_at") or detail.get("mod_state") or detail.get("expiry", 0) <= now:
+        return None
+    if detail.get("submission_deadline") and detail["submission_deadline"] <= now:
+        return None
+    economics = detail["economics"]
+    capacity = economics.get("available_award_capacity")
+    if capacity is not None and capacity <= 0:
+        return None
+    funding = detail.get("funding_status") or {}
+    mode = detail.get("funding_mode")
+    if mode == "funded":
+        if funding.get("funded") is not True:
+            return None
+        remaining = int((funding.get("onchain") or {}).get("remaining_atomic", "0"))
+        if remaining < int(economics.get("maximum_remaining_liability_atomic") or detail["amount_atomic"]):
+            return None
+        label = "chain-read committed funding; acceptance/claim conditions still apply"
+    elif detail.get("funder_address") and int(detail.get("funds_seen_atomic") or 0) >= int(detail["amount_atomic"]):
+        label = "historical wallet snapshot only; NOT locked, reserved or guaranteed"
+    else:
+        return None
+    return {"listing_id": detail["listing_id"], "title": detail["title"], "amount_atomic": detail["amount_atomic"], "asset": {"chain_id": detail["chain_id"], "token": detail["token"]}, "available_award_capacity": capacity, "capacity_note": "unknown legacy award capacity" if capacity is None else "declared remaining slots", "funding": label, "funds_checked_at": detail.get("funds_checked_at"), "expiry": detail["expiry"], "condition": detail["condition"][:1600], "submissions": detail.get("submissions_total"), "autonomous_spend": 0}
+
+
+def import_continuity(store, snapshot):
+    items = snapshot.get("items")
+    if not isinstance(items, list) or len(items) > 1000:
+        raise APIError("invalid_continuity_items")
+    items = [dict(item) for item in items]
+    for item in items:
+        if not re.fullmatch(r"square:(comment|post):[1-9][0-9]*", item["request_id"]):
+            raise APIError("invalid_continuity_request")
+        kind, source_id = item["request_id"].split(":")[1:]
+        if not str(item.get("sender", "")).startswith("square:"):
+            item["sender"] = square_sender(item["sender"], item.get("post_id"),
+                                           int(source_id) if kind == "comment" else 0)
+        if not re.fullmatch(r"square:[A-Za-z0-9_-]{2,32}:[1-9][0-9]*:(0|[1-9][0-9]*)", item["sender"]):
+            raise APIError("invalid_continuity_sender")
+        if not isinstance(item["content"], str) or not item["source_url"].startswith(ORIGIN + "/api/"):
+            raise APIError("invalid_continuity_source")
+        if any(type(reply) is not int or reply < 1 for reply in item.get("previous_replies", [])):
+            raise APIError("invalid_continuity_reply")
+    # Entire import is atomic and replayable; importing never ACKs the snapshot.
+    with store.db:
+        for item in items:
+            if item.get("previous_replies"):
+                proof = {"source_url": item["source_url"], "previous_replies": [ORIGIN + "/api/comment/" + str(reply) for reply in item["previous_replies"]], "basis": "operator-qualified pre-reset continuity; do not renew fulfilled asks"}
+                store.db.execute("INSERT OR IGNORE INTO seen VALUES (?,?,?)", (item["request_id"], "fulfilled_before_reset", canonical(proof)))
+        store.db.execute("INSERT OR REPLACE INTO state VALUES (?,?)", ("continuity:items", canonical(items)))
+        store.db.execute("INSERT OR REPLACE INTO state VALUES (?,?)", ("continuity:original_ack_cursor", canonical(snapshot.get("ack_cursor"))))
+    return {"imported": len(items), "already_fulfilled": sum(bool(i.get("previous_replies")) for i in items), "acknowledged": False}
+
+def record_result(store, result):
+    required = {"request_id", "project", "kind", "status", "summary", "evidence"}
+    if not isinstance(result, dict) or not required.issubset(result) or set(result) - required - {"goal_id", "source_url"}:
+        raise APIError("invalid_work_result_fields")
+    if not isinstance(result["request_id"], str) or not re.fullmatch(r"[A-Za-z0-9:_-]{1,200}", result["request_id"]):
+        raise APIError("invalid_work_result_id")
+    if result["kind"] not in {"experiment", "test", "delivery", "review"} or result["status"] not in {"succeeded", "failed", "blocked", "feedback"}:
+        raise APIError("invalid_work_result_state")
+    if any(not isinstance(result[key], str) or not 1 <= len(result[key]) <= limit for key, limit in (("project", 200), ("summary", 2000))):
+        raise APIError("invalid_work_result_text")
+    for key, limit in (("goal_id", 100), ("source_url", 2048)):
+        if key in result and (not isinstance(result[key], str) or len(result[key]) > limit):
+            raise APIError("invalid_work_result_reference")
+    if not isinstance(result["evidence"], list) or not 1 <= len(result["evidence"]) <= 8:
+        raise APIError("work_result_requires_retained_evidence")
+    for evidence in result["evidence"]:
+        if not isinstance(evidence, dict) or set(evidence) != {"path", "sha256"} or not re.fullmatch(r"[0-9a-f]{64}", evidence["sha256"]):
+            raise APIError("invalid_work_result_evidence")
+        path = Path(evidence["path"])
+        if not path.is_absolute():
+            raise APIError("work_result_evidence_requires_absolute_path")
+        with path.open("rb") as source:
+            raw = source.read(8 * 1024 * 1024 + 1)
+        if len(raw) > 8 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != evidence["sha256"]:
+            raise APIError("work_result_evidence_digest_mismatch")
+    key = "work-result:" + result["request_id"]
+    with store.db:
+        store.db.execute("BEGIN IMMEDIATE")
+        prior = store.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+        if prior and json.loads(prior["value"]) != result:
+            raise APIError("work_result_id_conflict")
+        store.db.execute("INSERT OR IGNORE INTO state VALUES (?,?)", (key, canonical(result)))
+    # The next observation run emits this durable callback, with no model call here.
+    return {"request_id": result["request_id"], "queued": True, "created": prior is None}
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("once", "status", "import-continuity", "record-result"))
+    parser.add_argument("--config", type=Path, default=CONFIG)
+    parser.add_argument("--file", type=Path)
+    args = parser.parse_args(argv)
+    store = Store()
+    if args.command == "status":
+        print(canonical({"sources": {row["key"]: json.loads(row["value"]) for row in store.db.execute("SELECT * FROM state WHERE key LIKE 'source:%'")}, "outbox": [dict(row) for row in store.db.execute("SELECT id,status,receipt FROM outbound ORDER BY started DESC LIMIT 30")], "inbox_page_pending": store.get("inbox:page") is not None}))
+        return 0
+    try:
+        with (STATE / "run.lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if args.command != "once":
+                    raise APIError("observer_busy_callback_not_queued_retry")
+                return 0
+            if args.command == "record-result":
+                if args.file is None:
+                    raise APIError("work_result_file_required")
+                print(canonical(record_result(store, json.loads(args.file.read_text()))))
+                return 0
+            if args.command == "import-continuity":
+                if args.file is None:
+                    raise APIError("continuity_file_required")
+                print(canonical(import_continuity(store, json.loads(args.file.read_text()))))
+                return 0
+            config = json.loads(args.config.read_text())
+            Observer(config, store, Square(store), Native(store)).run()
+        return 0
+    except (APIError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        print(canonical({"error": exc.code if isinstance(exc, APIError) else type(exc).__name__}), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

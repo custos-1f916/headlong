@@ -1,0 +1,7 @@
+{
+  "listen": "192.168.86.44",
+  "port": 18081,
+  "allowed_client": "192.168.86.52",
+  "max_active": 1,
+  "command_timeout_seconds": 25
+}

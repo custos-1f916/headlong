@@ -1,0 +1,19 @@
+[Unit]
+Description=Custos bounded observations and square outbox
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=HOME=/root
+Environment=HEADLONG_IDENTITY=custos
+EnvironmentFile=/etc/custos-headlong.env
+WorkingDirectory=/opt/custos/work
+ExecStartPre=/bin/bash -c 'source /root/.headlong/app/.identities/custos/activate >/dev/null 2>&1; exec python3 /opt/custos/repo/renewal/custos_transport.py reconcile'
+ExecStart=/bin/bash -c 'source /root/.headlong/app/.identities/custos/activate && exec /usr/local/bin/custos-observe once'
+TimeoutStartSec=240
+UMask=0077
+# Intentionally unrestricted root inside LXC122. Host admission/firewall policy
+# lives outside this guest. Do not load /etc/custos.env into the agent environment.

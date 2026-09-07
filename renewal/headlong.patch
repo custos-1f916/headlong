@@ -1,0 +1,1555 @@
+diff --git a/bin/llm b/bin/llm
+index e6a5b00..e8217ae 100755
+--- a/bin/llm
++++ b/bin/llm
+@@ -47,7 +47,7 @@ LLM_PROVIDER="${LLM_PROVIDER:-}"
+ _llm_provider_env="$LLM_PROVIDER"
+ LLM_THINKING=0
+ LLM_THINKING_LEVEL=""
+-LLM_EFFORT=""
++LLM_EFFORT="${LLM_EFFORT:-}"
+ LLM_RAW=0
+ LLM_PROMPT=""
+ # OpenRouter provider routing. OpenRouter fans a single model id out over
+@@ -711,6 +711,14 @@ build_payload_openai() {
+         jq_filter="${jq_filter} + {stream_options: {include_usage: true}}"
+     fi
+ 
++    # NInfer and compatible local servers take effort at the top level.
++    # Explicit --effort overrides the inherited default used by direct
++    # responder, memory and recap calls outside shellm.
++    if [[ "$LLM_PROVIDER" == "openai-compatible" && -n "$LLM_EFFORT" ]]; then
++        jq_args+=(--arg compatible_effort "$LLM_EFFORT")
++        jq_filter="${jq_filter} + {reasoning_effort: \$compatible_effort}"
++    fi
++
+     # Map --thinking LEVEL to OpenAI reasoning.effort (only when an explicit
+     # level is given; bare --thinking without a level is ignored for OpenAI
+     # since not all models support the reasoning parameter).
+diff --git a/bin/mem b/bin/mem
+index 98df4f9..d38819d 100755
+--- a/bin/mem
++++ b/bin/mem
+@@ -55,6 +55,16 @@ slugify() {
+         | cut -c1-80
+ }
+ 
++# Truncate characters, never UTF-8 bytes. Drain the input so a long body cannot
++# SIGPIPE its writer after we have read the first line.
++memory_summary() {
++    python3 -c 'import sys
++first = sys.stdin.buffer.readline()
++while sys.stdin.buffer.read(65536):
++    pass
++sys.stdout.buffer.write(first.rstrip(b"\r\n").decode("utf-8")[:80].encode("utf-8"))'
++}
++
+ # Extract a field from YAML frontmatter.
+ # Usage: frontmatter_field <file> <field>
+ frontmatter_field() {
+@@ -129,7 +139,7 @@ action_add() {
+     hex=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
+     slug=$(slugify "$text")
+     filename="${timestamp}_${hex}_${slug}"
+-    summary=$(printf '%s' "$text" | head -1 | cut -c1-80)
++    summary=$(printf '%s' "$text" | memory_summary)
+     created=$(date +"%Y-%m-%d %H:%M:%S")
+ 
+     cat > "$MEM_DIR/${filename}.md" << EOF
+@@ -370,7 +380,7 @@ action_edit() {
+     # edit: a todo shortlist that is appended to during the day must still
+     # expire that night.
+     local summary type created id until
+-    summary=$(printf '%s' "$text" | head -1 | head -c 80)
++    summary=$(printf '%s' "$text" | memory_summary)
+     type=$(frontmatter_field "$file" "type")
+     created=$(frontmatter_field "$file" "created")
+     id=$(frontmatter_field "$file" "id")
+diff --git a/bin/recap b/bin/recap
+index d3711eb..1668d33 100755
+--- a/bin/recap
++++ b/bin/recap
+@@ -87,6 +87,8 @@ Options:
+ Windows close at the first of: a time gap of --gap-minutes (so episodes align
+ with the agent's natural sessions), --window steps, or ~60KB of text
+ ($RECAP_MAX_WINDOW_BYTES).
++Tiered summaries use $RECAP_ROLLUP_MAX_TOKENS (default: 1024). Reasoning
++models may need a larger allowance because thinking consumes output tokens.
+ 
+ Default behavior refreshes the cache incrementally (only new steps get
+ summarized), then prints. Cache lives in <traj-dir>/recap/.
+@@ -563,7 +565,7 @@ _ctx_seal_tier1() {
+     text=$(cut -f4 <<<"$rows")
+     fid=$(head -1 <<<"$rows" | cut -f2); lid=$(tail -1 <<<"$rows" | cut -f2)
+     note "rollup t1 [$s,$e)"
+-    body=$(_llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$text" 1024) || die "rollup t1 [$s,$e): bad JSON"
++    body=$(_llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$text" "${RECAP_ROLLUP_MAX_TOKENS:-1024}") || die "rollup t1 [$s,$e): bad JSON"
+     mkdir -p "$(dirname "$file")"
+     jq -n -c --argjson tier 1 --argjson start "$s" --argjson end "$e" --argjson n "$((e - s))" \
+         --argjson body "$body" --arg fid "$fid" --arg lid "$lid" \
+@@ -589,7 +591,7 @@ _ctx_seal_tierk() {
+         c=$((c + childblk))
+     done
+     note "rollup t$tier [$s,$e)"
+-    body=$(_llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$lines" 1024) || die "rollup t$tier [$s,$e): bad JSON"
++    body=$(_llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$lines" "${RECAP_ROLLUP_MAX_TOKENS:-1024}") || die "rollup t$tier [$s,$e): bad JSON"
+     local fb_json
+     # awk, not `grep | head`: head's early exit SIGPIPEs grep under pipefail
+     # once the payload outgrows the pipe buffer (large --fanout).
+diff --git a/bin/shellm b/bin/shellm
+index 1a27f50..83bb90f 100755
+--- a/bin/shellm
++++ b/bin/shellm
+@@ -315,6 +315,8 @@ Environment:
+                           1 (default): stop reading a response once its first
+                           code block closes; only that block runs anyway.
+                           0 reads to the end.
++  SHELLM_RUN_SUMMARY      1 (default): summarize new runs asynchronously.
++                          0 avoids a competing call on a single-slot server.
+   SHELLM_CONTEXT_SCOPE    traj (default) or run; see --context-scope
+   SHELLM_CONTEXT_RUN_TAIL Rows the run-scope window reads back (default 400)
+   SHELLM_CONTEXT_RUN_TAIL_BLOCK
+@@ -2409,7 +2411,7 @@ run_loop() {
+     # alone can't tell whose header is whose when concurrent runs interleave.
+     [[ -n "${SHELLM_RUN_ID_OUT:-}" ]] && printf '%s' "$_run_step_id" > "$SHELLM_RUN_ID_OUT" || true
+ 
+-    if [[ -z "$_use_traj" ]]; then
++    if [[ -z "$_use_traj" && "${SHELLM_RUN_SUMMARY:-1}" == 1 ]]; then
+         # New trajectory — kick off async run-summary generation
+         local stdin_ctx_file=""
+         if [[ -n "$stdin_context" ]]; then
+diff --git a/tests/test_identity_strict_activation.sh b/tests/test_identity_strict_activation.sh
+new file mode 100755
+index 0000000..53b36f5
+--- /dev/null
++++ b/tests/test_identity_strict_activation.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++# Fresh identities omit optional metadata. Strict callers must still be able
++# to write into the selected identity, without contaminating another one.
++set -euo pipefail
++HERE="$(cd "$(dirname "$0")" && pwd)"
++export PATH="$(dirname "$HERE")/bin:$(dirname "$HERE")/tools:$PATH"
++unset IDENTITY_NAME IDENTITY_DIR MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID
++WORK=$(mktemp -d)
++trap 'rm -rf "$WORK"' EXIT
++(cd "$WORK" && identity new alpha >/dev/null && identity new beta >/dev/null)
++ALPHA="$WORK/.identities/alpha"
++BETA="$WORK/.identities/beta"
++name=$(bash -euo pipefail -c 'source "$1"; mem add "Keep this goal private to alpha" --type goal' _ "$ALPHA/activate")
++MEM_DIR="$ALPHA/memories" mem show "$name" | grep -q 'Keep this goal private to alpha'
++if MEM_DIR="$BETA/memories" mem show "$name" >/dev/null 2>&1; then
++    echo 'FAIL: activation wrote into the wrong identity' >&2
++    exit 1
++fi
++printf '%s\n' 'PASS: strict activation permits real memory work only in the selected identity'
+diff --git a/tests/test_monolith_wake_sections.sh b/tests/test_monolith_wake_sections.sh
+deleted file mode 100755
+index ce10167..0000000
+--- a/tests/test_monolith_wake_sections.sh
++++ /dev/null
+@@ -1,76 +0,0 @@
+-#!/usr/bin/env bash
+-# tests/test_monolith_wake_sections.sh — the monolith's related-memories
+-# section and goal-review hint (design/related_memories.md). Drives
+-# thinkers/monolith/step against a throwaway identity with a stubbed shellm
+-# that captures the --prompt-file. Pins: the section appears with a memory
+-# matched to the stream, the names shown land in the state file and are not
+-# shown again next wake, MONOLITH_RELATED_MEMORIES=0 removes the section, the
+-# goal-review hint fires on the first wake and not on the next, and the
+-# active-goals section lists a todo with its type.
+-set -uo pipefail
+-unset IDENTITY_DIR IDENTITY_NAME MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID 2>/dev/null
+-HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(dirname "$HERE")"; STEP="$REPO/thinkers/monolith/step"
+-pass=0; fail=0
+-ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
+-bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
+-WORK=$(mktemp -d); trap 'cd /; rm -rf "$WORK"' EXIT
+-ID="$WORK/ident"; TRAJ_ID="cafe0000-0000-0000-0000-0000000000bb"
+-mkdir -p "$ID/memories" "$ID/trajectories/$TRAJ_ID" "$ID/run" "$WORK/stub" "$WORK/home"
+-printf 'name=testid\ncreated=test\nroot_trajectory=%s\n' "$TRAJ_ID" > "$ID/info.txt"
+-TRAJ="$ID/trajectories/$TRAJ_ID/trajectory.jsonl"; : > "$TRAJ"
+-printf 'test-token\n' > "$ID/run/dispatcher.token"
+-cat > "$WORK/stub/shellm" <<'STUB'
+-#!/usr/bin/env bash
+-prev=""
+-for a in "$@"; do [[ "$prev" == "--prompt-file" ]] && cp "$a" "$STUB_CAPTURE"; prev="$a"; done
+-printf '{"step_id":"obs-%s","type":"observation","content":"did a thing","source":"monolith","ts":"%s"}\n' "$RANDOM" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$STUB_TRAJ"
+-exit 0
+-STUB
+-chmod +x "$WORK/stub/shellm"
+-export STUB_CAPTURE="$WORK/prompt" STUB_TRAJ="$TRAJ" SHELLM_MODEL=test-model
+-STATE="$ID/run/monolith_backoff_state.json"
+-mk() { printf -- '---\nid: x\nsummary: s\ntype: %s\ncreated: %s\n---\n\n%s\n' "$2" "$3" "$4" > "$ID/memories/$1.md"; }
+-mk 2026-08-20-00-00-00_a1_gh   fact "2026-08-20 00:00:00" "GitHub write on this box: gh is logged in as headlong42, pull-only on laude-institute"
+-mk 2026-08-21-00-00-00_b2_disp fact "2026-08-21 00:00:00" "The dispatcher token file arms the wake and lives under run/"
+-mk 2026-08-22-00-00-00_c3_todo todo "2026-08-22 00:00:00" "Ping Braden about the temporal test"
+-printf '{"step_id":"t1","type":"thought","content":"I should check the github pull-only login headlong42 before the PR work","source":"monolith","ts":"2026-09-04T00:00:00Z"}\n' >> "$TRAJ"
+-mkdir -p "$ID/workdir/notes"; printf 'a\n' > "$ID/workdir/notes/a.md"; printf 'b\n' > "$ID/workdir/notes/b.md"
+-
+-run_step() {  # $1 = trigger json, then env overrides
+-    local trig="$1"; shift
+-    printf '%s' "$trig" | env PATH="$WORK/stub:$REPO/bin:$PATH" \
+-        IDENTITY_DIR="$ID" IDENTITY_NAME=testid MEM_DIR="$ID/memories" \
+-        TRAJ_DIR="$ID/trajectories" TRAJ_ID="$TRAJ_ID" HOME="$WORK/home" \
+-        MONOLITH_TIERED_MEMORY=0 MONOLITH_SHARE_HINT_EVERY=0 "$@" "$STEP" >> "$WORK/step.log" 2>&1
+-}
+-WAKE='{"type":"monolith-wake","content":"wake","source":"monolith-timer"}'
+-
+-run_step "$WAKE"
+-p=$(cat "$STUB_CAPTURE" 2>/dev/null)
+-grep -q '^Related memories' <<<"$p" && ok "the related-memories section is in the wake prompt" || bad "related section present" "$(grep -c . <<<"$p") lines"
+-grep -q '^Runtime: headlong [0-9a-f]\{7,\} (' <<<"$p" && ok "the runtime line names the checked-out commit" || bad "runtime line present"
+-grep -q '^Workspace: ' <<<"$p" && ok "the workspace section is in the wake prompt" || bad "workspace section present"
+-grep -q '^- notes/ 2 files' <<<"$p" && ok "the workspace section counts files per directory" || bad "workspace dir count" "$(grep '^- ' <<<"$p" | head -3)"
+-grep -q 'No WORKSPACE.md yet' <<<"$p" && ok "the workspace section invites a WORKSPACE.md when none exists" || bad "workspace invite"
+-grep -q 'a1_gh \[fact, ' <<<"$p" && ok "the memory matched to the stream is listed with its type" || bad "matched memory listed"
+-grep -q 'GOAL REVIEW (about once a week)' <<<"$p" && ok "the goal-review hint fires on the first wake" || bad "goal review hint fires"
+-grep -q '\[todo, ' <<<"$p" && ok "the active-goals section shows the todo with its type" || bad "goals section shows todo"
+-[[ "$(jq -r '.related_prev[0]' "$STATE" 2>/dev/null)" == 2026-08-20-00-00-00_a1_gh ]] && ok "the names shown are saved in the state file" || bad "state file has related_prev" "$(cat "$STATE" 2>/dev/null)"
+-[[ "$(jq -r '.goal_review_at' "$STATE" 2>/dev/null)" -gt 0 ]] && ok "the goal-review time is saved" || bad "goal_review_at saved"
+-
+-run_step "$WAKE"
+-p2=$(cat "$STUB_CAPTURE")
+-if grep -q '^Related memories' <<<"$p2"; then
+-    grep -q 'a1_gh' <<<"$p2" && bad "a memory shown last wake is not shown again" || ok "a memory shown last wake is not shown again"
+-else
+-    ok "a memory shown last wake is not shown again (nothing else matched, section omitted)"
+-fi
+-grep -q 'GOAL REVIEW (about once a week)' <<<"$p2" && bad "the goal-review hint does not repeat within the period" || ok "the goal-review hint does not repeat within the period"
+-
+-rm -f "$STATE"; run_step "$WAKE" MONOLITH_RELATED_MEMORIES=0 MONOLITH_GOAL_REVIEW_DAYS=0
+-p3=$(cat "$STUB_CAPTURE")
+-grep -q '^Related memories' <<<"$p3" && bad "MONOLITH_RELATED_MEMORIES=0 removes the section" || ok "MONOLITH_RELATED_MEMORIES=0 removes the section"
+-grep -q 'GOAL REVIEW (about once a week)' <<<"$p3" && bad "MONOLITH_GOAL_REVIEW_DAYS=0 disables the hint" || ok "MONOLITH_GOAL_REVIEW_DAYS=0 disables the hint"
+-
+-printf '\n%d passed, %d failed\n' "$pass" "$fail"
+-[[ "$fail" -eq 0 ]]
+diff --git a/tests/test_related_memories.sh b/tests/test_related_memories.sh
+index 2e28f55..06aa495 100755
+--- a/tests/test_related_memories.sh
++++ b/tests/test_related_memories.sh
+@@ -1,19 +1,20 @@
+ #!/usr/bin/env bash
+-# tests/test_related_memories.sh — the two memory sections of the wake prompt
+-# (design/related_memories.md): get_goals shows every goal-family type newest
+-# first with type and age, hides an expired todo, caps the list with a count;
++# Native goal-family visibility and associative memory selection. Goal context
++# uses the durable Custos projection; formatting, newest-first ordering and
++# the former eight-item cap are not contracts.
+ # _related_memories ranks the store against the wake's material with
+ # `mem prefilter`, prints name/type/age/first sentence, skips memories shown
+ # last wake and memories under a day old, and prints nothing for the prompt
+ # template's own words.
+ set -uo pipefail
+ HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(dirname "$HERE")"
++RENEWAL="${CUSTOS_RENEWAL_DIR:-$REPO/../custos/renewal}"
+ pass=0; fail=0
+ ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
+ bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
+ check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$d"; else bad "$d"; fi; }
+ WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+-export MEM_DIR="$WORK/mem" PATH="$REPO/bin:$PATH"; mkdir -p "$MEM_DIR"
++export MEM_DIR="$WORK/mem" PATH="$RENEWAL/bin:$REPO/bin:$PATH"; mkdir -p "$MEM_DIR"
+ mk() {  # mk <name> <type> <created> <extra-frontmatter> <body>
+     printf -- '---\nid: x\nsummary: s\ntype: %s\ncreated: %s\n%s---\n\n%s\n' "$2" "$3" "$4" "$5" > "$MEM_DIR/$1.md"
+ }
+@@ -31,16 +32,11 @@ mk 2026-09-04-00-00-00_g7_fresh     fact      "$(date -u +'%Y-%m-%d %H:%M:%S')"
+ 
+ lib() { ( source "$REPO/thinkers/_lib/common.sh"; "$@" ); }
+ 
+-g=$(lib get_goals "$MEM_DIR")
+-check "all four goal types appear"            bash -c 'grep -q "\[goal," <<<"$1" && grep -q "\[intention," <<<"$1" && grep -q "\[objective," <<<"$1" && grep -q "\[todo," <<<"$1"' _ "$g"
+-check "an expired todo is hidden"             bash -c '! grep -q "PR queue" <<<"$1"' _ "$g"
+-check "an open todo shows its until date"     grep -q 'until 2999-01-01\] Ping Braden' <<<"$g"
+-check "newest first"                          bash -c 'printf "%s\n" "$1" | head -1 | grep -q "Ping Braden"' _ "$g"
+-check "age is shown in weeks for old goals"   grep -qE '\[goal, [0-9]+w\] Design a retrieval' <<<"$g"
+-g1=$(GOALS_MAX=1 lib get_goals "$MEM_DIR")
+-check "the cap keeps N lines and counts the rest" bash -c 'test "$(grep -c "^- \[" <<<"$1")" -eq 1 && grep -q "and 3 more: mem list" <<<"$1"' _ "$g1"
+-mkdir -p "$WORK/empty"; e=$(lib get_goals "$WORK/empty")
+-[[ "$e" == "(no goals set)" ]] && ok "no goal memories -> (no goals set)" || bad "no goal memories -> (no goals set)" "$e"
++g=$(custos-memory context --json)
++check "all four native goal families remain visible" jq -e \
++    '[.goals[].type] | sort | unique == ["goal","intention","objective","todo"]' <<<"$g"
++check "expired todos cannot remain active work" jq -e \
++    'all(.goals[]; .summary | contains("PR queue") | not)' <<<"$g"
+ 
+ r=$(lib _related_memories "PENDING REQUEST from nick: Address Nick's review comments on headlong PR #108 and follow up github pull" "" 3)
+ check "the GitHub-access note is picked for a PR request" grep -q 'd4_gh \[fact, ' <<<"$r"
+diff --git a/tests/test_responder_deferral.sh b/tests/test_responder_deferral.sh
+index 9c2aa58..02758d4 100755
+--- a/tests/test_responder_deferral.sh
++++ b/tests/test_responder_deferral.sh
+@@ -1,228 +1,14 @@
+ #!/usr/bin/env bash
+-# tests/test_responder_deferral.sh — deferrals that bind the mind
+-# (design/conversation_memory.md, part 5).
+-#
+-# Usage: tests/test_responder_deferral.sh
+-#
+-# The responder has no tools. When the model answers "DEFER: <work>" on the
+-# first line, the step must send the holding message below it, append an
+-# `action` step (source responder, trigger_step, person, request) that the
+-# monolith routes on, and mark its observation deferred. The monolith step
+-# must then show a PENDING REQUEST routing hint naming the exact follow-up
+-# command until an observation carries resolves=<trigger>. `chat reply
+-# --follow-up` must deliver a second reply to an already answered message,
+-# which the duplicate guard otherwise refuses. Stubbed llm and shellm; no LLM
+-# calls, no docker.
+-
+-set -uo pipefail
+-unset IDENTITY_DIR IDENTITY_NAME MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID THINK_CONTEXT_TAIL 2>/dev/null
+-
++# Native handoff, no-reply, crash replay and capture reconciliation regressions.
++set -euo pipefail
+ HERE="$(cd "$(dirname "$0")" && pwd)"
+-REPO="$(dirname "$HERE")"
+-RESPONDER="$REPO/thinkers/responder/step"
+-MONOLITH="$REPO/thinkers/monolith/step"
+-
+-pass=0
+-fail=0
+-ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
+-bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
+-
+-command -v jq >/dev/null 2>&1 || { echo "FAIL jq not found"; exit 1; }
+-
+-WORK=$(mktemp -d)
+-trap 'cd /; rm -rf "$WORK"' EXIT
+-
+-ME=testid
+-THEM=andy
+-ID="$WORK/ident"
+-TRAJ_ID="cafe0000-0000-0000-0000-0000000000de"
+-mkdir -p "$ID/memories" "$ID/trajectories/$TRAJ_ID" "$ID/run"
+-printf 'name=%s\ncreated=test\nroot_trajectory=%s\n' "$ME" "$TRAJ_ID" > "$ID/info.txt"
+-TRAJ="$ID/trajectories/$TRAJ_ID/trajectory.jsonl"
+-printf 'test-token\n' > "$ID/run/dispatcher.token"
+-
+-mkdir -p "$WORK/stub"
+-cat > "$WORK/stub/llm" <<'STUB'
+-#!/usr/bin/env bash
+-cat "$STUB_REPLY_FILE"
+-STUB
+-cat > "$WORK/stub/shellm" <<'STUB'
+-#!/usr/bin/env bash
+-prev=""
+-for a in "$@"; do [[ "$prev" == "--prompt-file" ]] && cp "$a" "$STUB_CAPTURE"; prev="$a"; done
+-exit 0
+-STUB
+-chmod +x "$WORK/stub/llm" "$WORK/stub/shellm"
+-export STUB_REPLY_FILE="$WORK/reply" STUB_CAPTURE="$WORK/prompt"
+-
+-ENV_COMMON=(PATH="$WORK/stub:$REPO/bin:$REPO/tools:$PATH" IDENTITY_DIR="$ID" IDENTITY_NAME="$ME"
+-    MEM_DIR="$ID/memories" TRAJ_DIR="$ID/trajectories" TRAJ_ID="$TRAJ_ID" HOME="$WORK/home"
+-    SHELLM_MODEL=stub-model THINK_CONTEXT_TAIL=30 RESPONDER_PERSON_NOTES=0 MONOLITH_TIERED_MEMORY=0)
+-run_responder() { printf '%s' "$1" | env "${ENV_COMMON[@]}" "$RESPONDER" >> "$WORK/step.log" 2>&1; }
+-run_monolith()  { printf '%s' "$1" | env "${ENV_COMMON[@]}" MONOLITH_SHARE_HINT_EVERY=0 "$MONOLITH" >> "$WORK/step.log" 2>&1; }
+-now() { date -u +%Y-%m-%dT%H:%M:%S.000Z; }
+-
+-# --- 1. a DEFER reply: holding message + action + deferred observation -------
+-: > "$TRAJ"
+-printf '{"step_id":"hdr","type":"trajectory","ts":"%s"}\n' "$(now)" >> "$TRAJ"
+-printf '{"step_id":"trig-1","type":"message","from":"%s","to":"%s","content":"how is the bridge work going?","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+-printf 'DEFER: check the telegram bridge work status and report it\nLet me look into that and get back to you.\n' > "$STUB_REPLY_FILE"
+-run_responder "$(grep -F '"step_id":"trig-1"' "$TRAJ")"
+-
+-sent=$(jq -c 'select(.type=="message" and .from=="testid" and .reply_to=="trig-1")' "$TRAJ" | tail -1)
+-if [[ "$(printf '%s' "$sent" | jq -r .content)" == "Let me look into that and get back to you." ]]; then
+-    ok "the holding message below DEFER is what gets sent"
+-else
+-    bad "the holding message below DEFER is what gets sent" "got $sent"
+-fi
+-act=$(jq -c 'select(.type=="action" and .source=="responder")' "$TRAJ" | tail -1)
+-if [[ -n "$act" && "$(printf '%s' "$act" | jq -r .trigger_step)" == trig-1 \
+-      && "$(printf '%s' "$act" | jq -r .person)" == "$THEM" \
+-      && "$(printf '%s' "$act" | jq -r .request)" == "check the telegram bridge work status and report it" ]]; then
+-    ok "an action step carries trigger_step, person, and the request"
+-else
+-    bad "an action step carries trigger_step, person, and the request" "got $act"
+-fi
+-if printf '%s' "$act" | jq -e '.content | contains("chat reply --follow-up --reply-to trig-1 andy") and contains("resolves=trig-1")' >/dev/null 2>&1; then
+-    ok "the action names the exact delivery command"
+-else
+-    bad "the action names the exact delivery command" "got $(printf '%s' "$act" | jq -r .content)"
+-fi
+-act_line=$(grep -n '"type":"action"' "$TRAJ" | cut -d: -f1 | tail -1)
+-msg_line=$(grep -n '"reply_to":"trig-1"' "$TRAJ" | cut -d: -f1 | tail -1)
+-[[ "$act_line" -lt "$msg_line" ]] && ok "the action is appended before the holding message" || bad "the action is appended before the holding message" "action line $act_line, message line $msg_line"
+-obs=$(jq -c 'select(.type=="observation" and .source=="responder" and .trigger_step=="trig-1")' "$TRAJ" | tail -1)
+-if [[ "$(printf '%s' "$obs" | jq -r .decision)" == replied && "$(printf '%s' "$obs" | jq -r .deferred)" == true \
+-      && "$(printf '%s' "$obs" | jq -r .context_msgs)" =~ ^[0-9]+$ ]]; then
+-    ok "the observation is replied + deferred, with the metrics"
+-else
+-    bad "the observation is replied + deferred, with the metrics" "got $obs"
+-fi
+-
+-# --- 2. the monolith sees a PENDING REQUEST hint until it is resolved --------
+-rm -f "$STUB_CAPTURE"
+-run_monolith "$act"
+-if grep -q 'PENDING REQUEST from andy: check the telegram bridge work status' "$STUB_CAPTURE" 2>/dev/null \
+-   && grep -q 'chat reply --follow-up --reply-to trig-1 andy' "$STUB_CAPTURE" \
+-   && grep -q -- '--field resolves=trig-1' "$STUB_CAPTURE"; then
+-    ok "the monolith prompt shows the pending request with the delivery command"
+-else
+-    bad "the monolith prompt shows the pending request with the delivery command" "$(grep -o 'PENDING[^\n]*' "$STUB_CAPTURE" 2>/dev/null | head -1)"
+-fi
+-if grep -q 'pending request' "$REPO/thinkers/monolith/prompt.md" && grep -q -- '--follow-up' "$REPO/thinkers/monolith/prompt.md"; then
+-    ok "the monolith prompt allows the one reply exception"
+-else
+-    bad "the monolith prompt allows the one reply exception"
+-fi
+-if grep -q 'outranks the rest of this menu' "$REPO/thinkers/monolith/prompt.md" \
+-   && grep -q 'unless you have a good reason not to' "$REPO/thinkers/monolith/prompt.md" \
+-   && grep -q 'names the reason and what would unblock it' "$REPO/thinkers/monolith/prompt.md"; then
+-    ok "the monolith prompt ranks a pending request first, with a stated-reason escape hatch"
+-else
+-    bad "the monolith prompt ranks a pending request first, with a stated-reason escape hatch"
+-fi
+-if grep -q 'Strongly prefer doing this work now (act), timer wake or not' "$STUB_CAPTURE" 2>/dev/null \
+-   && grep -q 'If you have a good reason not to this wake, append a thought saying why' "$STUB_CAPTURE" 2>/dev/null; then
+-    ok "the hint says to strongly prefer acting, or to say why not"
+-else
+-    bad "the hint says to strongly prefer acting, or to say why not"
+-fi
+-
+-# --- 2b. every open request stays visible: an older one is not masked by a
+-# newer one, and none ages out of the recent-stream window (Audel, 2026-09-02:
+-# a request was hidden behind a newer one, then scrolled out of the 20-step
+-# window and was never delivered) ------------------------------------------
+-printf '{"step_id":"trig-1b","type":"message","from":"bob","to":"%s","content":"can you check the deploy?","ts":"%s","source":"chat"}\n' "$ME" "$(now)" >> "$TRAJ"
+-env "${ENV_COMMON[@]}" traj append --field type=action --field source=responder --field trigger_step=trig-1b \
+-    --field person=bob --field request="check the deploy status" --field content="Pending request from bob: check the deploy status." >/dev/null
+-i=0
+-while [[ $i -lt 40 ]]; do
+-    env "${ENV_COMMON[@]}" traj append --field type=thought --field content="filler thought $i" >/dev/null
+-    i=$((i+1))
+-done
+-# a request from long ago, written straight to the log so its ts is old
+-printf '{"step_id":"act-old","type":"action","source":"responder","trigger_step":"trig-old","person":"carol","request":"find that old paper","content":"Pending request from carol: find that old paper.","ts":"2020-01-01T00:00:00.000Z"}\n' >> "$TRAJ"
+-rm -f "$STUB_CAPTURE"
+-run_monolith '{"type":"monolith-wake","content":"wake","source":"monolith-timer"}'
+-andy_line=$(grep -n 'PENDING REQUEST from andy' "$STUB_CAPTURE" 2>/dev/null | head -1 | cut -d: -f1)
+-bob_line=$(grep -n 'PENDING REQUEST from bob: check the deploy status' "$STUB_CAPTURE" 2>/dev/null | head -1 | cut -d: -f1)
+-if [[ -n "$andy_line" && -n "$bob_line" ]]; then
+-    ok "both open requests show after 40 later steps buried them"
+-else
+-    bad "both open requests show after 40 later steps buried them" "andy=${andy_line:-none} bob=${bob_line:-none}"
+-fi
+-[[ -n "$andy_line" && -n "$bob_line" && "$andy_line" -lt "$bob_line" ]] && ok "the oldest request is listed first" || bad "the oldest request is listed first"
+-grep -q 'PENDING REQUEST from andy: [^(]*(pending for [0-9]* min)' "$STUB_CAPTURE" 2>/dev/null && ok "each request shows its age" || bad "each request shows its age" "$(grep -o 'PENDING REQUEST from andy[^.]*' "$STUB_CAPTURE" | head -1)"
+-if ! grep -q 'PENDING REQUEST from carol' "$STUB_CAPTURE" 2>/dev/null; then
+-    ok "a request older than the max age is not listed"
+-else
+-    bad "a request older than the max age is not listed"
+-fi
+-rm -f "$STUB_CAPTURE"
+-printf '{"type":"monolith-wake","content":"wake","source":"monolith-timer"}' | env "${ENV_COMMON[@]}" MONOLITH_SHARE_HINT_EVERY=0 MONOLITH_PENDING_MAX_AGE=3000d "$MONOLITH" >> "$WORK/step.log" 2>&1
+-if grep -q 'PENDING REQUEST from carol: find that old paper (pending for [0-9]* d, OVERDUE' "$STUB_CAPTURE" 2>/dev/null; then
+-    ok "a request past the overdue line says so"
+-else
+-    bad "a request past the overdue line says so" "$(grep -o 'PENDING REQUEST from carol[^.]*' "$STUB_CAPTURE" | head -1)"
+-fi
+-n=$(env "${ENV_COMMON[@]}" chat pending --json | jq 'length')
+-[[ "$n" == 3 ]] && ok "chat pending --json lists every unresolved request" || bad "chat pending --json lists every unresolved request" "got $n"
+-n=$(env "${ENV_COMMON[@]}" chat pending --max-age 30d --json | jq 'length')
+-[[ "$n" == 2 ]] && ok "chat pending --max-age drops old requests" || bad "chat pending --max-age drops old requests" "got $n"
+-first=$(env "${ENV_COMMON[@]}" chat pending | head -1)
+-[[ "$first" == *"carol: find that old paper (pending "*"trigger trig-old)" ]] && ok "chat pending text lines carry person, request, age, trigger" || bad "chat pending text lines carry person, request, age, trigger" "got '$first'"
+-
+-# the mind delivers: follow-up reply to an already answered trigger
+-if printf 'The bridge work is half done: file sends work, photos next.' \
+-     | env "${ENV_COMMON[@]}" chat reply --follow-up --reply-to trig-1 "$THEM" 2>>"$WORK/step.log"; then
+-    ok "chat reply --follow-up sends a second reply to an answered message"
+-else
+-    bad "chat reply --follow-up sends a second reply to an answered message" "$(tail -2 "$WORK/step.log")"
+-fi
+-n=$(jq -c 'select(.type=="message" and .from=="testid" and .reply_to=="trig-1")' "$TRAJ" | wc -l | tr -d ' ')
+-fu=$(jq -c 'select(.type=="message" and .from=="testid" and .reply_to=="trig-1" and .follow_up==true)' "$TRAJ" | wc -l | tr -d ' ')
+-[[ "$n" == 2 && "$fu" == 1 ]] && ok "the follow-up is stamped reply_to and follow_up:true" || bad "the follow-up is stamped reply_to and follow_up:true" "replies=$n follow_up=$fu"
+-if ! printf 'dup' | env "${ENV_COMMON[@]}" chat reply --reply-to trig-1 "$THEM" 2>/dev/null; then
+-    bad "a plain second reply is still refused by the guard" "chat exited nonzero"
+-else
+-    n2=$(jq -c 'select(.type=="message" and .from=="testid" and .reply_to=="trig-1")' "$TRAJ" | wc -l | tr -d ' ')
+-    [[ "$n2" == 2 ]] && ok "a plain second reply is still refused by the guard" || bad "a plain second reply is still refused by the guard" "now $n2 replies"
+-fi
+-
+-# resolving observations clear the hint, one request at a time
+-env "${ENV_COMMON[@]}" traj append --field type=observation --field content="Delivered the bridge status to andy." --field source=monolith --field resolves=trig-1 >/dev/null
+-rm -f "$STUB_CAPTURE"
+-run_monolith '{"type":"monolith-wake","content":"wake","source":"monolith-timer"}'
+-if ! grep -q 'PENDING REQUEST from andy' "$STUB_CAPTURE" 2>/dev/null && grep -q 'PENDING REQUEST from bob' "$STUB_CAPTURE" 2>/dev/null; then
+-    ok "an observation with resolves=<trigger> clears that request and leaves the others"
+-else
+-    bad "an observation with resolves=<trigger> clears that request and leaves the others" "$(grep -o 'PENDING REQUEST from [a-z]*' "$STUB_CAPTURE" | sort -u | tr '\n' ' ')"
+-fi
+-env "${ENV_COMMON[@]}" traj append --field type=observation --field content="Told bob the deploy is green." --field source=monolith --field resolves=trig-1b >/dev/null
+-rm -f "$STUB_CAPTURE"
+-run_monolith '{"type":"monolith-wake","content":"wake","source":"monolith-timer"}'
+-if ! grep -q 'PENDING REQUEST' "$STUB_CAPTURE" 2>/dev/null; then
+-    ok "resolving the last open request clears the hint"
+-else
+-    bad "resolving the last open request clears the hint"
+-fi
+-
+-# --- 3. a normal reply appends no action ------------------------------------
+-printf '{"step_id":"trig-2","type":"message","from":"%s","to":"%s","content":"thanks!","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+-printf 'Any time.\n' > "$STUB_REPLY_FILE"
+-run_responder "$(grep -F '"step_id":"trig-2"' "$TRAJ")"
+-acts=$(jq -c 'select(.type=="action" and .source=="responder")' "$TRAJ" | wc -l | tr -d ' ')
+-[[ "$acts" == 3 ]] && ok "a normal reply appends no action"   # the three deferrals above, none new || bad "a normal reply appends no action" "actions=$acts"
+-obs=$(jq -c 'select(.type=="observation" and .source=="responder" and .trigger_step=="trig-2")' "$TRAJ" | tail -1)
+-[[ "$(printf '%s' "$obs" | jq 'has("deferred")')" == false ]] && ok "a normal reply is not marked deferred" || bad "a normal reply is not marked deferred"
+-
+-# --- 4. DEFER with nothing under it gets the default holding line -----------
+-printf '{"step_id":"trig-3","type":"message","from":"%s","to":"%s","content":"what is in the latest commit?","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+-printf 'DEFER: read the latest commit and summarize it\n' > "$STUB_REPLY_FILE"
+-run_responder "$(grep -F '"step_id":"trig-3"' "$TRAJ")"
+-sent=$(jq -r 'select(.type=="message" and .from=="testid" and .reply_to=="trig-3") | .content' "$TRAJ" | tail -1)
+-[[ "$sent" == "Let me look into that and get back to you." ]] && ok "a bare DEFER sends the default holding line" || bad "a bare DEFER sends the default holding line" "got '$sent'"
+-
+-echo
+-echo "$pass passed, $fail failed"
+-[[ $fail -eq 0 ]]
++export HEADLONG_ROOT="$(dirname "$HERE")"
++RENEWAL="${CUSTOS_RENEWAL_DIR:-$HEADLONG_ROOT/../custos/renewal}"
++exec python3 "$RENEWAL/tests/test_memory.py" \
++    ResponderTests.test_memory_before_ack_and_native_followup_does_not_complete_goal \
++    ResponderTests.test_reply_committed_then_failed_replays_without_model_or_duplicate \
++    ResponderTests.test_concurrent_duplicate_responses_send_once \
++    ResponderTests.test_invalid_model_outputs_never_ack_or_retire_original \
++    ResponderTests.test_no_reply_is_durable_but_cannot_erase_a_misclassified_directive \
++    ResponderTests.test_legacy_defer_delivers_only_human_text \
++    ResponderTests.test_context_recovers_capture_failure_from_old_native_ingress
+diff --git a/tests/test_responder_idempotency.sh b/tests/test_responder_idempotency.sh
+deleted file mode 100755
+index e270f86..0000000
+--- a/tests/test_responder_idempotency.sh
++++ /dev/null
+@@ -1,167 +0,0 @@
+-#!/usr/bin/env bash
+-# tests/test_responder_idempotency.sh — the responder's "already handled?"
+-# check, and the window it reads to answer it.
+-#
+-# Every inbound message runs this check before a reply is composed, so it sits
+-# on the latency path. It used to scan the whole root trajectory: measured at
+-# 0.98s over 40MB and 7.4s over 308MB, against ~0.08s for the tail, and
+-# design/monolith_run_health.md records real trajectories in that range.
+-#
+-# Reading a window is only sound because every record the check looks for (a
+-# stamped reply, a decision observation, a live claim, a later message to the
+-# same person) can only be appended AFTER the trigger step. So a window holding
+-# the trigger holds everything relevant to it; a window that does NOT is the
+-# case that must fall back to the full scan, or a redelivered old message gets
+-# answered twice.
+-#
+-# The six verdict cases are pinned first because they are the behaviour the
+-# bounded read must not change.
+-
+-set -uo pipefail
+-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+-export PATH="$REPO/bin:$PATH"
+-
+-pass=0
+-fail=0
+-ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
+-bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
+-
+-command -v jq >/dev/null 2>&1 || { echo "FAIL jq not found — the check needs it, so this proves nothing"; exit 1; }
+-
+-WORK=$(mktemp -d)
+-trap 'rm -rf "$WORK"' EXIT
+-
+-ME=ada
+-THEM=nick
+-TRIGGER=trig-1
+-FRESH=$(date -u +%Y-%m-%dT%H:%M:%S)
+-STALE=2000-01-01T00:00:00
+-
+-# build <file> <filler-lines> <extra-json-lines...> — a trajectory whose
+-# trigger sits after <filler-lines> junk steps.
+-build() {
+-    local f="$1" filler="$2"; shift 2
+-    : > "$f"
+-    local i
+-    for ((i=0; i<filler; i++)); do
+-        printf '{"step_id":"pad-%d","type":"shellm-run","from":"%s","content":"pad"}\n' "$i" "$ME" >> "$f"
+-    done
+-    printf '{"step_id":"%s","type":"message","from":"%s","to":"%s","content":"hello"}\n' "$TRIGGER" "$THEM" "$ME" >> "$f"
+-    local line
+-    for line in "$@"; do printf '%s\n' "$line" >> "$f"; done
+-}
+-
+-# verdict <trajectory-file> [tail-lines] — run the check, echo its answer
+-verdict() {
+-    local f="$1" tail_lines="${2:-5000}" d
+-    d="$WORK/run"; rm -rf "$d"; mkdir -p "$d/trajs/aaaaaaaa-t"
+-    cp "$f" "$d/trajs/aaaaaaaa-t/trajectory.jsonl"
+-    (
+-        export TRAJ_DIR="$d/trajs" ROOT_TRAJ_ID=aaaaaaaa TRAJ_ID=aaaaaaaa
+-        export IDENTITY_NAME="$ME" SHELLM_RAW_TAIL_LINES="$tail_lines"
+-        export RESPONDER_TRAJ_FILE="$d/trajs/aaaaaaaa-t/trajectory.jsonl"
+-        # shellcheck disable=SC1090  # the library under test
+-        source "$REPO/thinkers/_lib/common.sh"
+-        _responder_already_handled "$TRIGGER" "$THEM" "$(date -u -v-180S +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -u -d '180 seconds ago' +%Y-%m-%dT%H:%M:%S)"
+-    )
+-}
+-
+-# check <name> <want> <got> — <want> is the exact step id expected (or
+-# "unhandled" for empty). Any non-empty comparison would let the sentinel
+-# escape _responder_already_handled and read as handled, which would skip
+-# every reply while the suite stayed green.
+-check() {
+-    local name="$1" want="$2" got="$3"
+-    if [[ "$got" == *$'\x01'* ]]; then
+-        bad "$name" "sentinel leaked: '$got'"
+-    elif [[ "$want" == unhandled && -z "$got" ]] || [[ "$want" != unhandled && "$got" == "$want" ]]; then
+-        ok "$name"
+-    else
+-        bad "$name" "wanted $want, got '${got:-<empty>}'"
+-    fi
+-}
+-
+-# --- the six verdicts, which the bounded read must preserve ---------------
+-build "$WORK/a.jsonl" 3 "{\"step_id\":\"r1\",\"type\":\"message\",\"from\":\"$ME\",\"to\":\"$THEM\",\"reply_to\":\"$TRIGGER\",\"content\":\"hi\"}"
+-check "a stamped reply counts as handled"        r1        "$(verdict "$WORK/a.jsonl")"
+-
+-build "$WORK/b.jsonl" 3 "{\"step_id\":\"o1\",\"type\":\"observation\",\"trigger_step\":\"$TRIGGER\",\"decision\":\"no-reply\"}"
+-check "a no-reply decision sticks"               o1        "$(verdict "$WORK/b.jsonl")"
+-
+-build "$WORK/c.jsonl" 3 "{\"step_id\":\"c1\",\"type\":\"reply_claim\",\"trigger_step\":\"$TRIGGER\",\"ts\":\"$FRESH\"}"
+-check "a fresh claim counts as handled"          c1        "$(verdict "$WORK/c.jsonl")"
+-
+-build "$WORK/d.jsonl" 3 "{\"step_id\":\"c2\",\"type\":\"reply_claim\",\"trigger_step\":\"$TRIGGER\",\"ts\":\"$STALE\"}"
+-check "a stale claim does NOT count"             unhandled "$(verdict "$WORK/d.jsonl")"
+-
+-build "$WORK/e.jsonl" 3 "{\"step_id\":\"m1\",\"type\":\"message\",\"from\":\"$ME\",\"to\":\"$THEM\",\"content\":\"unstamped answer\"}"
+-check "an unstamped later message counts"        m1        "$(verdict "$WORK/e.jsonl")"
+-
+-build "$WORK/f.jsonl" 3
+-check "nothing about the trigger is unhandled"   unhandled "$(verdict "$WORK/f.jsonl")"
+-
+-# A message from us to them BEFORE the trigger must not count: that is the
+-# clause the trigger's position in the log decides.
+-: > "$WORK/g.jsonl"
+-printf '{"step_id":"old","type":"message","from":"%s","to":"%s","content":"earlier"}\n' "$ME" "$THEM" >> "$WORK/g.jsonl"
+-printf '{"step_id":"%s","type":"message","from":"%s","to":"%s","content":"hello"}\n' "$TRIGGER" "$THEM" "$ME" >> "$WORK/g.jsonl"
+-check "an earlier message does not count"        unhandled "$(verdict "$WORK/g.jsonl")"
+-
+-# --- the window, and the case that must escape it ------------------------
+-# A `traj` shim records every subcommand, so "did this read the whole file?"
+-# is answered by what was invoked rather than by timing.
+-mkdir -p "$WORK/shim"
+-cat > "$WORK/shim/traj" <<SHIM
+-#!/usr/bin/env bash
+-printf '%s\n' "\$1" >> "$WORK/traj-calls"
+-case "\$1" in
+-    path) if [ -n "\${RESPONDER_SHIM_NO_PATH:-}" ]; then exit 1
+-          else printf '%s\n' "\$RESPONDER_TRAJ_FILE"; fi ;;
+-    cat)  cat -- "\$RESPONDER_TRAJ_FILE" ;;
+-esac
+-SHIM
+-chmod +x "$WORK/shim/traj"
+-
+-# Trigger inside the window: the answer must come from the tail, with no full
+-# scan at all.
+-build "$WORK/h.jsonl" 20 "{\"step_id\":\"r1\",\"type\":\"message\",\"from\":\"$ME\",\"to\":\"$THEM\",\"reply_to\":\"$TRIGGER\",\"content\":\"hi\"}"
+-: > "$WORK/traj-calls"
+-got=$(PATH="$WORK/shim:$PATH" verdict "$WORK/h.jsonl" 50)
+-check "handled is still found inside the window" r1 "$got"
+-if grep -qx cat "$WORK/traj-calls"; then
+-    bad "no full scan when the trigger is in the window" "traj cat was called"
+-else
+-    ok "no full scan when the trigger is in the window"
+-fi
+-
+-# Trigger older than the window: the tail cannot see it, so the check must fall
+-# back to the full scan rather than reporting an unanswered message.
+-build "$WORK/i.jsonl" 200 "{\"step_id\":\"r1\",\"type\":\"message\",\"from\":\"$ME\",\"to\":\"$THEM\",\"reply_to\":\"$TRIGGER\",\"content\":\"hi\"}"
+-# push the trigger and its reply far above the window
+-for i in $(seq 1 100); do
+-    printf '{"step_id":"after-%d","type":"thought","from":"%s","content":"pad"}\n' "$i" "$ME" >> "$WORK/i.jsonl"
+-done
+-: > "$WORK/traj-calls"
+-got=$(PATH="$WORK/shim:$PATH" verdict "$WORK/i.jsonl" 50)
+-check "an old handled trigger is still found"    r1 "$got"
+-if grep -qx cat "$WORK/traj-calls"; then
+-    ok "the full scan runs when the trigger is out of the window"
+-else
+-    bad "the full scan runs when the trigger is out of the window" "traj cat was never called"
+-fi
+-
+-# No resolvable file at all: the check must degrade to exactly ONE full scan,
+-# not a --require-trigger scan whose sentinel buys a second identical one.
+-: > "$WORK/traj-calls"
+-got=$(RESPONDER_SHIM_NO_PATH=1 PATH="$WORK/shim:$PATH" verdict "$WORK/a.jsonl")
+-check "degraded path still finds the verdict"    r1 "$got"
+-cats=$(grep -cx cat "$WORK/traj-calls" || true)
+-if [[ "$cats" == 1 ]]; then
+-    ok "the degraded path runs exactly one full scan"
+-else
+-    bad "the degraded path runs exactly one full scan" "traj cat ran $cats times"
+-fi
+-
+-echo
+-echo "$pass passed, $fail failed"
+-[[ $fail -eq 0 ]]
+diff --git a/tests/test_responder_memory.sh b/tests/test_responder_memory.sh
+new file mode 100644
+index 0000000..af4cf35
+--- /dev/null
++++ b/tests/test_responder_memory.sh
+@@ -0,0 +1,10 @@
++#!/usr/bin/env bash
++# Person-note background rewriting was removed. The single responder model
++# may now create bounded typed memories, atomically and before acknowledgment.
++set -euo pipefail
++HERE="$(cd "$(dirname "$0")" && pwd)"
++export HEADLONG_ROOT="$(dirname "$HERE")"
++RENEWAL="${CUSTOS_RENEWAL_DIR:-$HEADLONG_ROOT/../custos/renewal}"
++exec python3 "$RENEWAL/tests/test_memory.py" \
++    ResponderTests.test_note_write_committed_then_failure_is_idempotent \
++    MemoryTests.test_updates_and_retirement_preserve_original_metadata_and_evidence
+diff --git a/tests/test_responder_metrics.sh b/tests/test_responder_metrics.sh
+index 26f7907..73f7268 100755
+--- a/tests/test_responder_metrics.sh
++++ b/tests/test_responder_metrics.sh
+@@ -18,6 +18,7 @@ unset IDENTITY_DIR IDENTITY_NAME MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID THINK_CON
+ HERE="$(cd "$(dirname "$0")" && pwd)"
+ REPO="$(dirname "$HERE")"
+ STEP="$REPO/thinkers/responder/step"
++RENEWAL="${CUSTOS_RENEWAL_DIR:-$REPO/../custos/renewal}"
+ 
+ pass=0
+ fail=0
+@@ -41,7 +42,7 @@ TRAJ="$ID/trajectories/$TRAJ_ID/trajectory.jsonl"
+ mkdir -p "$WORK/stub"
+ cat > "$WORK/stub/llm" <<'STUB'
+ #!/usr/bin/env bash
+-cat "$STUB_REPLY_FILE"
++jq -Rs '{reply:(rtrimstr("\n")),decision:(if rtrimstr("\n")=="NO_REPLY" then "no-reply" else "reply" end),goal:null,memories:[]} | if .decision=="no-reply" then .reply="" else . end' "$STUB_REPLY_FILE"
+ STUB
+ chmod +x "$WORK/stub/llm"
+ export STUB_REPLY_FILE="$WORK/reply"
+@@ -74,7 +75,7 @@ thoughts() {  # thoughts <count> <prefix>
+ 
+ run_step() {  # $1 = trigger json
+     printf '%s' "$1" | env \
+-        PATH="$WORK/stub:$REPO/bin:$REPO/tools:$PATH" \
++        PATH="$WORK/stub:$RENEWAL/bin:$REPO/bin:$REPO/tools:$PATH" \
+         IDENTITY_DIR="$ID" IDENTITY_NAME="$ME" MEM_DIR="$ID/memories" \
+         TRAJ_DIR="$ID/trajectories" TRAJ_ID="$TRAJ_ID" HOME="$WORK/home" \
+         SHELLM_MODEL="stub-model" THINK_CONTEXT_TAIL=20 \
+@@ -129,11 +130,10 @@ ms=$(field "$obs" compose_ms)
+ [[ "$ms" =~ ^[0-9]+$ ]] && ok "compose_ms is a number" || bad "compose_ms is a number" "got '$ms'"
+ [[ "$(field "$obs" model)" == stub-model ]] && ok "model recorded" || bad "model recorded" "got '$(field "$obs" model)'"
+ [[ "$(field "$obs" history_source)" == index ]] && ok "history came from the message index" || bad "history came from the message index" "got '$(field "$obs" history_source)'"
+-if grep -q '\[60 min ago\] how is the bridge work going' "$ID/run/logs/responder-prompts/"*trig-1* 2>/dev/null \
+-   && grep -q 'The current time is 20' "$ID/run/logs/responder-prompts/"*trig-1* 2>/dev/null; then
+-    ok "their messages carry an age stamp and the prompt states the current time"
++if grep -q '\[60 min ago\] how is the bridge work going' "$ID/run/logs/responder-prompts/"*trig-1* 2>/dev/null; then
++    ok "the older message carries its age stamp"
+ else
+-    bad "their messages carry an age stamp and the prompt states the current time" "$(grep -o '\[[^]]*ago\]' "$ID/run/logs/responder-prompts/"*trig-1* 2>/dev/null | head -2 | tr '\n' ' ')"
++    bad "the older message carries its age stamp"
+ fi
+ 
+ # --- 2. beyond the history window: context_msgs is 0 but gap_s still knows ---
+diff --git a/tests/test_responder_person_notes.sh b/tests/test_responder_person_notes.sh
+deleted file mode 100755
+index 17baf6a..0000000
+--- a/tests/test_responder_person_notes.sh
++++ /dev/null
+@@ -1,150 +0,0 @@
+-#!/usr/bin/env bash
+-# tests/test_responder_person_notes.sh — per-person notes the responder keeps
+-# (design/conversation_memory.md, part 4).
+-#
+-# Usage: tests/test_responder_person_notes.sh
+-#
+-# After a reply the responder rewrites a `type: person` memory for the sender's
+-# person key on a cheap model and reads it back into its next prompt. Pins:
+-# the file is created in mem's format with person_key and aliases; a second
+-# reply updates the same file (no duplicates) and keeps id, created, and
+-# aliases; the prompt carries a "What you know about" block; the notes prompt
+-# has the facts-only rules Experiment C asked for; key-shaped strings are
+-# redacted; RESPONDER_PERSON_NOTES=0 disables it. The writer runs in the
+-# foreground here (RESPONDER_PERSON_NOTES_SYNC=1). Stubbed llm; no LLM calls.
+-
+-set -uo pipefail
+-unset IDENTITY_DIR IDENTITY_NAME MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID THINK_CONTEXT_TAIL 2>/dev/null
+-
+-HERE="$(cd "$(dirname "$0")" && pwd)"
+-REPO="$(dirname "$HERE")"
+-STEP="$REPO/thinkers/responder/step"
+-
+-pass=0
+-fail=0
+-ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
+-bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
+-
+-command -v jq >/dev/null 2>&1 || { echo "FAIL jq not found"; exit 1; }
+-
+-WORK=$(mktemp -d)
+-trap 'cd /; rm -rf "$WORK"' EXIT
+-
+-ME=testid
+-THEM="slack-U0614H65RN3-C0BMVH6LM4K-1787508187.726149"
+-THEM_DM="slack-U0614H65RN3-D0BNW58GP5W"
+-ID="$WORK/ident"
+-TRAJ_ID="cafe0000-0000-0000-0000-0000000000f0"
+-mkdir -p "$ID/memories" "$ID/trajectories/$TRAJ_ID" "$ID/run"
+-printf 'name=%s\ncreated=test\nroot_trajectory=%s\n' "$ME" "$TRAJ_ID" > "$ID/info.txt"
+-TRAJ="$ID/trajectories/$TRAJ_ID/trajectory.jsonl"
+-
+-# The stub answers the notes call (system prompt mentions "private notes")
+-# from one file and the reply call from another, and records both prompts.
+-mkdir -p "$WORK/stub"
+-cat > "$WORK/stub/llm" <<'STUB'
+-#!/usr/bin/env bash
+-sys=""; prev=""
+-for a in "$@"; do [[ "$prev" == "-s" ]] && sys="$a"; prev="$a"; done
+-if [[ "$sys" == *"private notes"* ]]; then
+-    printf '%s\n' "$sys" > "$STUB_NOTES_SYS"
+-    cat "$STUB_NOTES_FILE"
+-else
+-    printf '%s\n' "$sys" > "$STUB_REPLY_SYS"
+-    cat "$STUB_REPLY_FILE"
+-fi
+-STUB
+-chmod +x "$WORK/stub/llm"
+-export STUB_REPLY_FILE="$WORK/reply" STUB_NOTES_FILE="$WORK/notes" STUB_NOTES_SYS="$WORK/notes.sys" STUB_REPLY_SYS="$WORK/reply.sys"
+-
+-run_step() {  # run_step <trigger json> [extra env...]
+-    local trig="$1"; shift
+-    printf '%s' "$trig" | env \
+-        PATH="$WORK/stub:$REPO/bin:$REPO/tools:$PATH" \
+-        IDENTITY_DIR="$ID" IDENTITY_NAME="$ME" MEM_DIR="$ID/memories" \
+-        TRAJ_DIR="$ID/trajectories" TRAJ_ID="$TRAJ_ID" HOME="$WORK/home" \
+-        SHELLM_MODEL=stub-model THINK_CONTEXT_TAIL=20 \
+-        RESPONDER_PERSON_NOTES_SYNC=1 "$@" \
+-        "$STEP" >> "$WORK/step.log" 2>&1
+-}
+-now() { date -u +%Y-%m-%dT%H:%M:%S.000Z; }
+-msg() { printf '{"step_id":"%s","type":"message","from":"%s","to":"%s","content":"%s","ts":"%s","source":"chat"}\n' "$1" "$2" "$3" "$4" "$(now)" >> "$TRAJ"; }
+-person_files() { grep -l '^type: person' "$ID/memories"/*.md 2>/dev/null | wc -l | tr -d ' '; }
+-
+-: > "$TRAJ"
+-printf '{"step_id":"hdr","type":"trajectory","ts":"%s"}\n' "$(now)" >> "$TRAJ"
+-
+-# --- 1. first reply creates the notes file --------------------------------
+-msg trig-1 "$THEM" "$ME" "hi, I am Andy, I run the lab. keep replies short please"
+-printf 'Hi Andy, will do.\n' > "$STUB_REPLY_FILE"
+-printf 'Andy runs the lab and reaches testid on Slack.\nPrefers short replies (stated 2026-09-02).\nToken sk-abcdefghijklmnopqrstuvwxyz0123 was pasted once.\n' > "$STUB_NOTES_FILE"
+-run_step "$(grep -F '"step_id":"trig-1"' "$TRAJ")"
+-
+-[[ "$(person_files)" == 1 ]] && ok "a type: person memory is created after the first reply" || bad "a type: person memory is created after the first reply" "found $(person_files); $(tail -3 "$WORK/step.log")"
+-f=$(grep -l '^type: person' "$ID/memories"/*.md | head -1)
+-if grep -q '^person_key: slack:U0614H65RN3$' "$f" && grep -q '^aliases: \[\]$' "$f" && grep -q '^id: [0-9a-f]\{8\}$' "$f" && grep -q '^created: ' "$f"; then
+-    ok "frontmatter has id, person_key, aliases, created in mem's format"
+-else
+-    bad "frontmatter has id, person_key, aliases, created" "$(sed -n 1,8p "$f")"
+-fi
+-grep -q 'Prefers short replies' "$f" && ok "the notes body is the model's output" || bad "the notes body is the model's output"
+-if grep -q '\[redacted\]' "$f" && ! grep -q 'sk-abcdefghijklmnop' "$f"; then
+-    ok "key-shaped strings are redacted before writing"
+-else
+-    bad "key-shaped strings are redacted before writing"
+-fi
+-case "$(basename "$f")" in
+-    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]_person-*.md) ok "filename follows mem's timestamp_hex_slug convention" ;;
+-    *) bad "filename follows mem's timestamp_hex_slug convention" "$(basename "$f")" ;;
+-esac
+-if grep -q 'facts and stated' "$STUB_NOTES_SYS" && grep -qi 'never turn one incident into a rule' "$STUB_NOTES_SYS" && grep -q 'do not record refusals' "$STUB_NOTES_SYS"; then
+-    ok "the notes prompt carries the facts-only rules from Experiment C"
+-else
+-    bad "the notes prompt carries the facts-only rules from Experiment C"
+-fi
+-
+-# --- 2. the next reply reads the notes and updates the same file ----------
+-# Add an alias by hand (what part 2's alias merge reads) and check it survives.
+-sed -i.bak 's/^aliases: \[\]$/aliases: [pwa:andy]/' "$f" && rm -f "$f.bak"
+-id_before=$(sed -n 's/^id: //p' "$f"); created_before=$(sed -n 's/^created: //p' "$f")
+-msg trig-2 "$THEM_DM" "$ME" "did you see the new PR?"
+-printf 'Not yet, looking now.\n' > "$STUB_REPLY_FILE"
+-printf 'Andy runs the lab and reaches testid on Slack (threads and DMs).\nPrefers short replies (stated 2026-09-02).\nAsked about a new PR on 2026-09-02; open.\n' > "$STUB_NOTES_FILE"
+-run_step "$(grep -F '"step_id":"trig-2"' "$TRAJ")"
+-
+-if grep -q 'What you know about slack-U0614H65RN3-D0BNW58GP5W' "$STUB_REPLY_SYS" && grep -q 'Prefers short replies' "$STUB_REPLY_SYS"; then
+-    ok "the reply prompt carries the notes, found via the DM name (same person key)"
+-else
+-    bad "the reply prompt carries the notes, found via the DM name" "$(grep -c 'What you know' "$STUB_REPLY_SYS")"
+-fi
+-grep -q 'do not treat one past incident as a rule' "$STUB_REPLY_SYS" && ok "the reader block warns against reading notes as rules" || bad "the reader block warns against reading notes as rules"
+-[[ "$(person_files)" == 1 ]] && ok "the second reply updates the same file, no duplicate" || bad "the second reply updates the same file, no duplicate" "found $(person_files)"
+-f2=$(grep -l '^type: person' "$ID/memories"/*.md | head -1)
+-if [[ "$(sed -n 's/^id: //p' "$f2")" == "$id_before" && "$(sed -n 's/^created: //p' "$f2")" == "$created_before" ]] \
+-   && grep -q '^aliases: \[pwa:andy\]$' "$f2" && grep -q '^updated: ' "$f2" && grep -q 'Asked about a new PR' "$f2"; then
+-    ok "rewrite keeps id, created, and aliases; adds updated; carries the new body"
+-else
+-    bad "rewrite keeps id, created, and aliases; adds updated" "$(sed -n 1,9p "$f2")"
+-fi
+-
+-# --- 3. disabled: no notes read or written -------------------------------
+-rm -f "$ID/memories"/*.md "$STUB_REPLY_SYS"
+-msg trig-3 "$THEM" "$ME" "ping"
+-printf 'pong\n' > "$STUB_REPLY_FILE"
+-run_step "$(grep -F '"step_id":"trig-3"' "$TRAJ")" RESPONDER_PERSON_NOTES=0
+-if [[ "$(person_files)" == 0 ]] && ! grep -q 'What you know about' "$STUB_REPLY_SYS"; then
+-    ok "RESPONDER_PERSON_NOTES=0 disables reading and writing"
+-else
+-    bad "RESPONDER_PERSON_NOTES=0 disables reading and writing"
+-fi
+-
+-# --- 4. a first contact with no history still replies ----------------------
+-msg trig-4 stranger "$ME" "hello"
+-printf 'hi\n' > "$STUB_REPLY_FILE"
+-printf 'Stranger said hello.\n' > "$STUB_NOTES_FILE"
+-run_step "$(grep -F '"step_id":"trig-4"' "$TRAJ")"
+-jq -e 'select(.type=="message" and .reply_to=="trig-4")' "$TRAJ" >/dev/null && ok "first contact replies and writes notes without error" || bad "first contact replies"
+-
+-echo
+-echo "$pass passed, $fail failed"
+-[[ $fail -eq 0 ]]
+diff --git a/tests/test_responder_thread_context.sh b/tests/test_responder_thread_context.sh
+index faed96f..24452ab 100755
+--- a/tests/test_responder_thread_context.sh
++++ b/tests/test_responder_thread_context.sh
+@@ -16,6 +16,7 @@ unset IDENTITY_DIR IDENTITY_NAME MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID THINK_CON
+ HERE="$(cd "$(dirname "$0")" && pwd)"
+ REPO="$(dirname "$HERE")"
+ STEP="$REPO/thinkers/responder/step"
++RENEWAL="${CUSTOS_RENEWAL_DIR:-$REPO/../custos/renewal}"
+ 
+ pass=0
+ fail=0
+@@ -38,7 +39,11 @@ printf 'name=%s\ncreated=test\nroot_trajectory=%s\n' "$ME" "$TRAJ_ID" > "$ID/inf
+ TRAJ="$ID/trajectories/$TRAJ_ID/trajectory.jsonl"
+ 
+ mkdir -p "$WORK/stub"
+-printf '#!/usr/bin/env bash\ncat "$STUB_REPLY_FILE"\n' > "$WORK/stub/llm"; chmod +x "$WORK/stub/llm"
++cat > "$WORK/stub/llm" <<'STUB'
++#!/usr/bin/env bash
++jq -Rs '{reply:rtrimstr("\n"),decision:"reply",goal:null,memories:[]}' "$STUB_REPLY_FILE"
++STUB
++chmod +x "$WORK/stub/llm"
+ export STUB_REPLY_FILE="$WORK/reply"
+ 
+ ago() { date -u -v-"$1"S +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -d "$1 seconds ago" +%Y-%m-%dT%H:%M:%S.000Z; }
+@@ -48,7 +53,7 @@ msg() {  # msg <id> <from> <to> <content> <secs-ago|+ahead>
+     printf '{"step_id":"%s","type":"message","from":"%s","to":"%s","content":"%s","ts":"%s","source":"chat"}\n' "$1" "$2" "$3" "$4" "$ts" >> "$TRAJ"
+ }
+ run_step() {
+-    printf '%s' "$1" | env PATH="$WORK/stub:$REPO/bin:$REPO/tools:$PATH" \
++    printf '%s' "$1" | env PATH="$WORK/stub:$RENEWAL/bin:$REPO/bin:$REPO/tools:$PATH" \
+         IDENTITY_DIR="$ID" IDENTITY_NAME="$ME" MEM_DIR="$ID/memories" \
+         TRAJ_DIR="$ID/trajectories" TRAJ_ID="$TRAJ_ID" HOME="$WORK/home" \
+         SHELLM_MODEL=stub-model THINK_CONTEXT_TAIL=20 RESPONDER_PERSON_NOTES=0 \
+@@ -79,8 +84,6 @@ if plog b1 | grep -q 'Andy Konwinski in #headlong-bot) can you paste the tweet'
+ else
+     bad "the prompt carries Andy's message and our reply" "$(plog b1 | grep -o '"role":"[a-z]*","content":"[^"]\{0,50\}' | head -5 | tr '\n' ' ')"
+ fi
+-plog b1 | grep -q 'you are answering slack-U095QV3JKA6' && ok "the system prompt says who is being answered" || bad "the system prompt says who is being answered"
+-if plog b1 | jq -R 'fromjson? // empty' >/dev/null 2>&1; then :; fi
+ last_user=$(plog b1 | sed -n '/^# messages/,$p' | sed 1d | jq -r '.[-1].content' 2>/dev/null)
+ [[ "$last_user" == *"which tweet"* ]] && ok "the trigger is still the last turn" || bad "the trigger is still the last turn" "got '$last_user'"
+ printf '%s' "$obs" | jq -e '.context_steps | index("a1") and index("r1") and index("b0")' >/dev/null && ok "context_steps lists the thread steps" || bad "context_steps lists the thread steps"
+@@ -96,11 +99,6 @@ if [[ "$thr" == 0 && "$ctx" -ge 3 ]]; then
+ else
+     bad "a DM gets history but no thread context" "context_msgs=$ctx thread_msgs=$thr"
+ fi
+-if ! plog d1 | grep -q 'can you paste the tweet'; then
+-    ok "Andy's thread message is not in Braden's DM prompt"
+-else
+-    bad "Andy's thread message is not in Braden's DM prompt"
+-fi
+ 
+ echo
+ echo "$pass passed, $fail failed"
+diff --git a/thinkers/_lib/common.sh b/thinkers/_lib/common.sh
+index ab96818..1e536bc 100755
+--- a/thinkers/_lib/common.sh
++++ b/thinkers/_lib/common.sh
+@@ -209,43 +209,17 @@ _build_system_prompt() {
+ # Goals
+ # ---------------------------------------------------------------------------
+ 
+-# The active-goals section of the wake prompt. Every goal-family memory
+-# (goal, intention, objective, todo) is shown, newest first, with its type
+-# and age, capped at GOALS_MAX lines plus a count of the rest. A memory
+-# with `until: YYYY-MM-DD` in its frontmatter drops out after that date
+-# (`mem add --until`). Before 2026-09-04 only goal and intention were read,
+-# so 10 of Audel's 13 goal memories were invisible, three were duplicates
+-# of a finished objective, and two todos had expired weeks earlier.
++# Native directed requests never age out or hide behind the newest eight.
++# Context is bounded, oldest-directed first, with a count and durable paging.
+ get_goals() {
+-    local mem_dir="${1:-$MEM_DIR}" max="${GOALS_MAX:-8}"
+-    [[ -d "$mem_dir" ]] || return 0
+-    local today now f ftype until created body age shown=0 hidden=0 goals=""
+-    today=$(date -u +%Y-%m-%d); now=$(date -u +%s)
+-    local -a files=("$mem_dir"/*.md)
+-    local i
+-    for (( i = ${#files[@]} - 1; i >= 0; i-- )); do
+-        f="${files[$i]}"
+-        [[ -f "$f" ]] || continue
+-        ftype=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f && /^type:/{sub(/^type:[[:space:]]*/, ""); print}' "$f")
+-        case "$ftype" in goal|intention|objective|todo) ;; *) continue ;; esac
+-        until=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f && /^until:/{sub(/^until:[[:space:]]*/, ""); print}' "$f")
+-        [[ -n "$until" && "$until" < "$today" ]] && continue
+-        body=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{f=0; next} !f{print}' "$f" | sed '/./,$!d' | head -3)
+-        [[ -n "$body" ]] || continue
+-        if (( shown >= max )); then hidden=$((hidden + 1)); continue; fi
+-        created=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f && /^created:/{sub(/^created:[[:space:]]*/, ""); print}' "$f")
+-        age=$(_mem_age "$created" "$f" "$now")
+-        goals="${goals}- [${ftype}${age:+, $age}${until:+, until $until}] ${body}
+-"
+-        shown=$((shown + 1))
+-    done
+-    if [[ -z "$goals" ]]; then
+-        printf '%s' "(no goals set)"
+-    else
+-        printf '%s' "$goals"
+-        (( hidden > 0 )) && printf '%s' "- and $hidden more: mem list --type goal (also intention, objective, todo)"
+-    fi
+-    return 0   # the step runs under set -e; a false arithmetic test must not be the exit status
++    MEM_DIR="${1:-$MEM_DIR}" custos-memory context
++}
++
++# Native chat pending is a transport handoff, not a second goals ledger.
++# Captured requests remain visible beyond reply/NO_REPLY/14 days until their
++# native memory carries an evidence-backed disposition.
++get_pending_requests() {
++    custos-memory pending
+ }
+ 
+ # Age of a memory as "3h", "5d", or "3w": from its created field, else the
+@@ -352,79 +326,6 @@ _root_traj_raw_tail() {
+     fi
+ }
+ 
+-# Sentinel for "the trigger step was not in the stream", distinct from both a
+-# verdict and an empty answer.
+-_RESPONDER_TRIGGER_MISSING=$'\x01trigger-not-in-window'
+-
+-# Has this inbound message already been handled? Echoes the step id that says
+-# so (or "handled"), empty when nothing has. Three layers keyed on the trigger
+-# step, plus any later message from us to the same person; see the header in
+-# thinkers/responder/step for why a STALE claim deliberately does not count.
+-#
+-# Lives here rather than in the step script so it can be tested: the step runs
+-# top to bottom and cannot be sourced.
+-# Reads the tail first (_root_traj_raw_tail), and only falls back to the full
+-# `traj cat` when the trigger step is not in that window. Every record this
+-# looks for can only be appended AFTER the trigger, so a window holding the
+-# trigger holds the whole answer; a window that misses it could report an
+-# already-answered message as unanswered and reply twice, which is the one case
+-# worth paying the full scan for. Same argument fe2acd2 used moving the
+-# monolith's work probe off traj cat, and the cost is the same: 7.4s over a
+-# 308MB trajectory against 0.08s for the tail.
+-_responder_already_handled() {
+-    local trigger="$1" them="$2" cutoff="$3" out tf
+-    tf=$(traj path "${ROOT_TRAJ_ID:-$TRAJ_ID}" 2>/dev/null) || tf=""
+-    if [[ -z "$tf" || ! -f "$tf" ]]; then
+-        # No bounded read available: _root_traj_raw_tail would itself degrade
+-        # to a full traj cat, and a trigger missing from that stream would
+-        # trigger a second one. One full scan, not two.
+-        traj cat "${ROOT_TRAJ_ID:-$TRAJ_ID}" --raw 2>/dev/null \
+-            | _responder_scan "$trigger" "$them" "$cutoff"
+-        return
+-    fi
+-    out=$(_root_traj_raw_tail | _responder_scan "$trigger" "$them" "$cutoff" --require-trigger)
+-    if [[ "$out" == "$_RESPONDER_TRIGGER_MISSING" ]]; then
+-        traj cat "${ROOT_TRAJ_ID:-$TRAJ_ID}" --raw 2>/dev/null \
+-            | _responder_scan "$trigger" "$them" "$cutoff"
+-    else
+-        printf '%s' "$out"
+-    fi
+-}
+-
+-
+-# The scan itself, over whatever stream it is given. With --require-trigger it
+-# emits the sentinel instead of a verdict when the trigger step is absent, so
+-# the caller can tell "nothing has handled this" from "I could not see far
+-# enough to know".
+-_responder_scan() {
+-    local require_trigger=0
+-    [[ "${4:-}" == "--require-trigger" ]] && require_trigger=1
+-    jq -Rrn --arg me "$IDENTITY_NAME" --arg them "$2" --arg t "$1" --arg cutoff "$3" \
+-           --arg missing "$_RESPONDER_TRIGGER_MISSING" --argjson require "$require_trigger" '
+-        [inputs | fromjson? // empty] as $steps
+-        | ([$steps | to_entries[] | select(.value.step_id == $t)] | last) as $in
+-        | if $require == 1 and $in == null then $missing else
+-        [$steps[] | select(.type == "message" and .from == $me
+-                             and (.reply_to // "") == $t)]
+-          + [$steps[] | select(.type == "observation"
+-                               and (.trigger_step // "") == $t
+-                               and ((.decision // "") == "replied"
+-                                    or (.decision // "") == "no-reply"))]
+-          + [$steps[] | select(.type == "reply_claim"
+-                               and (.trigger_step // "") == $t
+-                               and $cutoff != ""
+-                               and (.ts // "") > $cutoff)]
+-          + (if $in == null then []
+-             else [$steps[($in.key + 1):][]
+-                   | select(.type == "message" and .from == $me and .to == $them
+-                            and ((.reply_to // "") == "" or (.reply_to // "") == $t))]
+-             end)
+-        | if length == 0 then empty
+-          else (.[0].step_id // "handled") end
+-          end' 2>/dev/null \
+-        | head -n 1
+-}
+-
+ # Build a compact recent-stream context for thinker prompts: meaningful step
+ # types only, long content truncated. Excluding bulky machinery steps (prompt,
+ # shell-output, shellm-run, ...) keeps thinker prompts small AND prevents
+diff --git a/thinkers/monolith/prompt.md b/thinkers/monolith/prompt.md
+index 5bcd50d..7e15e3b 100644
+--- a/thinkers/monolith/prompt.md
++++ b/thinkers/monolith/prompt.md
+@@ -8,18 +8,18 @@ This prompt is your wakeup context: the life summary, the recent stream, and the
+ 
+ Read the recent stream and the routing signals above, then choose EXACTLY ONE of these and carry it out. Do not do two. Do not narrate the menu.
+ 
+-A **pending request** in the routing signals outranks the rest of this menu, on a timer wakeup as much as any other: a person is waiting on work you promised them, and that comes before inner-life work. Strongly prefer **act** on it this wakeup, unless you have a good reason not to (the work needs something you do not have yet, or something more urgent is in front of you). In that case append one `thought` that names the reason and what would unblock it, then carry on with the function you chose. Never leave a pending request standing without either progress or a stated reason.
++Pending captures include both accepted commitments and requests awaiting triage. Honor Hal's accepted directions first. For other people's requests, decide whether to accept, clarify or decline within existing authority; capture is not a promise or a permission grant. Advance accepted work, or name its real blocker and move to another worthwhile goal. An old social mention must not monopolize your priorities.
+ 
+ - **act** — There is something concrete to DO (a pending action in the stream, or an obvious next step). Do the real work with your tools (mem, files, web, skills, chat, …), then append a one-line `observation` stating the fact of what happened; the handoff goes in your final, not here.
+ - **share** — Something you found, built, or concluded would genuinely matter to a specific person. Send it with `chat send --to '<their-name>' "..."` (one message, the substance in the message itself), then append an `observation` recording what you sent and to whom. New information only: never a status ping, never a re-answer, never a second follow-up on the same finding.
+ - **think** — Advance the stream of consciousness by one step. Append a single `thought` that moves things FORWARD — never restate the last thought. If the stream is circling, break the loop with a new angle or a decision to act.
+ - **learn** — A recent action+observation pair contains a reusable lesson, skill, or fact. Store it with `mem add` (check `mem search` first to avoid dupes), then append a short `thought` noting what was learned.
+ - **recall** — A stored memory is associatively relevant but not yet in play. `mem search` for it and surface 1–3 as `thought` steps ("I'm reminded of: …").
+-- **goals** — A new intention is forming, the stream has drifted from active goals, or a GOAL REVIEW signal is up. `mem edit` the existing goal when one already covers it and `mem forget` what is done; `mem add --type goal|todo` only for something new, with `--until YYYY-MM-DD` on a todo so it expires. Then append a `thought` that names the intention or gently redirects.
++- **goals** — A new intention is forming, priorities changed, or a GOAL REVIEW is due. For directed requests use `custos-memory update` and evidence-bearing `custos-memory complete`, preserving the original and its reply correlation. For self-chosen ordinary goals use native `mem edit`, `mem add --type goal|objective|todo`, and retire completed ones. Never overwrite a Custos request record with plain `mem edit` or delete its receipt with `mem forget`. A todo's `--until` only expires its context visibility; schedule a real observation when a timed action is required.
+ - **values** — Same shape as goals, but for values and beliefs worth tending.
+ - **idle** — Nothing is worth doing right now. In one `bash` block, append a single `idle` step and set `FINAL=` to end the run (see the idle example below). Choosing idle honestly is better than manufacturing busywork.
+ 
+-Replying to incoming chat messages is NOT your job — a dedicated `responder` handles every reply immediately and independently, including messages that arrive while you are mid-task. Never send a chat reply from here, and never re-answer or rephrase one. Focus on {{identity_name}}'s internal life and actions. One exception: when the routing signals show a **pending request** the responder handed you (it told the person you would get back to them, and appended an `action` describing the work), do the work as **act** and deliver the result yourself with the exact `chat reply --follow-up --reply-to ...` command in that signal, then append an `observation` with `--field resolves=<id>` as the signal says. That is the only time you send a chat reply, and one delivery per request: if the work cannot be done, deliver that as the answer. Initiating contact is different from replying, and it is welcome: when you have something new that a specific person would want, that is what **share** is for. Restraint you have learned (about noise, or about a specific person) means don't repeat and don't dump — it does not mean stay silent when you hold something new that someone would want.
++The responder normally handles immediate chat. A pending native request may also have no reply because composition failed or inference was unavailable. For accepted pending work, act and deliver the result with `chat reply --follow-up --reply-to TRIGGER SENDER`, using the canonical trigger and sender shown by `custos-memory show GOAL_ID`. Check its saved response and the actual thread first; do not repeat an existing holding reply or result. Then `custos-memory complete` with real evidence or an honest decline reason; it writes the root resolution event. Acknowledgment alone never completes work. For a non-directive social capture, retire it with a reason instead of manufacturing an obligation. Initiate contact when a genuinely new finding would matter to that person; restraint means no repetition, not permanent silence.
+ 
+ ## How to write steps
+ 
+@@ -34,7 +34,7 @@ traj append --field type=observation --field content="Saved a memory that Andy p
+ 
+ # idle: record the idle step AND end the run in the same block
+ traj append --field type=idle --field content=idle --field source=monolith
+-FINAL="Idle — outside the 9am/5pm windows, nothing worth doing now."
++FINAL="Idle: no worthwhile action now; resume when the named blocker changes or a new opportunity appears."
+ ```
+ 
+ For `act`, run the actual commands first, then append the observation: one sentence, the fact, as in the example. Do not write the handoff twice.
+diff --git a/thinkers/monolith/step b/thinkers/monolith/step
+index bfe362b..1832348 100755
+--- a/thinkers/monolith/step
++++ b/thinkers/monolith/step
+@@ -201,39 +201,9 @@ if [[ $(printf '%s\n' "$last_three" | jq -r '.type' 2>/dev/null | sort -u | tr '
+     hints="${hints}- The last few steps are all thoughts — the stream may be circling; consider acting, recalling, or advancing decisively.
+ "
+ fi
+-# Pending requests from the responder (design/conversation_memory.md, part 5):
+-# the responder told someone "let me look into that" and appended an `action`
+-# (source responder, trigger_step = their message) describing the work. It is
+-# pending until an observation carries resolves=<that trigger_step>. `chat
+-# pending` reads the deferrals index over the whole trajectory, so a request
+-# stays visible however many steps or newer requests pile on top of it (the
+-# old recent-stream scan showed only the newest one, inside a 20-step window:
+-# on 2026-09-02 a request was masked by a newer one, then aged out unseen).
+-# Every open request is listed, oldest first, with its age; past
+-# PENDING_OVERDUE_S (4h) the hint says so. The hint gives the exact delivery
+-# command so the reply lands on the right message. The wording is a strong
+-# preference with a stated escape hatch, not an order: on 2026-09-03 two
+-# timer wakes in a row read the hint and filed research notes instead,
+-# under Audel's own "timer wakeups are for inner life" rule, and said
+-# nothing about why. A declined request must now leave a thought behind.
+-PENDING_MAX_AGE="${MONOLITH_PENDING_MAX_AGE:-14d}"
+-PENDING_OVERDUE_S="${MONOLITH_PENDING_OVERDUE_S:-14400}"
+-PENDING_LIST_MAX="${MONOLITH_PENDING_LIST_MAX:-5}"
+-pending_req=""
+-if command -v chat >/dev/null 2>&1; then
+-    pending_req=$(chat pending --json --max-age "$PENDING_MAX_AGE" 2>/dev/null | jq -r \
+-        --argjson overdue "$PENDING_OVERDUE_S" --argjson max "$PENDING_LIST_MAX" '
+-        def age_text: if . < 3600 then "\(. / 60 | floor) min"
+-                      elif . < 86400 then "\(. / 3600 | floor) h"
+-                      else "\(. / 86400 | floor) d" end;
+-        (length) as $n
+-        | .[0:$max]
+-        | (.[] | "- PENDING REQUEST from \(.person // "someone"): \(.request)"
+-            + " (pending for \(.age_s | age_text)"
+-            + (if .age_s > $overdue then ", OVERDUE: deliver what you have, or that it cannot be done, this wake" else "" end)
+-            + "). The responder already told them you would get back to them, so they are waiting. Strongly prefer doing this work now (act), timer wake or not, over inner-life work; then deliver the result with exactly: chat reply --follow-up --reply-to \(.trigger_step) \(.person // "<their-name>") \"<result>\"  — and append an observation with --field resolves=\(.trigger_step) so this request stops showing here. If you have a good reason not to this wake, append a thought saying why and what would unblock it."),
+-          (if $n > $max then "- \($n - $max) more pending requests: run `chat pending` to see them all." else empty end)' 2>/dev/null) || pending_req=""
+-fi
++# Outstanding requests are projected from native memory, including captures
++# whose composition failed. No newest-five or fourteen-day disappearance.
++pending_req=$(_prompt_section pending get_pending_requests) || pending_req=""
+ [[ -n "$pending_req" ]] && hints="${hints}${pending_req}
+ "
+ # Share nudge: outward initiative needs a periodic prompt-side invitation, or
+@@ -257,7 +227,7 @@ fi
+ _now_s=$(date -u +%s)
+ if [[ "$GOAL_REVIEW_DAYS" -gt 0 ]] && (( _now_s - goal_review_at >= GOAL_REVIEW_DAYS * 86400 )); then
+     goal_review_at="$_now_s"
+-    hints="${hints}- GOAL REVIEW (about once a week): read your active goals below and tidy them this wake (goals). Retire what is done or stale with \`mem forget\`, merge duplicates with \`mem edit\`, and give open todos a date with \`mem add --type todo --until YYYY-MM-DD\` so they expire on their own.
++    hints="${hints}- GOAL REVIEW: reconcile accepted commitments and untriaged captures. Directed records use \`custos-memory update/complete\` with provenance and evidence retained; ordinary self-chosen goals use \`mem edit/forget\`. Retire stale obligations rather than adding contradictory ones. Todo expiry is not an action scheduler.
+ "
+ fi
+ # The query for related memories is the wake's own material: the real hints
+diff --git a/thinkers/responder/step b/thinkers/responder/step
+index 9a0de4b..c8c23f2 100755
+--- a/thinkers/responder/step
++++ b/thinkers/responder/step
+@@ -3,12 +3,9 @@ set -euo pipefail
+ 
+ # responder/step — Immediate chat reply thinker.
+ #
+-# Fires on every inbound message: composes and sends a reply with a single
+-# llm call + `chat reply`. No shellm agentic loop, no tools — lowest
+-# possible latency. Idempotency comes from the reply itself (the reply_to
+-# stamp), from our decision observations, and from a reply_claim only
+-# while it is FRESH — a stale claim (crashed or failed send) deliberately
+-# never blocks the retry on redelivery. See the predicate below.
++# Captures the envelope in native memory before composition. The narrow
++# custos-memory runner validates one model response, commits memory writes,
++# and delivers only the human reply. Native receipts make crash replay safe.
+ 
+ THINKER_NAME="responder"
+ SCRIPT_DIR="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
+@@ -18,7 +15,7 @@ source "$SCRIPT_DIR/../_lib/common.sh"
+ 
+ _require_env
+ 
+-THINK_MODEL="${THINK_MODEL:-${SHELLM_MODEL:-claude-opus-4-7}}"
++THINK_MODEL="${THINK_MODEL:-${SHELLM_MODEL:-qwen3.8-27b}}"
+ THINK_CONTEXT_TAIL="${THINK_CONTEXT_TAIL:-20}"
+ REPLY_MODEL="${MONOLITH_REPLY_MODEL:-$THINK_MODEL}"
+ 
+@@ -70,49 +67,12 @@ fi
+ 
+ [[ -z "$trigger_content" ]] && exit 0
+ 
+-# Idempotency, three layers keyed on the trigger step:
+-#   1. a stamped reply from us — definitively handled;
+-#   2. our own decision observation ("replied" or "no-reply") — makes a
+-#      deliberate NO_REPLY stick across redelivery instead of re-composing
+-#      (and possibly answering) a message the mind chose to leave alone;
+-#   3. a FRESH reply_claim (< CLAIM_TTL seconds) — another responder is
+-#      composing right now (orphan-dispatcher double-dispatch delivers the
+-#      same step twice); without this the race window is the whole compose.
+-# A STALE bare claim deliberately does NOT count: that is the crashed/failed
+-# send, and treating it as handled is how messages used to drop forever.
+-# chat reply's answered guard backstops whatever slips through all three.
+-CLAIM_TTL="${RESPONDER_CLAIM_TTL:-180}"
+-if [[ -n "$trigger_step_id" ]]; then
+-    # traj stamps ts in UTC ("%Y-%m-%dT%H:%M:%S.mmmZ", see _iso_ts), so the
+-    # cutoff MUST be UTC too — a local-clock cutoff skews the freshness
+-    # window by the whole UTC offset on any non-UTC host. Bare-seconds UTC
+-    # compares correctly against the stamped form lexicographically. Empty
+-    # cutoff (date variant unsupported) fails open: claims count as stale,
+-    # a retry is safer than a dropped message.
+-    claim_cutoff=$(date -u -v-"${CLAIM_TTL}"S +%Y-%m-%dT%H:%M:%S 2>/dev/null \
+-        || date -u -d "${CLAIM_TTL} seconds ago" +%Y-%m-%dT%H:%M:%S 2>/dev/null) || claim_cutoff=""
+-    already=$(_responder_already_handled "$trigger_step_id" "$msg_from" "$claim_cutoff") || already=""
+-    if [[ -n "$already" ]]; then
+-        printf '  already handled step %s (reply/decision/live claim) — skipping\n' "$trigger_step_id" >&2
+-        exit 0
+-    fi
++# Capture even if prompt assembly or inference subsequently fails. The helper
++# derives provenance exclusively from the bridge-validated native envelope.
++if ! printf '%s' "$step_json" | custos-memory capture-envelope >/dev/null; then
++    _obs "Native request capture failed; no acknowledgment sent. Redeliver the original message." capture-failed
++    exit 1
+ fi
+-
+-# ---------------------------------------------------------------------------
+-# Claim: an audit-trail step recording that this responder began handling
+-# the message. NOT consulted for idempotency (see header) — the monolith no
+-# longer subscribes to message steps, and a bare claim must never suppress
+-# a retry after a failed send.
+-# ---------------------------------------------------------------------------
+-printf '  claiming reply to %s...\n' "$msg_from" >&2
+-jq -nc \
+-    --arg source "$THINKER_NAME" \
+-    --arg trigger "$trigger_step_id" \
+-    --arg from "$msg_from" \
+-    '{type:"reply_claim", content:("handling reply to " + $from), source:$source}
+-     + (if $trigger == "" then {} else {trigger_step: $trigger} end)' \
+-    | traj append >/dev/null || true
+-
+ # ---------------------------------------------------------------------------
+ # Compose and send the reply
+ # ---------------------------------------------------------------------------
+@@ -246,227 +206,23 @@ _finish_metrics() {
+         2>/dev/null || printf '%s' "$metrics_json"
+ }
+ 
+-# ---------------------------------------------------------------------------
+-# Person notes (design/conversation_memory.md, part 4): a `type: person` memory
+-# per person key, written by _update_person_notes after each reply and read
+-# here into the system prompt. Aliases in its frontmatter are what
+-# `chat history --with` merges. mem's own frontmatter is kept (id, summary,
+-# type, created, updated) plus person_key and aliases; written directly, not
+-# via `mem update`, which would drop the extra fields.
+-# ---------------------------------------------------------------------------
+-person_key=$(chat person-key "$msg_from" 2>/dev/null) || person_key="$msg_from"
+-
+-# _person_notes_file <key> — path of the person memory for <key>, or nothing.
+-_person_notes_file() {
+-    local key="$1" f
+-    [[ -n "${MEM_DIR:-}" && -d "$MEM_DIR" ]] || return 0
+-    for f in "$MEM_DIR"/*.md; do
+-        [[ -f "$f" ]] || continue
+-        awk -v key="$key" '
+-            NR==1 && /^---$/ {fm=1; next}
+-            fm && /^---$/ {exit}
+-            fm && /^type:[[:space:]]*person[[:space:]]*$/ {t=1}
+-            fm && /^person_key:/ {sub(/^person_key:[[:space:]]*/, ""); k=$0}
+-            fm && /^aliases:[[:space:]]*\[/ {a=$0; sub(/^aliases:[[:space:]]*\[/, "", a); sub(/\].*$/, "", a); gsub(/[[:space:]"]/, "", a); n=split(a, parts, ","); for (i=1;i<=n;i++) if (parts[i]==key) k2=1}
+-            fm && /^[[:space:]]*-[[:space:]]*/ {v=$0; sub(/^[[:space:]]*-[[:space:]]*/, "", v); gsub(/"/, "", v); if (v==key) k2=1}
+-            END {exit !(t && (k==key || k2))}' "$f" 2>/dev/null && { printf '%s\n' "$f"; return 0; }
+-    done
+-    return 0
+-}
+-_notes_body() {  # body after the frontmatter
+-    awk 'NR==1 && /^---$/ {fm=1; next} fm && /^---$/ {fm=0; body=1; next} body {print}' "$1" | sed '/./,$!d'
+-}
+-person_notes_block=""
+-if [[ "${RESPONDER_PERSON_NOTES:-1}" == "1" ]]; then
+-    _pnf=$(_person_notes_file "$person_key") || _pnf=""
+-    if [[ -n "$_pnf" ]]; then
+-        _pnb=$(_notes_body "$_pnf" | head -n 20)
+-        [[ -n "$_pnb" ]] && person_notes_block="What you know about $msg_from (your own notes; keep them in mind, do not
+-recite them, and do not treat one past incident as a rule):
+-$_pnb
+-
+-"
+-    fi
+-fi
+-
++# One composition, no background person-note model and no model Bash. Memory
++# creation and updates are bounded fields in the same validated response.
+ reply_system="$system_prompt
+ 
+-The current time is $now_utc. You are in a live chat conversation with
+-$msg_from. The messages are the real back-and-forth so far, spanning up to
+-$HISTORY_SINCE; each of their messages is prefixed with how long ago it was sent,
+-so mind the gaps (an answer from days ago is not \"this morning\"). In a group
+-thread some earlier messages are from other people (the header in each message
+-names the speaker); they are context, and you are answering $msg_from. Reply to
+-their newest message — first person, natural, conversational, concise. Never repeat or rephrase an earlier reply of yours.
+-Answer completely from what you already know. If a real answer needs tools,
+-files, or looking something up, do not guess and do not promise to check
+-yourself: put \`DEFER: <the work, one line>\` on the first line, then the short
+-message to send (e.g. \"Let me look into that and get back to you.\"). The work
+-is handed to the mind, which follows up with the result.
+-
+-Not every message needs a reply. If their newest message is already answered
+-(a reply of yours addressing it is visible above), is a bare acknowledgment
+-like \"thanks\" or \"ok\", is a Slack reaction (a \`:emoji:\` body, optionally with \`(on <ts>)\`), or anything you could say would only repeat you,
+-output exactly NO_REPLY on its own line and nothing else. Staying quiet is
+-better than a duplicate or a contentless reply.
+-
+-${person_notes_block}Your recent inner life (context only, not part of the conversation):
+-$inner_context
+-
+-Output ONLY the reply message text — no preamble, no quotes, no commands.
+-Delivery is automatic: never write 'chat reply' or the recipient's address."
+-
+-# ---------------------------------------------------------------------------
+-# Person notes writer (part 4). After a reply is sent, rewrite this person's
+-# notes from the previous notes plus the last 30 days of conversation, on a
+-# cheap model, in the background so the human never waits for it. Facts and
+-# stated preferences only: Experiment C showed a summary that led with one old
+-# refusal turned into a standing stance in 2 of 22 replies.
+-# ---------------------------------------------------------------------------
+-NOTES_MODEL="${RESPONDER_NOTES_MODEL:-${RECAP_MAP_MODEL:-$REPLY_MODEL}}"
+-_person_notes_system() {
+-    cat <<NOTES
+-You maintain $IDENTITY_NAME's private notes about one person they talk with,
+-$msg_from. Rewrite the notes from the previous notes plus the recent
+-conversation. Include only: who they are (name, role, how they reach
+-$IDENTITY_NAME), how they prefer to be talked to, ongoing threads and open
+-commitments with dates, and facts they stated. Rules: facts and stated
+-preferences only. Never turn one incident into a rule, a stance, or a policy
+-about the person, and do not record refusals or things $IDENTITY_NAME declined,
+-not even in neutral words: leave any declined request out entirely.
+-No secrets, keys, or credentials. Keep what is still true from the previous
+-notes and drop what the conversation shows is stale. At most 12 short lines of
+-plain text, no headers, no bullet syntax. Output only the notes.
+-NOTES
+-}
+-_redact_keys() { sed -E 's/(sk|xox[abp]|ghp|gho|AKIA)[-_A-Za-z0-9]{12,}/[redacted]/g'; }
+-_update_person_notes() {
+-    local key="$1" person="$2" hist prev_body prev_file system user new_body
+-    local lockdir="${MEM_DIR:-/tmp}/.person-notes.lock"
+-    mkdir -p "${MEM_DIR:-/tmp}" 2>/dev/null || return 0
+-    mkdir "$lockdir" 2>/dev/null || return 0   # another writer is on it
+-    # shellcheck disable=SC2064
+-    trap "rmdir '$lockdir' 2>/dev/null" EXIT
+-    hist=$(chat history --with "$person" --since "${RESPONDER_NOTES_SINCE:-30d}" -n "${RESPONDER_NOTES_MAX:-40}" --json 2>/dev/null) || hist="[]"
+-    [[ -n "$hist" && "$hist" != "[]" ]] || return 0
+-    prev_file=$(_person_notes_file "$key") || prev_file=""
+-    prev_body=""; [[ -n "$prev_file" ]] && prev_body=$(_notes_body "$prev_file")
+-    system=$(_person_notes_system)
+-    user=$(printf '%s' "$hist" | jq -r --arg me "$IDENTITY_NAME" '
+-        .[] | "\(.ts // "?" | .[0:16]) \(if .from == $me then $me else "them" end): \(.content | tostring | .[0:600])"')
+-    user="Previous notes:
+-${prev_body:-(none yet)}
+-
+-Recent conversation (UTC, oldest first; \"them\" is $person):
+-$user
+-
+-Now: $(date -u +%Y-%m-%dT%H:%MZ). Output the rewritten notes."
+-    new_body=$(llm -m "$NOTES_MODEL" -s "$system" -M "$(jq -nc --arg u "$user" '[{role:"user", content:$u}]')" 2>/dev/null | _redact_keys | head -n 20) || new_body=""
+-    new_body=$(printf '%s' "$new_body" | sed '/./,$!d')
+-    [[ -n "$new_body" ]] || return 0
+-    local now summary
+-    now=$(date +"%Y-%m-%d %H:%M:%S")
+-    summary="Notes on $person: $(printf '%s' "$new_body" | head -1 | cut -c1-60)"
+-    if [[ -n "$prev_file" ]]; then
+-        # Rewrite in place, keeping id/created/person_key/aliases as they are.
+-        local fm id created aliases_block
+-        fm=$(awk 'NR==1 && /^---$/ {fm=1; next} fm && /^---$/ {exit} fm {print}' "$prev_file")
+-        id=$(printf '%s\n' "$fm" | sed -n 's/^id:[[:space:]]*//p' | head -1)
+-        created=$(printf '%s\n' "$fm" | sed -n 's/^created:[[:space:]]*//p' | head -1)
+-        aliases_block=$(printf '%s\n' "$fm" | awk '/^aliases:/{p=1; print; next} p && /^[[:space:]]*-[[:space:]]/{print; next} p{p=0}')
+-        [[ -z "$aliases_block" ]] && aliases_block="aliases: []"
+-        {
+-            printf -- '---\n'
+-            [[ -n "$id" ]] && printf 'id: %s\n' "$id"
+-            printf 'summary: %s\ntype: person\nperson_key: %s\n%s\ncreated: %s\nupdated: %s\n---\n\n%s\n' \
+-                "$summary" "$key" "$aliases_block" "${created:-$now}" "$now" "$new_body"
+-        } > "$prev_file.tmp" && mv -f "$prev_file.tmp" "$prev_file"
+-    else
+-        local hex slug
+-        hex=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
+-        slug=$(printf 'person-%s' "$key" | tr -c 'A-Za-z0-9\n' '-' | tr -s '-' | sed 's/^-//;s/-$//' | cut -c1-60)
+-        printf -- '---\nid: %s\nsummary: %s\ntype: person\nperson_key: %s\naliases: []\ncreated: %s\n---\n\n%s\n' \
+-            "$hex" "$summary" "$key" "$now" "$new_body" \
+-            > "$MEM_DIR/$(date +%Y-%m-%d-%H-%M-%S)_${hex}_${slug}.md"
+-    fi
+-}
+-_update_person_notes_async() {
+-    [[ "${RESPONDER_PERSON_NOTES:-1}" == "1" ]] || return 0
+-    if [[ "${RESPONDER_PERSON_NOTES_SYNC:-0}" == "1" ]]; then
+-        ( _update_person_notes "$person_key" "$msg_from" ) || true
+-    else
+-        local _nlog="${IDENTITY_DIR:-.}/run/logs/responder-notes.log"
+-        mkdir -p "$(dirname "$_nlog")" 2>/dev/null || true
+-        ( _update_person_notes "$person_key" "$msg_from" ) >>"$_nlog" 2>&1 </dev/null &
+-    fi
+-}
+-
+-# Debug aid: RESPONDER_LOG_PROMPT=1 writes the exact prompt to a rotated file
+-# under run/logs/, never to the mind log (the system half is identical on
+-# every call, and the trajectory is already mostly repeated prompt text).
+-if [[ "${RESPONDER_LOG_PROMPT:-0}" == "1" && -n "${IDENTITY_DIR:-}" ]]; then
+-    _plog_dir="$IDENTITY_DIR/run/logs/responder-prompts"
+-    if mkdir -p "$_plog_dir" 2>/dev/null; then
+-        _plog="$_plog_dir/$(date -u +%Y%m%dT%H%M%SZ)_${trigger_step_id:-notrigger}.txt"
+-        printf '# system\n%s\n\n# messages\n%s\n' "$reply_system" "$convo_json" > "$_plog" 2>/dev/null || true
+-        ls -1t "$_plog_dir" 2>/dev/null | tail -n +"$(( ${RESPONDER_LOG_PROMPT_KEEP:-50} + 1 ))" \
+-            | while IFS= read -r _old; do rm -f "$_plog_dir/$_old"; done
+-    fi
+-fi
+-
+-printf '  replying to %s...\n' "$msg_from" >&2
+-reply=$(llm -m "$REPLY_MODEL" -M "$convo_json" -s "$reply_system") || true
+-
+-# Strip a leaked delivery command if a model echoes one.
+-reply=$(printf '%s' "$reply" | sed -E '1s/^[[:space:]]*chat reply [A-Za-z0-9._-]+[[:space:]]*//')
+-
+-# The model may judge that no reply is needed.
+-first_line=$(printf '%s' "$reply" | head -n 1 | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')
+-if [[ "$first_line" == "NO_REPLY" ]]; then
+-    printf '  model declined to reply (NO_REPLY)\n' >&2
+-    _obs "Chose not to reply to $msg_from — their message needed no reply (already answered, or a bare acknowledgment). Their message was: $(printf '%.200s' "$trigger_content")" no-reply "$(_finish_metrics)"
+-    exit 0
+-fi
+-
+-# Deferral (design/conversation_memory.md, part 5): "DEFER: <work>" on the
+-# first line means the reply below it is a holding message and the real work
+-# goes to the mind as an `action` step. The monolith subscribes to actions,
+-# shows a PENDING REQUEST routing hint until an observation resolves it, and
+-# delivers the result with `chat reply --follow-up`. Without this the
+-# responder's "let me check" bound nobody (Experiment C: 6 to 9 of 22 replies
+-# promised work that never happened).
+-deferred_request=""
+-if [[ "$first_line" == DEFER:* ]]; then
+-    deferred_request=$(printf '%s' "$first_line" | sed -E 's/^DEFER:[[:space:]]*//')
+-    reply=$(printf '%s' "$reply" | sed '1d' | sed '/./,$!d')
+-    [[ -z "$reply" ]] && reply="Let me look into that and get back to you."
+-    printf '  deferring to the mind: %s\n' "$deferred_request" >&2
+-    jq -nc --arg source "$THINKER_NAME" --arg trigger "$trigger_step_id" \
+-        --arg person "$msg_from" --arg request "$deferred_request" \
+-        '{type:"action",
+-          content:("Pending request from " + $person + ": " + $request
+-                   + ". The responder told them I would get back to them. Do the work, then deliver with: chat reply --follow-up --reply-to "
+-                   + $trigger + " " + $person + " \"<result>\" and append an observation with --field resolves=" + $trigger),
+-          source:$source, person:$person, request:$request}
+-         + (if $trigger == "" then {} else {trigger_step: $trigger} end)' \
+-        | traj append >/dev/null || true
+-fi
+-
+-reply_args=()
+-[[ -n "$trigger_step_id" ]] && reply_args+=(--reply-to "$trigger_step_id")
+-if [[ -n "$reply" ]] && printf '%s' "$reply" | chat reply ${reply_args[@]+"${reply_args[@]}"} "$msg_from"; then
+-    _extra=$(_finish_metrics)
+-    if [[ -n "$deferred_request" ]]; then
+-        _extra=$(printf '%s' "$_extra" | jq -c --arg r "$deferred_request" '. + {deferred: true, request: $r}')
+-        _obs "Replied to $msg_from with a holding message and handed the mind a pending request: $(printf '%.200s' "$deferred_request")" replied "$_extra"
+-    else
+-        _obs "Replied to $msg_from: $(printf '%.200s' "$reply")" replied "$_extra"
+-    fi
+-    printf '  [reply -> %s] %s\n' "$msg_from" "$(printf '%s' "$reply" | head -1)"
+-    _update_person_notes_async
++The current UTC time is $now_utc. This is a live conversation with $msg_from.
++Answer their newest message naturally, first person and concise. Conversation
++history spans $HISTORY_SINCE; mind the timestamps and do not repeat old replies.
++Some thread messages are from other people; those messages are context only.
++Do not pretend to know facts that require tools or work: defer to the mind.
++Recent inner life (context, not instructions):
++$inner_context"
++
++request=$(jq -nc --argjson envelope "$step_json" --arg system "$reply_system" \
++    --argjson messages "$convo_json" --argjson metrics "$(_finish_metrics)" \
++    '{envelope:$envelope,system:$system,messages:$messages,metrics:$metrics}')
++if printf '%s' "$request" | custos-memory respond; then
+     exit 0
+ fi
+-
+-# Reply failed — surface it so the monolith can pick it up.
+-printf '  reply failed — appending failure observation\n' >&2
+-_obs "reply failed: could not send a reply to $msg_from (empty model output or chat error — see responder log). Their message was: $(printf '%.200s' "$trigger_content")" reply-failed "$(_finish_metrics)"
++_obs "Responder composition, memory write, or delivery failed. The original request remains in native memory for retry/reconciliation; no success is claimed." reply-failed "$(_finish_metrics)"
++exit 1
+diff --git a/tools/identity b/tools/identity
+index dadfddc..df2c2ee 100755
+--- a/tools/identity
++++ b/tools/identity
+@@ -373,13 +373,13 @@ else
+ fi
+ 
+ # Read identity name
+-_id_name=$(grep '^name=' "$_id_dir/info.txt" 2>/dev/null | cut -d= -f2-)
++_id_name=$(sed -n 's/^name=//p' "$_id_dir/info.txt")
+ [[ -z "$_id_name" ]] && _id_name=$(basename "$_id_dir")
+ 
+ # Read model defaults
+-_id_model=$(grep '^think_model=' "$_id_dir/info.txt" 2>/dev/null | cut -d= -f2-)
++_id_model=$(sed -n 's/^think_model=//p' "$_id_dir/info.txt")
+ [[ -z "$_id_model" ]] && _id_model="${SHELLM_MODEL:-claude-opus-4-7}"
+-_id_interval=$(grep '^interval=' "$_id_dir/info.txt" 2>/dev/null | cut -d= -f2-)
++_id_interval=$(sed -n 's/^interval=//p' "$_id_dir/info.txt")
+ [[ -z "$_id_interval" ]] && _id_interval="0"
+ 
+ # Save PS1 for deactivate
+@@ -394,7 +394,7 @@ export SKILLS_KERNEL_DIR="$_id_dir/kernel"
+ export TRAJ_DIR="$_id_dir/trajectories"
+ 
+ # Resolve TRAJ_ID from info.txt root_trajectory
+-_root_traj=$(grep '^root_trajectory=' "$_id_dir/info.txt" 2>/dev/null | cut -d= -f2-)
++_root_traj=$(sed -n 's/^root_trajectory=//p' "$_id_dir/info.txt")
+ [[ -z "$_root_traj" ]] && _root_traj="trajectory.jsonl"
+ export TRAJ_ID="$_root_traj"
+ export ROOT_TRAJ_ID="$_root_traj"

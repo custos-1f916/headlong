@@ -1,0 +1,16 @@
+[Unit]
+Description=Custos LXC122 external network boundary (host-owned)
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target pve-guests.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/nft -f /etc/custos-boundary.nft
+ExecReload=/usr/sbin/nft -f /etc/custos-boundary.nft
+RemainAfterExit=yes
+# No ExecStop: stopping management must not open the boundary.
+
+[Install]
+WantedBy=multi-user.target

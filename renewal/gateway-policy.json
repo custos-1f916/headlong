@@ -1,0 +1,21 @@
+{
+  "bind_host": "192.168.86.44",
+  "bind_port": 18080,
+  "allowed_clients": ["192.168.86.52"],
+  "state_db": "/var/lib/custos-gateway/quota.sqlite3",
+  "busy_signal": "/run/custos-gateway/busy.json",
+  "pause_file": "/etc/custos-gateway/paused",
+  "daily_seconds": 7200,
+  "rolling_24h_seconds": 7200,
+  "request_seconds": 180,
+  "max_tokens": 32768,
+  "max_connections": 16,
+  "max_header_bytes": 16384,
+  "max_body_bytes": 131072,
+  "max_response_bytes": 8388608,
+  "header_timeout_seconds": 5,
+  "body_timeout_seconds": 5,
+  "connect_timeout_seconds": 3,
+  "io_timeout_seconds": 5,
+  "busy_max_age_seconds": 5
+}

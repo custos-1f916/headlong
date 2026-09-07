@@ -1,0 +1,37 @@
+# Root inside122 is unrestricted. Only its outbound network boundary is scoped.
+# This transaction replaces our own tables; it never changes PVE/other guest rules.
+add table bridge custos122
+flush table bridge custos122
+table bridge custos122 {
+    chain guest_egress {
+        ether saddr != bc:24:11:00:32:05 counter drop
+        ether type arp arp saddr ip 192.168.86.52 accept
+        ether type arp counter drop
+        ether type ip6 counter drop
+        ether type ip ip saddr != 192.168.86.52 counter drop
+        # Return traffic for clients of guest services is allowed. Existing
+        # guest-initiated LAN connections do not bypass destination policy.
+        ether type ip ct direction reply ct state established,related accept
+        ether type ip ip daddr { 192.168.86.50, 192.168.86.51 } udp dport 53 accept
+        ether type ip ip daddr { 192.168.86.50, 192.168.86.51 } tcp dport 53 accept
+        ether type ip ip daddr 192.168.86.44 tcp dport { 18080, 18081 } accept
+        ether type ip ip daddr 192.168.86.46 tcp dport 3000 accept
+        # Direct LAN, alternate/private addressing and public-IP hairpin are denied.
+        ether type ip ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4, 136.47.9.156 } counter drop
+        ether type ip accept
+        counter drop
+    }
+    chain prerouting {
+        type filter hook prerouting priority -100; policy accept;
+        iifname "veth122i0" jump guest_egress
+    }
+}
+add table inet custos_gateway_guard
+flush table inet custos_gateway_guard
+table inet custos_gateway_guard {
+    chain input {
+        type filter hook input priority -200; policy accept;
+        tcp dport { 18080, 18081 } ip saddr { 192.168.86.52, 192.168.86.44, 127.0.0.1 } accept
+        tcp dport { 18080, 18081 } counter drop
+    }
+}

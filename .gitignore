@@ -7,3 +7,8 @@ nohup.out
 probe.out
 __pycache__/
 .DS_Store
+
+# Installed bridge dependencies and local-only credentials.
+node_modules/
+.env
+*.key

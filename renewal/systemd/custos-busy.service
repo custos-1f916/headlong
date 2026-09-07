@@ -1,0 +1,41 @@
+[Unit]
+Description=Custos host-only Johan socket busy observation
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+RuntimeDirectory=custos-gateway
+RuntimeDirectoryMode=0755
+ExecStart=/usr/bin/python3 /opt/custos/repo/renewal/custos_busy.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=192.168.86.117/32
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitNOFILE=64
+TasksMax=8
+MemoryMax=96M
+ReadOnlyPaths=/etc/custos-gateway
+
+[Install]
+WantedBy=multi-user.target

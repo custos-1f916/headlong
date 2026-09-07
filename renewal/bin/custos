@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export HOME=/root
+export PATH=/root/.local/bin:/root/.bun/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+source /root/.headlong/app/.identities/custos/activate >/dev/null 2>&1
+case "${1:-}" in
+  status) exec systemctl show headlong-thinkers@custos.service --property=ActiveState,SubState,UnitFileState ;;
+  start)
+    rm -f /var/lib/custos/operator-paused
+    exec systemctl start headlong-thinkers@custos.service ;;
+  stop)
+    mkdir -p /var/lib/custos
+    touch /var/lib/custos/operator-paused
+    exec systemctl stop headlong-thinkers@custos.service ;;
+  pair)
+    systemctl kill --signal=HUP custos-relay-bridge.service
+    sleep 1
+    journalctl -u custos-relay-bridge.service --no-pager --since '5 seconds ago' -o cat | sed -n '/^remotepi:\/\/pair?/p'
+    ;;
+  *) exec python3 /opt/custos/repo/renewal/custos_client.py "$@" ;;
+esac

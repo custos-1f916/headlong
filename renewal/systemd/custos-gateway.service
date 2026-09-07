@@ -1,0 +1,44 @@
+[Unit]
+Description=Custos outside-guest inference admission gateway
+Wants=network-online.target custos-busy.service
+After=network-online.target custos-busy.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+DynamicUser=yes
+User=custos-gateway
+StateDirectory=custos-gateway
+StateDirectoryMode=0700
+ExecStart=/usr/bin/python3 /opt/custos/repo/renewal/custos_gateway.py --policy /etc/custos-gateway/gateway-policy.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=192.168.86.52/32
+IPAddressAllow=192.168.86.117/32
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitNOFILE=128
+TasksMax=16
+MemoryMax=128M
+ReadOnlyPaths=/etc/custos-gateway
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""Talk to the named Custos guest; message bytes travel only on SSH stdin."""
+import subprocess
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if not args:
+    print('usage: custos <message> | custos status | custos start | custos stop | custos pair', file=sys.stderr)
+    raise SystemExit(2)
+action = args[0] if len(args) == 1 and args[0] in {'status', 'start', 'stop', 'pair'} else ''
+command = 'sudo -n pct exec 122 -- /usr/local/bin/custos' + (' ' + action if action else '')
+if action == 'stop':
+    command = 'sudo -n touch /etc/custos-gateway/paused && ' + command
+elif action == 'start':
+    command = 'sudo -n rm -f /etc/custos-gateway/paused && ' + command
+result = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-i',
+                         str(Path.home() / '.ssh/id_ed25519'), 'user@192.168.86.44', command],
+                        input=None if action else ' '.join(args), text=True)
+raise SystemExit(result.returncode)

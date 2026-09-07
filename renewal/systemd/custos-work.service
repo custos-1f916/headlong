@@ -1,0 +1,51 @@
+[Unit]
+Description=Custos outside-guest Voidle Beads work channel
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+DynamicUser=yes
+User=custos-work
+StateDirectory=custos-work
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/custos-work/repo
+EnvironmentFile=/etc/custos-work.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /opt/custos/repo/renewal/custos_work.py --policy /etc/custos-work/work-policy.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=192.168.86.52/32
+IPAddressAllow=192.168.86.66/32
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitNOFILE=128
+TasksMax=64
+MemoryMax=512M
+ReadOnlyPaths=/etc/custos-work /usr/local/libexec/custos-bd
+ReadOnlyPaths=/var/lib/custos-work/repo/.beads/metadata.json /var/lib/custos-work/repo/.beads/config.yaml
+# Operator-provisioned metadata/config are immutable in the service namespace.
+# bd may maintain local Dolt/client bookkeeping inside the metadata directory.
+# The guest cannot reach this filesystem. No source checkout/hooks/routes here.
+
+[Install]
+WantedBy=multi-user.target
