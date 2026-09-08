@@ -90,7 +90,7 @@ def run(argv, content=None, timeout=30):
         process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
-            stdout, _ = process.communicate(content, timeout=timeout)
+            stdout, stderr = process.communicate(content, timeout=timeout)
         except subprocess.TimeoutExpired:
             # llm is a Bash launcher; kill its curl/adapter children as well.
             try:
@@ -102,8 +102,17 @@ def run(argv, content=None, timeout=30):
     except OSError as exc:
         raise MemoryError("command failed: " + Path(argv[0]).name) from exc
     if process.returncode:
-        # Never echo stderr, which may contain request text or secrets.
-        raise MemoryError("command failed: " + Path(argv[0]).name)
+        # Only reflect fixed, recognized failure codes; model/provider stderr
+        # can contain request text or credentials. Keep failures diagnosable
+        # without dumping it into the public timeline.
+        codes = ("backend_busy_or_unavailable", "custos_request_in_flight",
+                 "busy_observation_unavailable", "operator_paused",
+                 "invalid_completion_request", "request_body_too_large",
+                 "request_walltime_limit", "unsupported_model",
+                 "unsupported_reasoning_effort")
+        reason = next((code for code in codes if code in stderr), "unclassified")
+        raise MemoryError("command failed: " + Path(argv[0]).name +
+                          f" (rc={process.returncode}, reason={reason})")
     return stdout
 
 

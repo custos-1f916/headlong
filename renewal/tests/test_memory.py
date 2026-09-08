@@ -45,6 +45,14 @@ class MemoryFixture(unittest.TestCase):
                         "authority": "agent"}
 
 
+class CommandDiagnosticsTests(unittest.TestCase):
+    def test_known_failure_code_survives_without_stderr_secrets(self):
+        with self.assertRaises(cm.MemoryError) as caught:
+            cm.run([sys.executable, "-c", "import sys; print('secret-request backend_busy_or_unavailable', file=sys.stderr); sys.exit(7)"])
+        self.assertIn("rc=7, reason=backend_busy_or_unavailable", str(caught.exception))
+        self.assertNotIn("secret-request", str(caught.exception))
+
+
 class MemoryTests(MemoryFixture):
     def test_positional_write_id_rejected_before_reading_stdin(self):
         goal_id = self.store.capture(self.payload)["goal_id"]

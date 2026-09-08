@@ -1,0 +1,44 @@
+[Unit]
+Description=Custos Signal client (outside LXC122)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/var/lib/custos-signal/registered
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=custos-signal
+Group=custos-signal
+StateDirectory=custos-signal
+StateDirectoryMode=0700
+RuntimeDirectory=custos-signal
+RuntimeDirectoryMode=0700
+EnvironmentFile=/etc/custos-signal/account.env
+Environment=JAVA_HOME=/opt/custos-signal/java25
+Environment=JAVA_OPTS=-Xmx512m
+ExecStart=/opt/custos-signal/jvm/bin/signal-cli --scrub-log --config /var/lib/custos-signal/data --account ${SIGNAL_ACCOUNT} daemon --socket /run/custos-signal/socket --receive-mode manual --no-receive-stdout --ignore-attachments --ignore-stories --ignore-avatars --ignore-stickers
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitNOFILE=1024
+TasksMax=128
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

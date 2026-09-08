@@ -1,0 +1,30 @@
+[Unit]
+Description=Custos allowlisted Signal delivery bridge
+Wants=custos-signal.service
+After=custos-signal.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Host root is required only for fixed pct exec 122 commands. The Signal daemon
+# and its native parsing run as custos-signal. This worker exposes no listener.
+User=root
+StateDirectory=custos-signal-bridge
+StateDirectoryMode=0700
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /opt/custos-signal/bridge/custos_signal.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=10
+UMask=0077
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictRealtime=yes
+LockPersonality=yes
+LimitNOFILE=256
+TasksMax=128
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

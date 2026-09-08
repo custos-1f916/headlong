@@ -72,8 +72,10 @@ def payload(raw, max_tokens):
                    "tool_choice", "parallel_tool_calls", "response_format", "reasoning_effort", "n"}
         if not isinstance(value, dict) or set(value) - allowed:
             raise ValueError("unsupported fields")
-        if value.get("model") != MODEL or value.get("n", 1) != 1:
-            raise ValueError("unsupported model or sample count")
+        if value.get("model") != MODEL:
+            raise Denied(400, "unsupported_model")
+        if value.get("n", 1) != 1:
+            raise ValueError("unsupported sample count")
         if "stream" in value and type(value["stream"]) is not bool:
             raise ValueError("stream must be boolean")
         if "max_tokens" in value and "max_completion_tokens" in value:
@@ -84,7 +86,7 @@ def payload(raw, max_tokens):
         value["max_tokens"] = limit
         effort = value.setdefault("reasoning_effort", "xhigh")
         if effort not in ("medium", "xhigh"):
-            raise ValueError("only medium or explicit xhigh effort is admitted")
+            raise Denied(400, "unsupported_reasoning_effort")
         messages = value.get("messages")
         if not isinstance(messages, list) or not 1 <= len(messages) <= 128:
             raise ValueError("invalid messages")
@@ -175,6 +177,9 @@ class Gateway:
         self.busy = busy or BusySignal(policy["busy_signal"], policy["busy_max_age_seconds"])
         self.clock, self.upstream = clock, upstream
         self.inflight = False
+        # asyncio.Lock is FIFO: a fresh monolith call cannot overtake a waiting
+        # responder. Hold only during one completion, never across agent tools.
+        self.slot = asyncio.Lock()
         self.connections = 0
         self.tasks = set()
 
@@ -291,6 +296,25 @@ class Gateway:
         finally:
             await close_writer(upstream_writer)
 
+    async def admitted_proxy(self, writer, method, path, body, sent):
+        async with self.slot:
+            while True:
+                self.check_pause()
+                try:
+                    self.busy.check(self.clock())
+                    break
+                except Denied as denial:
+                    if denial.code != "backend_busy_or_unavailable":
+                        raise
+                    # The independent watcher bounds waiting and cancels it on
+                    # disconnect/pause. Never poll the inference endpoint here.
+                    await asyncio.sleep(0.2)
+            self.inflight = True
+            try:
+                await self.proxy(writer, method, path, body, sent)
+            finally:
+                self.inflight = False
+
     def accept(self, reader, writer):
         # Synchronous admission bounds task creation as well as active handlers.
         peer = writer.get_extra_info("peername")
@@ -307,7 +331,7 @@ class Gateway:
         self.tasks.add(task)
 
     async def handle(self, reader, writer):
-        sent, owned, jobs = [False], False, []
+        sent, jobs = [False], []
         try:
             line, headers = await asyncio.wait_for(read_headers(reader, self.p["max_header_bytes"]), self.p["header_timeout_seconds"])
             parts = line.split(" ")
@@ -337,20 +361,21 @@ class Gateway:
                     raise Denied(413, "normalized_request_body_too_large")
             now = self.clock()
             self.check_pause()
-            self.busy.check(now)
-            if self.inflight:
-                raise Denied(429, "custos_request_in_flight", 30)
             duration = self.p["request_seconds"]
             if path == "/health":
+                self.busy.check(now)
+                if self.inflight:
+                    raise Denied(429, "custos_request_in_flight", 30)
                 response = json.dumps({"status": "ok", "scope": "gateway_admission_snapshot",
                                        "usage_quota": None}).encode()
                 writer.write((f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response)}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n").encode() + response)
                 sent[0] = True
                 await asyncio.wait_for(writer.drain(), self.p["io_timeout_seconds"])
                 return
-            self.inflight, owned = True, True
             started = time.monotonic()
-            jobs = [asyncio.create_task(self.proxy(writer, method, path, body, sent)),
+            # Existing 600-second end-to-end bound includes admission waiting;
+            # no change to client deadlines, output budget or backend concurrency.
+            jobs = [asyncio.create_task(self.admitted_proxy(writer, method, path, body, sent)),
                     asyncio.create_task(self.watch(reader, started + duration))]
             done, _ = await asyncio.wait(jobs, return_when=asyncio.FIRST_COMPLETED)
             if jobs[1] in done:
@@ -374,8 +399,6 @@ class Gateway:
             for job in jobs:
                 job.cancel()
             await asyncio.gather(*jobs, return_exceptions=True)
-            if owned:
-                self.inflight = False
             await close_writer(writer)
             self.connections -= 1
             self.tasks.discard(asyncio.current_task())

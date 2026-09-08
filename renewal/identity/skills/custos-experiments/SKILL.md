@@ -20,7 +20,9 @@ Before running, state one question and an observable discriminator. Execute, ret
 Default inference is xhigh effort on qwen3.8-27b through the gateway. For a substantial coding, planning, or experiment-design problem, a **single synchronous bounded** call may use verified native syntax:
 
 ```bash
-shellm --here --effort xhigh --max-iterations 3 --max-tokens 65536 "A specific difficult subproblem with its evidence and stop condition"
+shellm --here -m qwen3.8-27b --effort xhigh --max-iterations 3 --max-tokens 65536 "A specific difficult subproblem with its evidence and stop condition"
 ```
 
 Use this only when the extra reasoning is justified and admitted. Do not start a second chooser, background worker, retry loop, or alternate model/provider. xhigh is a request, not proof of better reasoning or a larger resource allowance; gateway limits still win. Responder, recall and summaries also use xhigh; their output budget includes reasoning. Return to the native monolith function after the bounded result rather than delegating away your judgment.
+
+Johan has one inference slot. Run this helper synchronously and wait for it before continuing the parent; do ordinary work inline. The gateway serializes independent native thinkers, but is not a reason to launch background workers. `claude-opus-4-7` and effort `high` are unsupported here.

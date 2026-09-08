@@ -155,6 +155,10 @@ class WireTests(unittest.IsolatedAsyncioTestCase):
                     writer.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
                 writer.write(b"0\r\n\r\n")
             await writer.drain()
+        except gateway.Denied:
+            # Deadline cancellation may close a just-connected fixture socket
+            # before its request headers arrive.
+            pass
         finally:
             await gateway.close_writer(writer)
             self.backend_tasks.discard(task)
@@ -332,19 +336,62 @@ class WireTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.response())[0], 200)
         self.assertEqual(self.calls, 2)
 
-    async def test_runtime_limit_and_single_inflight(self):
+    async def test_runtime_limit_includes_waiting(self):
         self.mode = "wait"
         # Exercise a one-second real monotonic timeout.
         self.gateway.p["request_seconds"] = 1
         reader, writer = await self.connect()
         await asyncio.wait_for(self.started.wait(), 2)
         status, _, body = await self.response()
-        self.assertEqual(status, 429)
-        self.assertIn(b"custos_request_in_flight", body)
+        self.assertEqual(status, 503)
+        self.assertIn(b"request_walltime_limit", body)
         await asyncio.wait_for(self.disconnected.wait(), 2)
         line, _ = await gateway.read_headers(reader, 16384)
         self.assertIn("503", line)
         await gateway.close_writer(writer)
+
+    async def test_concurrent_requests_wait_fifo_and_never_overlap(self):
+        self.mode = "gated_sse"
+        first = asyncio.create_task(self.response())
+        await self.started.wait()
+        second = asyncio.create_task(self.response())
+        await asyncio.sleep(0.05)
+        third = asyncio.create_task(self.response())
+        await asyncio.sleep(0.05)
+        self.assertEqual(self.calls, 1)
+        self.assertFalse(second.done())
+        self.assertFalse(third.done())
+        self.release_response.set()
+        results = await asyncio.gather(first, second, third)
+        self.assertEqual([r[0] for r in results], [200, 200, 200])
+        self.assertEqual(self.calls, 3)
+        self.assertFalse(self.gateway.slot.locked())
+
+    async def test_busy_snapshot_waits_and_pause_cancels_queue(self):
+        def busy(now, admission=True):
+            raise gateway.Denied(503, "backend_busy_or_unavailable", 30)
+        self.busy.check = busy
+        response = asyncio.create_task(self.response())
+        await asyncio.sleep(0.1)
+        self.assertEqual(self.calls, 0)
+        self.assertFalse(response.done())
+        Path(self.gateway.p["pause_file"]).touch()
+        status, _, body = await response
+        self.assertEqual(status, 503)
+        self.assertIn(b"operator_paused", body)
+        self.assertEqual(self.calls, 0)
+
+    async def test_waiting_disconnect_never_reaches_backend(self):
+        self.mode = "gated_sse"
+        first = asyncio.create_task(self.response())
+        await self.started.wait()
+        _, writer = await self.connect()
+        await asyncio.sleep(0.05)
+        await gateway.close_writer(writer)
+        await asyncio.sleep(0.15)
+        self.release_response.set()
+        self.assertEqual((await first)[0], 200)
+        self.assertEqual(self.calls, 1)
 
 
 if __name__ == "__main__":
