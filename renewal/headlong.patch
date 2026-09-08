@@ -142,7 +142,7 @@ index d3711eb..1668d33 100755
      # awk, not `grep | head`: head's early exit SIGPIPEs grep under pipefail
      # once the payload outgrows the pipe buffer (large --fanout).
 diff --git a/bin/shellm b/bin/shellm
-index 1a27f50..9298d26 100755
+index 1a27f50..5e52239 100755
 --- a/bin/shellm
 +++ b/bin/shellm
 @@ -130,6 +130,9 @@ SHELLM_CONTEXT_RUN_TAIL_BLOCK="${SHELLM_CONTEXT_RUN_TAIL_BLOCK:-50}"
@@ -174,7 +174,25 @@ index 1a27f50..9298d26 100755
    SHELLM_EMPTY_RESPONSE_RETRIES
                            Empty-response retries before the run dies
                            (default 8; set empty for unlimited)
-@@ -2409,7 +2417,7 @@ run_loop() {
+@@ -1746,6 +1754,17 @@ NOTICE
+         code="$nofence_notice"$'\n'"$code"
+     fi
+ 
++    # Validate the whole script before any command can have side effects.
++    # A stray XML closing tag can otherwise fail only after earlier commands
++    # have run, inviting duplicate actions when the model retries the script.
++    local syntax_error
++    if ! syntax_error=$(bash -n <<<"$code" 2>&1); then
++        local rejected_notice
++        rejected_notice='[shellm: rejected invalid bash syntax before execution; NONE of this script ran. Return one valid ```bash fenced script. Do not use XML <bash> or </bash> tags as code. Correct the syntax below before retrying.]'
++        printf 'printf %s %q %q >&2\nexit 2\n' "'%s\n'" "$rejected_notice" "$syntax_error"
++        return
++    fi
++
+     echo "$code"
+ }
+ 
+@@ -2409,7 +2428,7 @@ run_loop() {
      # alone can't tell whose header is whose when concurrent runs interleave.
      [[ -n "${SHELLM_RUN_ID_OUT:-}" ]] && printf '%s' "$_run_step_id" > "$SHELLM_RUN_ID_OUT" || true
  
@@ -183,7 +201,7 @@ index 1a27f50..9298d26 100755
          # New trajectory — kick off async run-summary generation
          local stdin_ctx_file=""
          if [[ -n "$stdin_context" ]]; then
-@@ -2517,7 +2525,10 @@ run_loop() {
+@@ -2517,7 +2536,10 @@ run_loop() {
                  --tail "$SHELLM_CONTEXT_RUN_TAIL" --tail-block "$SHELLM_CONTEXT_RUN_TAIL_BLOCK")
              [[ -n "$_prompt_step_id" ]] && _ctx_args+=(--pin "$_prompt_step_id")
          fi
@@ -195,7 +213,7 @@ index 1a27f50..9298d26 100755
  
          # Call Claude (capture thinking/reasoning to file)
          local thinking_file="$rundir/.last_thinking"
-@@ -2543,9 +2554,8 @@ run_loop() {
+@@ -2543,9 +2565,8 @@ run_loop() {
          fi
          rm -f "$thinking_file"
  
@@ -207,7 +225,7 @@ index 1a27f50..9298d26 100755
          # Default: 8 retries; SHELLM_EMPTY_RESPONSE_RETRIES overrides (set it
          # to the empty string for unlimited).
          local empty_retries=0
-@@ -2569,9 +2579,22 @@ run_loop() {
+@@ -2569,9 +2590,22 @@ run_loop() {
                  local feedback_file
                  feedback_file=$(mktemp)
                  printf '%s' "$feedback" > "$feedback_file"
@@ -285,6 +303,38 @@ index dc453ef..4e604df 100755
  fi
  
  # 5. Excluded types never appear in output.
+diff --git a/tests/test_extract_code_notice.sh b/tests/test_extract_code_notice.sh
+index b5c64e2..9fec675 100755
+--- a/tests/test_extract_code_notice.sh
++++ b/tests/test_extract_code_notice.sh
+@@ -61,6 +61,27 @@ echo hi
+ \`\`\`")
+ grep -q "$NOTICE" <<<"$out" && bad "an end-of-line fence must not get the notice" || ok "an end-of-line fence gets no notice"
+ 
++# A mismatched model tag must not partially execute the preceding command.
++MARKER=$(mktemp); rm -f "$MARKER"
++out=$(extract_code "\`\`\`bash
++printf touched > '$MARKER'
++</bash>
++\`\`\`")
++result=$(bash -c "$out" 2>&1); rc=$?
++[[ $rc -eq 2 && ! -e "$MARKER" ]] && ok "invalid syntax rejects the whole script without side effects" || bad "syntax preflight" "$result"
++grep -q 'NONE of this script ran' <<<"$result" && ok "syntax feedback states no command ran" || bad "missing rejection feedback"
++grep -q 'Do not use XML' <<<"$result" && ok "syntax feedback explains mismatched tags" || bad "missing tag guidance"
++
++# Literal tags in a heredoc are valid data, not a malformed envelope.
++out=$(extract_code "\`\`\`bash
++cat <<'DATA'
++</bash>
++\`\`\`
++DATA
++\`\`\`")
++result=$(bash -c "$out" 2>&1); rc=$?
++[[ $rc -eq 0 && "$result" == $'</bash>\n```' ]] && ok "literal tags and fences in heredocs are preserved" || bad "heredoc content altered" "$result"
++
+ echo
+ echo "$pass passed, $fail failed"
+ [[ $fail -eq 0 ]]
 diff --git a/tests/test_identity_strict_activation.sh b/tests/test_identity_strict_activation.sh
 new file mode 100755
 index 0000000..53b36f5
