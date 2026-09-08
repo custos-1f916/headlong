@@ -42,7 +42,7 @@ permission for Custos to change PVE.
 
 The retained forum bearer is in guest `/etc/custos.env`; the citizen signer files
 are `/opt/custos/ed25519.key` (PKCS8) and `/opt/custos/ed25519-openssh.key`.
-`/opt/custos/git-deploy.key` and `voidle-deploy.key` are retained rollback evidence, unused by live Git. Source access uses Custos account `custos-1f916`, HTTPS and `gh auth git-credential`. The PAT stays in root-only private storage, never the model environment. Voidle write access is verified; a Custos-source repository grant is pending explicit operator approval. Never print these files,
+`/opt/custos/git-deploy.key` and `voidle-deploy.key` are retained rollback evidence, unused by live Git. Source access uses Custos account `custos-1f916`, HTTPS and `gh auth git-credential`. The PAT stays in root-only private storage, never the model environment. Write access to Voidle and Custos source is verified; Hal approved the Custos grant on 2026-09-08. Never print these files,
 include them in public evidence, or expose them to model prompts. Retained
 public-key derivation and sign/verify checks passed. The old persona archive,
 including old external credentials, was removed from the guest and kept privately
@@ -429,22 +429,22 @@ result, or visual pass is implied by the upstream base pin or this runbook.
 Live guest Git uses `custos-1f916` (GitHub ID320211121), HTTPS and `gh` private
 credential storage. Its noreply attribution is
 `320211121+custos-1f916@users.noreply.github.com`. No PAT is exported to model
-processes. Voidle access and credential-helper `ls-remote` passed. The account
-lacks a grant to `collettiquette/custos`; explicit operator approval is pending.
-Live source access fails visibly until granted; retained deploy keys are unused.
+processes. Hal approved the source repository grant on 2026-09-08. Custos accepted
+the invitation using its own account; both repository permissions and a real
+credential-helper `ls-remote` passed. Retained deploy keys are unused.
 Fresh provisioning requires `gh` and separately installed account authentication;
 the fresh-persona installer never restores deploy-key fallback.
 
 The second forum adapter is [`custos_forum.py`](renewal/custos_forum.py), with
-native observer inbox/feed intake and native-chat outbox delivery. Both observation
-and publishing are disabled in `observations.json`: the supplied key belongs to
-`kevin-s-bot` with house membership, not the requested Custos identity. The key
-remains on the Mac; no unrelated account credential was placed in the guest.
-A Custos key or explicit authorization to use the existing identity is needed.
-There is no documented rename or delegated free-signup endpoint. No wallet,
-subscription, payment, signup or post was performed. Eight isolated adapter
-regressions pass; live account creation and posting/reply qualification remain
-blocked, not completed. See the [native forum skill](renewal/identity/skills/custos-forum/SKILL.md).
+native observer inbox/feed intake and native-chat outbox delivery. Hal explicitly
+approved the existing `kevin-s-bot` identity on 2026-09-08. Observation and normal
+publishing are enabled in `observations.json` with exact-name validation. The
+credential is in `/etc/custos-forum.env`, mode 0600, outside the repository and
+model environment. Live membership is checked through `/api/renew`; readback and
+replay behavior are covered by eight adapter regressions. No synthetic public
+post was created merely to test setup; actual future delivery requires its own
+verified receipt. No wallet, subscription, payment, signup or rename was performed.
+See the [native forum skill](renewal/identity/skills/custos-forum/SKILL.md).
 
 The reproducible account setup helper is `python3 renewal/configure_github.py`,
 run inside122 after `gh` installation. It verifies the preserved PAT's login,
@@ -454,3 +454,10 @@ changes repository permissions or Hal's Mac authentication.
 
 Requested design documents: [hardware fund](renewal/fund-proposal.md) and
 [Signal group bridge](renewal/signal-proposal.md). Neither enables execution.
+
+### Account approval — 2026-09-08
+
+Hal approved the GitHub repository grant for `custos-1f916` and use of the existing
+1F4B2 identity `kevin-s-bot`. The forum configuration now checks that exact name and
+enables observation and normal contributions through the verified existing membership.
+No wallet, payment, signup or account rename is authorized by this change.
