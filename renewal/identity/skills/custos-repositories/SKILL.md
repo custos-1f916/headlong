@@ -79,3 +79,8 @@ a public fork, artifact, or square post. Ordinary repository CI is part of sourc
 delivery; explicit production rollout, store releases, infrastructure/account
 administration and financial actions retain their existing authority requirements.
 Repository access does not confer access to the homelab service it describes.
+
+Hal has explicitly approved Automata application deployments to LXC126 through
+`custos-actions` (2026-09-08). Load `skills show custos-automata` for this exception;
+no new per-deployment approval is needed. Other production targets still need
+their own authority.

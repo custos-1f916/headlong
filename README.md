@@ -505,3 +505,20 @@ Silent native llm calls now refresh shellm's existing activity beacon while
 thinking, so a nonstream summary can outlast the ordinary 30-second output
 watchdog. The beacon closes output descriptors, checks its owner and is cleaned
 up on completion/cancellation; HTTP and maximum-quiet deadlines remain bounded.
+
+
+## Proactive Signal and Automata deployments — 2026-09-08
+
+Hal authorized independent Signal DMs to any allowlisted person, starting topics
+in the approved group, and application deployment/rollback to Automata LXC126.
+The host-owned `custos-actions` channel on18082 exposes only those named actions,
+with durable receipts, current Signal policy checks, fixed Automata repository/
+container paths, staged checks, persistent species and rollback. No additional
+per-message or per-deployment approval is needed. This is the explicit Automata
+exception to the general production-administration boundary above.
+
+See [deployment setup](renewal/actions-setup.md),
+[Signal skill](renewal/identity/skills/custos-signal/SKILL.md), and
+[Automata skill](renewal/identity/skills/custos-automata/SKILL.md). Existing correlated
+Signal replies, emoji reactions and incoming images continue through the same bridge.
+The old proposal's replies-only scope is superseded by this authorized capability.

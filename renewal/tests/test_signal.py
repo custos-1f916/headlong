@@ -136,7 +136,7 @@ class SignalSpoolTests(unittest.TestCase):
     def test_image_request_is_prepared_once_and_replayed_after_transport_failure(self):
         image={'contentType':'image/png','id':'12345','size':3}
         self.spool.receive(cs.classify(envelope(message='Look',attachments=[image]),POLICY))
-        bridge=cs.Bridge(self.policy_path,self.spool); bridge.rpc=mock.Mock()
+        bridge=cs.Bridge(self.policy_path,self.spool,str(self.policy_path)+'.actions.sqlite'); bridge.rpc=mock.Mock()
         bridge.rpc.call.return_value={'data':'YWJj'}
         calls=[]
         def transport(args,content=''):
@@ -203,7 +203,7 @@ class SignalSpoolTests(unittest.TestCase):
 
     def test_reaction_intake_passes_ambient_but_cannot_react_to_reaction(self):
         self.spool.receive(cs.classify(reaction(), POLICY))
-        bridge = cs.Bridge(self.policy_path, self.spool)
+        bridge = cs.Bridge(self.policy_path, self.spool, str(self.policy_path)+'.actions.sqlite')
         def transport(args, content=''):
             if args[0] == 'send':
                 self.assertIn('--ambient', args)
@@ -220,7 +220,7 @@ class SignalSpoolTests(unittest.TestCase):
              'targetAuthor': STRANGER, 'targetTimestamp': 999}]})
         self.spool.db.execute("UPDATE outbox SET phase='submitted' WHERE id='reply-1'")
         self.spool.db.commit()
-        bridge = cs.Bridge(self.policy_path, self.spool); bridge.rpc = mock.Mock()
+        bridge = cs.Bridge(self.policy_path, self.spool, str(self.policy_path)+'.actions.sqlite'); bridge.rpc = mock.Mock()
         bridge.rpc.call.return_value = {'timestamp':88,'results':[{'type':'SUCCESS'}]}
         with mock.patch.object(cs,'paused',return_value=False), mock.patch.object(cs,'transport',
                 return_value={'events':[],'trajectory':'one','offset':51}):
@@ -265,14 +265,14 @@ class SignalSpoolTests(unittest.TestCase):
 
     def test_operator_pause_prevents_intake_and_send(self):
         self.spool.receive(self.item)
-        bridge = cs.Bridge(self.policy_path, self.spool)
+        bridge = cs.Bridge(self.policy_path, self.spool, str(self.policy_path)+'.actions.sqlite')
         with mock.patch.object(cs, 'paused', return_value=True), mock.patch.object(cs, 'transport') as transport:
             bridge.tick()
             transport.assert_not_called()
 
     def test_partial_group_acceptance_is_not_marked_submitted(self):
         self.queue()
-        bridge = cs.Bridge(self.policy_path, self.spool)
+        bridge = cs.Bridge(self.policy_path, self.spool, str(self.policy_path)+'.actions.sqlite')
         bridge.rpc = mock.Mock()
         bridge.rpc.call.return_value = {'timestamp': 88, 'results': [
             {'type': 'SUCCESS'}, {'type': 'NETWORK_FAILURE'}]}
@@ -284,7 +284,7 @@ class SignalSpoolTests(unittest.TestCase):
 
     def test_send_routes_to_verified_aci_and_requires_success(self):
         self.queue()
-        bridge = cs.Bridge(self.policy_path, self.spool)
+        bridge = cs.Bridge(self.policy_path, self.spool, str(self.policy_path)+'.actions.sqlite')
         bridge.rpc = mock.Mock()
         bridge.rpc.call.return_value = {'timestamp': 88, 'results': [{'type': 'SUCCESS'}]}
         with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport',
@@ -298,7 +298,7 @@ class SignalSpoolTests(unittest.TestCase):
         policy = copy.deepcopy(POLICY)
         del policy['people'][HAL]
         self.policy_path.write_text(json.dumps(policy))
-        bridge = cs.Bridge(self.policy_path, self.spool)
+        bridge = cs.Bridge(self.policy_path, self.spool, str(self.policy_path)+'.actions.sqlite')
         bridge.rpc = mock.Mock()
         with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport',
                 return_value={'events': [], 'trajectory': 'one', 'offset': 50}):

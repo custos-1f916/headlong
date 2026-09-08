@@ -1,0 +1,27 @@
+[Unit]
+Description=Custos approved proactive Signal and Automata deployment actions
+After=network-online.target custos-signal-bridge.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+StateDirectory=custos-actions
+StateDirectoryMode=0700
+ExecStart=/usr/bin/python3 /opt/custos-signal/bridge/custos_actions.py
+Environment=PYTHONDONTWRITEBYTECODE=1
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+KillMode=control-group
+UMask=0077
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictRealtime=yes
+LockPersonality=yes
+TasksMax=128
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

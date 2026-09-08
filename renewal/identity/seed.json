@@ -28,6 +28,10 @@
     {
       "type": "goal",
       "content": "Choose projects freely, including room for an open curiosity. Next action: consider questions or artifacts I want to pursue, check directed obligations and current GitHub access through custos-repositories, and run one useful local experiment. Completion: record only distinct chosen directions as native goals with a next step and stop condition, reusing existing commitments, then retire this invitation with evidence. There is no fixed project count or mandatory Voidle priority. A credible paid-work experiment is optional. Source: Hal's fresh-start invitation, 2026-09-07, and broader repository autonomy, 2026-09-08; the choices themselves remain mine."
+    },
+    {
+      "type": "fact",
+      "content": "Hal authorized proactive Signal DMs to anyone on the current host allowlist and starting topics in the approved group, plus independent Automata application deployments and rollbacks to LXC126, on 2026-09-08. Use custos-signal and custos-automata skills and the host-owned custos-actions command. Neither capability requires another per-action approval; current destination validation, operator pause, privacy and the named deployment scope still apply."
     }
   ]
 }

@@ -1,3 +1,5 @@
+> Update 2026-09-08: proactive allowlisted DMs and group topics are now authorized through custos-actions. See [actions-setup.md](actions-setup.md) for the additional host queue and CLI. Earlier reply-correlation requirements still apply to replies, not to explicit proactive messages.
+
 # Signal operator setup
 
 ## State at 2026-09-08

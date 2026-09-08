@@ -323,11 +323,17 @@ def paused():
 
 
 class Bridge:
-    def __init__(self, policy_file, spool):
+    def __init__(self, policy_file, spool, actions_state='/var/lib/custos-actions/actions.sqlite'):
         self.policy_file, self.spool = policy_file, spool
         self.policy = load_policy(policy_file)
         self.last_send = {}
         self.rpc = None
+        self.actions_state = actions_state
+        if Path(actions_state).exists():
+            from custos_actions import connect
+            with connect(actions_state) as db:
+                db.execute("UPDATE actions SET phase='uncertain' WHERE phase='sending' "
+                           "AND json_extract(payload,'$.action')='signal-send'")
 
     def receive(self, envelope):
         self.policy = load_policy(self.policy_file)
@@ -339,7 +345,55 @@ class Bridge:
             return
         item = classify(envelope, self.policy)
         if item:
+            if item.get('reaction') and item['reaction']['author'] == self.policy['self_aci'] and Path(self.actions_state).exists():
+                from custos_actions import connect
+                with connect(self.actions_state) as db:
+                    row = db.execute("SELECT payload FROM actions WHERE phase='submitted' "
+                        "AND json_extract(payload,'$.action')='signal-send' "
+                        "AND json_extract(payload,'$.target')=? AND json_extract(receipt,'$.timestamp')=?",
+                        (item['conversation'],item['reaction']['timestamp'])).fetchone()
+                if row:
+                    item['body'] += '\nProactive message target: ' + json.loads(row[0])['message'][:1600]
             self.spool.receive(item)
+
+    def proactive(self):
+        """Consume explicit proactive requests, with current host policy at send time."""
+        if not Path(self.actions_state).exists():
+            return
+        from custos_actions import connect, resolve
+        with connect(self.actions_state) as db:
+            rows = db.execute("SELECT * FROM actions WHERE phase='queued' "
+                              "AND json_extract(payload,'$.action')='signal-send' ORDER BY created LIMIT 8").fetchall()
+            for row in rows:
+                self.policy = load_policy(self.policy_file)
+                p = json.loads(row['payload'])
+                try:
+                    target = resolve(p['target'], self.policy)
+                    group = target[6:] if target.startswith('group:') else None
+                    if not self.group_ok({'group': group}):
+                        raise ValueError('group membership or expiration is not approved')
+                except ValueError:
+                    db.execute("UPDATE actions SET phase='blocked',receipt=? WHERE id=?",
+                               (encoded({'error':'destination no longer approved'}),row['id']))
+                    db.commit(); continue
+                route = 'signal-' + hashlib.sha256(target.encode()).hexdigest()[:24]
+                if time.monotonic()-self.last_send.get(route,-60)<30:
+                    continue
+                if paused(): return
+                params={'message':p['message']}
+                params.update({'groupId':group} if group else {'recipient':[target[3:]]})
+                db.execute("UPDATE actions SET phase='sending' WHERE id=? AND phase='queued'",(row['id'],))
+                db.commit()
+                try:
+                    result=self.rpc.call('send',params)
+                    if (not isinstance(result,dict) or not result.get('timestamp') or not result.get('results') or
+                            any(r.get('type')!='SUCCESS' for r in result['results'])):
+                        raise RuntimeError('Signal has no acceptance receipt')
+                except (TimeoutError,OSError,RuntimeError,ValueError):
+                    db.execute("UPDATE actions SET phase='uncertain' WHERE id=?",(row['id'],));db.commit()
+                    raise
+                db.execute("UPDATE actions SET phase='submitted',receipt=? WHERE id=?",(encoded(result),row['id']))
+                db.commit(); self.last_send[route]=time.monotonic()
 
     def group_ok(self, item):
         if not item['group']:
@@ -462,6 +516,7 @@ class Bridge:
                 db.execute("UPDATE outbox SET phase='submitted',receipt=? WHERE id=?",
                            (encoded(receipt), row['id']))
             self.last_send[item['route']] = time.monotonic()
+        self.proactive()
 
 
 def main():

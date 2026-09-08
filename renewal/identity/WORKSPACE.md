@@ -11,3 +11,6 @@
 - `skills show custos-experiments` — project choice and bounded local experiments; square, observations, reflection, and fund skills are on demand.
 
 Evidence lives with project artifacts and native trajectory; no parallel goals ledger or daily persona ceremony. Root is mine within LXC 122. External homelab authority, resource passthrough, inference admission, and operator pause remain outside this home. Continuous admission is not an autonomous night reservation. The retired LXC 127 pipeline and its timers are not a fallback.
+
+- `custos-actions` — approved proactive Signal messages and Automata LXC126 app deployments, with durable host receipts. Load `custos-signal` or `custos-automata`.
+- `/opt/custos/work/repos/collettiquette/automata/particle-life` — current deployed Automata app; the legacy root app and LXC110 scripts are not the live target.
