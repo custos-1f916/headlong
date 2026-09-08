@@ -220,6 +220,27 @@ class ResponderTests(MemoryFixture):
         self.assertEqual(self.model_calls, 1)
         self.assertEqual(len(self.outgoing()), 1)
 
+    def test_signal_reaction_is_durable_correlated_and_replayed_once(self):
+        self.envelope['allow_reaction'] = True
+        self.log.write_text(cm.encode(self.envelope) + '\n')
+        self.plan = {'reply':'👍🏽','decision':'react','goal':None,'memories':[]}
+        with mock.patch.object(cm,'run',side_effect=self.model):
+            cm.response(self.store,self.request)
+            cm.response(self.store,self.request)
+        self.assertEqual(self.model_calls,1)
+        self.assertEqual(len(self.outgoing()),1)
+        self.assertEqual(self.outgoing()[0]['reaction'],'👍🏽')
+        self.assertEqual(self.outgoing()[0]['reply_to'],'trigger-1')
+
+    def test_reaction_requires_transport_capability_and_one_emoji(self):
+        self.plan = {'reply':'👍','decision':'react','goal':None,'memories':[]}
+        with mock.patch.object(cm,'run',side_effect=self.model), self.assertRaises(cm.InvalidInput):
+            cm.response(self.store,self.request)
+        self.assertEqual(self.outgoing(),[])
+        for value in ('yes', '👍👍'):
+            with self.assertRaises(cm.MemoryError):
+                cm.validate_plan(cm.encode({**self.plan,'reply':value}))
+
     def ambient(self):
         self.envelope['ambient'] = True
         self.log.write_text(cm.encode(self.envelope) + '\n')

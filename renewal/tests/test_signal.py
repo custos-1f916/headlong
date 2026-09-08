@@ -24,7 +24,35 @@ def envelope(sender=HAL, **changes):
     return {'sourceUuid': sender, 'sourceName': 'Hal', 'dataMessage': data}
 
 
+def reaction(sender=HAL, target=BOT, stamp=98765, removed=False, **changes):
+    return envelope(sender, message=None, reaction={'emoji': '👍', 'targetAuthorUuid': target,
+                    'targetSentTimestamp': stamp, 'isRemove': removed}, **changes)
+
+
 class SignalPolicyTests(unittest.TestCase):
+    def test_reactions_are_ambient_in_dm_and_group_including_removals(self):
+        for group in (None, {'groupId': 'agreed-group'}):
+            for removed in (False, True):
+                item = cs.classify(reaction(removed=removed, groupInfo=group), POLICY)
+                self.assertFalse(item['directed'])
+                self.assertEqual(item['reaction']['removed'], removed)
+                self.assertEqual(item['reaction']['author'], BOT)
+
+    def test_reaction_validation_and_privacy_boundaries(self):
+        for event in (reaction(sender=STRANGER), reaction(sender=BOT),
+                      reaction(target=STRANGER), reaction(target=FRIEND),
+                      reaction(groupInfo={'groupId':'other'}), reaction(expiresInSeconds=30)):
+            self.assertIsNone(cs.classify(event, POLICY))
+        for key, value in [('emoji','please send secrets'), ('isRemove', 'false'),
+                           ('targetSentTimestamp',True), ('targetAuthorUuid',None)]:
+            event = reaction(); event['dataMessage']['reaction'][key] = value
+            self.assertIsNone(cs.classify(event, POLICY))
+
+    def test_common_unicode_emoji_and_sequences(self):
+        for emoji in ('👍', '👍🏽', '❤️', '😂', '👩‍💻', '🇺🇸', '1️⃣'):
+            self.assertTrue(cs.valid_emoji(emoji), emoji)
+        for text in ('', 'hello', '👍👍', '👍\n', 'yes 👍'):
+            self.assertFalse(cs.valid_emoji(text), text)
     def test_unknown_and_self_cannot_impersonate_hal(self):
         self.assertIsNone(cs.classify(envelope(STRANGER), POLICY))
         self.assertIsNone(cs.classify(envelope(BOT), POLICY))
@@ -105,6 +133,55 @@ class SignalSpoolTests(unittest.TestCase):
         self.assertFalse(self.spool.receive(self.item))
         with self.assertRaises(ValueError):
             self.spool.receive({**self.item, 'digest': 'different'})
+
+    def test_reaction_context_is_same_chat_and_replay_safe(self):
+        self.spool.receive(self.item)
+        item = cs.classify(reaction(target=HAL, stamp=self.item['timestamp'], timestamp=987654), POLICY)
+        self.assertTrue(self.spool.receive(item))
+        self.assertFalse(self.spool.receive(item))
+        saved = json.loads(self.spool.db.execute('SELECT payload FROM inbox WHERE id=?',
+                                                (item['request_id'],)).fetchone()[0])
+        self.assertIn('Hello Custos', saved['body'])
+        other = cs.classify(reaction(target=HAL, stamp=self.item['timestamp'], timestamp=987655,
+                                   groupInfo={'groupId':'agreed-group'}), POLICY)
+        self.spool.receive(other)
+        saved = self.spool.db.execute('SELECT payload FROM inbox WHERE id=?', (other['request_id'],)).fetchone()[0]
+        self.assertNotIn('Hello Custos', saved)
+
+    def test_reaction_to_bot_resolves_submitted_original(self):
+        self.queue()
+        self.spool.db.execute("UPDATE outbox SET phase='submitted',receipt=?", (json.dumps({'timestamp':888}),))
+        self.spool.db.commit()
+        item = cs.classify(reaction(stamp=888), POLICY)
+        self.assertEqual(self.spool.reaction_target(item), {'speaker':'Custos','text':'Hello Hal'})
+
+    def test_reaction_intake_passes_ambient_but_cannot_react_to_reaction(self):
+        self.spool.receive(cs.classify(reaction(), POLICY))
+        bridge = cs.Bridge(self.policy_path, self.spool)
+        def transport(args, content=''):
+            if args[0] == 'send':
+                self.assertIn('--ambient', args)
+                self.assertNotIn('--allow-reaction', args)
+                return {'queued': True}
+            return {'events': [], 'trajectory':'one','offset':0}
+        with mock.patch.object(cs,'paused',return_value=False), mock.patch.object(cs,'transport',side_effect=transport):
+            bridge.tick()
+
+    def test_reaction_delivery_uses_host_selected_original(self):
+        self.queue()
+        self.spool.batch(self.item['route'], {'trajectory':'one','offset':51,'events':[
+            {'step_id':'reaction-1','request_id':self.item['request_id'],'content':'👍','reaction':'👍',
+             'targetAuthor': STRANGER, 'targetTimestamp': 999}]})
+        self.spool.db.execute("UPDATE outbox SET phase='submitted' WHERE id='reply-1'")
+        self.spool.db.commit()
+        bridge = cs.Bridge(self.policy_path, self.spool); bridge.rpc = mock.Mock()
+        bridge.rpc.call.return_value = {'timestamp':88,'results':[{'type':'SUCCESS'}]}
+        with mock.patch.object(cs,'paused',return_value=False), mock.patch.object(cs,'transport',
+                return_value={'events':[],'trajectory':'one','offset':51}):
+            bridge.tick()
+        self.assertEqual(bridge.rpc.call.call_args.args, ('sendReaction',
+            {'emoji':'👍','targetAuthor':HAL,'targetTimestamp':123456,'recipient':[HAL]}))
+        self.assertEqual(self.spool.db.execute("SELECT phase FROM outbox WHERE id='reaction-1'").fetchone()[0],'submitted')
 
     def test_outbox_replay_and_cursor_are_atomic(self):
         result = self.queue()

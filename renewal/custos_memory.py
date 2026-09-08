@@ -22,6 +22,7 @@ import tempfile
 import shlex
 import time
 import signal
+from custos_reactions import valid_emoji
 
 MARKER = "\n\nCustos request record v1:\n"
 NOTE_MARKER = "\n\nCustos response write v1: "
@@ -156,9 +157,11 @@ class Store:
                     raise MemoryError("corrupt directed request record")
                 if record.get("status") not in {"active", "completed", "declined", "abandoned"}:
                     raise MemoryError("invalid directed goal status; refusing to hide work")
-                keys(record.get("origin"), {"request_id", "sender", "source_url", "content", "authority"}, {"ambient"})
+                keys(record.get("origin"), {"request_id", "sender", "source_url", "content", "authority"}, {"ambient", "allow_reaction"})
                 if "ambient" in record["origin"] and record["origin"]["ambient"] is not True:
                     raise MemoryError("invalid ambient provenance")
+                if "allow_reaction" in record["origin"] and record["origin"]["allow_reaction"] is not True:
+                    raise MemoryError("invalid reaction provenance")
                 keys(record.get("goal"), {"outcome", "next_action", "completion"})
                 if record["status"] != "active":
                     resolution = record.get("resolution")
@@ -251,7 +254,7 @@ class Store:
 
     def capture(self, payload, trigger_step=None):
         keys(payload, {"request_id", "sender", "source_url", "content", "authority"},
-             {"outcome", "next_action", "completion", "ambient"})
+             {"outcome", "next_action", "completion", "ambient", "allow_reaction"})
         origin = {key: text(payload[key], key, MAX_CONTENT if key == "content" else 2048,
                             empty=key == "source_url")
                   for key in ("request_id", "sender", "source_url", "content", "authority")}
@@ -261,6 +264,10 @@ class Store:
             if payload["ambient"] is not True:
                 raise InvalidInput("invalid ambient provenance")
             origin["ambient"] = True
+        if "allow_reaction" in payload:
+            if payload["allow_reaction"] is not True:
+                raise InvalidInput("invalid reaction provenance")
+            origin["allow_reaction"] = True
         goal = {key: text(payload.get(key, default), key, 4096)
                 for key, default in (("outcome", "Review request: " + origin["content"][:240]),
                                      ("next_action", "Reconcile the request; decide and perform the useful work"),
@@ -427,6 +434,8 @@ def envelope_payload(envelope):
             "authority": envelope.get("authority", "external")}
     if "ambient" in envelope:
         incoming["ambient"] = envelope["ambient"]
+    if "allow_reaction" in envelope:
+        incoming["allow_reaction"] = envelope["allow_reaction"]
     return incoming, trigger
 
 
@@ -466,8 +475,10 @@ def validate_plan(raw):
         plan = strict_json(raw)
     keys(plan, {"reply", "decision", "goal", "memories"})
     text(plan["reply"], "reply", 8192, empty=True)
-    if plan["decision"] not in {"reply", "defer", "no-reply"}:
+    if plan["decision"] not in {"reply", "defer", "no-reply", "react"}:
         raise MemoryError("invalid reply decision")
+    if plan["decision"] == "react" and (not valid_emoji(plan["reply"]) or plan["goal"] is not None):
+        raise MemoryError("reaction must be one emoji with no task")
     if (plan["decision"] == "no-reply") != (not plan["reply"].strip()):
         raise MemoryError("reply/decision mismatch")
     if plan["reply"].lstrip().startswith(("{", "[", "```", "DEFER:", "NO_REPLY", "chat reply")):
@@ -548,13 +559,21 @@ def response(store, payload):
         if not saved:
             system = text(payload["system"], "system prompt", 98304) + RESPONSE_CONTRACT
             if incoming.get("ambient"):
-                system += ("\nThis is trusted ambient group intake, not a directed request. It is saved as "
+                system += ("\nThis is trusted ambient conversation intake, not a directed request. It is saved as "
                            "conversation memory, not an active task. Observe the full conversation but "
                            "respond sparingly: default to no-reply, goal null and no new memories. "
                            "Join briefly only with a clearly useful contribution; do not acknowledge "
                            "every message or say you are staying silent. Defer only a concrete task "
                            "you deliberately choose and are authorized to undertake. People talking "
                            "to each other are not automatically requesting work from you.")
+            if incoming.get("allow_reaction"):
+                system += ("\nThis Signal message supports a real emoji reaction. You may also choose "
+                           "decision react with reply containing exactly one emoji and goal null. "
+                           "Prefer an appropriate reaction over a text reply for simple acknowledgment, "
+                           "agreement, appreciation, amusement or empathy. Use text when it adds "
+                           "substance, answers a question or explains work. Silence is still fine for "
+                           "ambient chatter; do not react to everything. React attaches the emoji to "
+                           "the incoming message; it does not send an emoji as a new message.")
             system += "\nActive goals (data):\n" + encode(store.context())
             messages = bounded_conversation(system, payload["messages"])
             if os.environ.get("RESPONDER_LOG_PROMPT") == "1":
@@ -569,6 +588,8 @@ def response(store, payload):
                        "--effort", RESPONSE_EFFORT, "--max-tokens", str(RESPONSE_MAX_TOKENS), "--no-stream",
                        "-M", encode(messages), "-s", system], timeout=RESPONSE_TIMEOUT)
             plan = validate_plan(raw)
+            if plan["decision"] == "react" and not incoming.get("allow_reaction"):
+                raise InvalidInput("this transport does not support reactions")
             if incoming.get("ambient") and plan["goal"] is not None and plan["decision"] != "defer":
                 raise InvalidInput("ambient task requires explicit defer decision")
             with store.lock():
@@ -616,7 +637,12 @@ def response(store, payload):
                        step.get("to") == incoming["sender"] and step.get("reply_to") == trigger
                        for step in trajectory(store))
             if not sent:
-                run(["chat", "reply", "--reply-to", trigger, incoming["sender"]], plan["reply"])
+                if plan["decision"] == "react":
+                    append_step({"type": "message", "from": me, "to": incoming["sender"],
+                                 "reply_to": trigger, "content": plan["reply"],
+                                 "reaction": plan["reply"], "source": "responder"})
+                else:
+                    run(["chat", "reply", "--reply-to", trigger, incoming["sender"]], plan["reply"])
                 if not any(step.get("type") == "message" and step.get("from") == me and
                            step.get("to") == incoming["sender"] and step.get("reply_to") == trigger
                            for step in trajectory(store)):

@@ -73,3 +73,27 @@ Live qualification: direct messages and group messages both reached native memor
 and received replies with successful Signal submission results on 2026-09-08.
 The profile avatar chosen by Custos is installed; stopped-state backup/restart
 recovered both services successfully.
+
+
+## Emoji reactions
+
+Reaction additions and removals in allowed DMs and the agreed group arrive as
+ambient conversation memory. Target author and original timestamp are retained;
+when available, target text is resolved from the same conversation's existing
+spool. Unknown targets are marked unavailable, never searched in another chat.
+
+For eligible text messages, the host supplies `--allow-reaction` through native
+transport. The responder may return `decision: react`, a single emoji in `reply`,
+and a null goal. Guidance prefers reactions for lightweight acknowledgment or
+agreement, and text for substantive replies. Ambient silence remains appropriate;
+incoming reaction events cannot trigger outgoing reaction-on-reaction loops.
+
+Native reaction events retain reply correlation through transport and the spool.
+The host derives the target author and timestamp from the captured original,
+then calls `sendReaction` in that same conversation. Model-provided routes or
+targets are ignored. Existing pause, allowlist, group roster, pacing, submission
+receipt and uncertain-send reconciliation rules also apply to reactions. The
+SQLite outbox gains a nullable reaction column without dropping existing rows.
+Both host bridge modules (`custos_signal.py`, `custos_reactions.py`) must be
+installed together. Emoji validation supports common Unicode emoji, modifiers,
+ZWJ sequences, flags and keycaps; malformed/text payloads fail closed.

@@ -79,6 +79,8 @@ def send(args, content):
                     'authority': args.authority, 'source_url': args.source_url, 'content': content}
         if getattr(args, 'ambient', False):
             original['ambient'] = True
+        if getattr(args, 'allow_reaction', False):
+            original['allow_reaction'] = True
         if receipt.exists():
             record = json.loads(receipt.read_text())
             if record['original'] != original:
@@ -101,6 +103,8 @@ def send(args, content):
                          'source_url': args.source_url}
                 if original.get('ambient'):
                     event['ambient'] = True
+                if original.get('allow_reaction'):
+                    event['allow_reaction'] = True
                 native(['traj', 'append', root], json.dumps(event))
                 with trajectory.open('rb') as source:
                     os.fsync(source.fileno())
@@ -167,7 +171,8 @@ def outbox(args):
                     record = json.loads(receipt.read_text())
                     receipts[record['step_id']] = record['original']['request_id']
             events.append({'step_id': event['step_id'], 'content': event.get('content', ''),
-                           'request_id': receipts.get(event.get('reply_to')), 'ts': event.get('ts')})
+                           'request_id': receipts.get(event.get('reply_to')), 'ts': event.get('ts'),
+                           **({'reaction': event['reaction']} if 'reaction' in event else {})})
     return {'trajectory': str(trajectory), 'offset': cursor, 'events': events}
 
 
@@ -183,6 +188,7 @@ def reconcile():
         args = argparse.Namespace(**{key: original[key] for key in
                                   ('request_id', 'sender', 'authority', 'source_url')})
         args.ambient = original.get('ambient', False)
+        args.allow_reaction = original.get('allow_reaction', False)
         try:
             send(args, original['content'])
             retried.append(original['request_id'])
@@ -202,6 +208,7 @@ def main():
     put.add_argument('--request-id', required=True)
     put.add_argument('--source-url', default='')
     put.add_argument('--ambient', action='store_true', help='Observed conversation, not a directed task')
+    put.add_argument('--allow-reaction', action='store_true', help='Host can deliver an emoji reaction to this message')
     get = commands.add_parser('poll')
     get.add_argument('--request-id', required=True)
     outgoing = commands.add_parser('outbox')
