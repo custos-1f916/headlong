@@ -35,6 +35,15 @@ class PayloadTests(unittest.TestCase):
         explicit = json.loads(gateway.payload(json.dumps(base | {"reasoning_effort": "xhigh"}).encode(), 32768))
         self.assertEqual(explicit["reasoning_effort"], "xhigh")
 
+    def test_xhigh_default_and_expanded_reasoning_limits(self):
+        policy = gateway.load_policy(str(Path(__file__).resolve().parents[1] / "gateway-policy.json"))
+        self.assertEqual(policy["request_seconds"], 600)
+        self.assertEqual(policy["max_tokens"], 65536)
+        self.assertEqual(policy["max_response_bytes"], 33554432)
+        value = json.loads(gateway.payload(json.dumps({"model":gateway.MODEL,"messages":[{"role":"user","content":"hello"}]}).encode(), policy["max_tokens"]))
+        self.assertEqual(value["reasoning_effort"], "xhigh")
+        self.assertEqual(value["max_tokens"], 65536)
+
     def test_duplicate_keys_and_deep_json_are_rejected(self):
         for raw in (b'{"model":"x","model":"qwen3.8-27b"}', b"[" * 65 + b"0" + b"]" * 65):
             with self.assertRaises(gateway.Denied):

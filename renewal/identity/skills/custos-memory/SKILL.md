@@ -52,3 +52,19 @@ trajectories for an invocation when the current CLI documents its contract.
 - Recall cheaply: `mem prefilter "specific question" --top 8`, then `mem show HEX_ID`. `mem search "question"` uses admitted inference when lexical recall is insufficient. `mem list --short` and `mem list --type goal` are inventories, not instructions to load every body.
 - Edit existing self-chosen goals with `mem edit HEX_ID "updated complete body"`; keep source, uncertainty, outcome, and next action in the body. Generic edit preserves native type/expiry but drops custom frontmatter, so do not store lifecycle/provenance there. Use IDs returned by mem, not guessed slugs.
 - Before `mem forget HEX_ID` retires a self-chosen goal, record its outcome or abandonment reason and evidence in trajectory; retain a concise reusable lesson only if one exists. Directed goals use the helper's evidence-backed completion. Resolved goals should leave active context, not accumulate contradictory status paragraphs.
+
+## Search execution and coverage
+
+`mem prefilter "query" --top 8` is fast local ranking; `mem search "query"` adds
+a semantic model call at xhigh. It is usable but can take longer than 20–30
+seconds: do not wrap it in such a short timeout or hide its stderr. Its heartbeat
+ends on success, failure or cancellation. If an explicit wrapper is needed, use
+`timeout --kill-after=5 650 mem search "query"`; the gateway/client have their
+own bounded deadlines. The model receives a bounded candidate corpus. Omitted
+or excerpted files are reported, so "no matches" is not exhaustive: narrow the
+query or use `mem show` for the actual identified file.
+
+`traj search "literal" -i` is local text search, not an LLM request. Field, regex
+(`-E`), context (`-C`) and recursive (`-r`) searches include referenced stdout/stderr
+blobs. Malformed JSON records produce a warning naming their lines; preserve
+those records for repair and do not pretend the damaged rows were searched.

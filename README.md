@@ -17,7 +17,7 @@ continue through native goals.
 
 | Where | Role and authoritative data |
 |---|---|
-| blink1, `192.168.86.44`, LXC **122** | Custos home: `192.168.86.52`, MAC `BC:24:11:00:32:05`; 4 cores, 6144 MiB RAM, 2048 MiB swap, 64 GiB rootfs. Still **unprivileged** at the PVE boundary, with unrestricted root **inside** its home. |
+| blink1, `192.168.86.44`, LXC **122** | Custos home: `192.168.86.52`, MAC `BC:24:11:00:32:05`; 4 cores, 6144 MiB RAM, 20432 MiB swap, 64 GiB rootfs. Still **unprivileged** at the PVE boundary, with unrestricted root **inside** its home. |
 | Guest `/root/.headlong/app` | Fresh Headlong runtime based on upstream `5458fee8e722c9eb45a75739e9fa1f92419ebafc`; exact integration delta and digest are retained in [headlong.patch](renewal/headlong.patch) and [headlong-runtime.json](renewal/headlong-runtime.json). Native identity/state are separate and must also be backed up. |
 | Guest `/root/.headlong/app/.identities/custos` | Active identity: charter, skills, native `memories/`, `trajectories/`, chat and runtime state. Fresh root trajectory: `7ed4c8d8-4fc3-43b7-a812-3c29d92fbb1d`. Transport receipts live in `.state/transport/`. |
 | Guest `/opt/custos/repo/renewal` | Maintained integration source, policy templates, installers, and [identity/skills](renewal/identity/skills/). Installed identity files are copied at cutover: changing a template is not automatically a live identity update. |
@@ -86,8 +86,8 @@ primary user. There is **no daily or rolling inference quota**, no reservations,
 and no foreign-client preemption. The former `quota.sqlite3` is historical evidence
 and is neither opened nor modified by the gateway.
 
-The gateway retains 180 seconds/request, 32768 output tokens, 128 KiB request body,
-128 messages, and medium reasoning by default (explicit xhigh allowed). A fresh
+The gateway retains 600 seconds/request, 65536 output tokens, 128 KiB request body,
+128 messages, and xhigh reasoning by default. A fresh
 idle socket observation is required for new admission. Once admitted, a stream
 continues even if another client appears or the observation goes stale; operator
 pause, timeout and client disconnection still cancel it. NInfer owns its one-slot
@@ -461,3 +461,21 @@ Hal approved the GitHub repository grant for `custos-1f916` and use of the exist
 1F4B2 identity `kevin-s-bot`. The forum configuration now checks that exact name and
 enables observation and normal contributions through the verified existing membership.
 No wallet, payment, signup or account rename is authorized by this change.
+
+### Search recovery and xhigh — 2026-09-08
+
+A timed-out memory search leaked a heartbeat process which held a pipeline open
+and kept resetting the inactivity watchdog. Search cleanup now handles model
+failure and cancellation; a candidate corpus is capped at 64 KiB of encoded
+content with explicit omitted/excerpted coverage notices. The previous real query
+selected 199,033 bytes and was rejected immediately by the 128 KiB gateway.
+Trajectory search now parses each file once and invokes grep once per file,
+retaining literal/regex, case, context, fields, recursive labels and blob reads.
+Malformed records are reported rather than silently hiding all later records.
+
+Hal requested xhigh throughout. Identity/service effort and gateway default are
+xhigh. Utility calls have an opt-in 65,536-token output floor so small summary
+and search caps cannot consume their entire budget in reasoning. Requests allow
+600 seconds, the client allows 630 seconds, and streamed responses allow 32 MiB.
+The existing 128 KiB input limit, one inference slot and operator pause remain.
+These are per-request stability bounds, not usage quotas.

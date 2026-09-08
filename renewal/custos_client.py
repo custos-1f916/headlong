@@ -24,7 +24,7 @@ def main():
             if response.get('decision') == 'no-reply':
                 return 0
             time.sleep(2)
-        print('Saved as goal ' + receipt['goal_id'] + '. Reply pending; inference may be busy, paused, or budget-limited.')
+        print('Saved as goal ' + receipt['goal_id'] + '. Reply pending; inference may be busy, paused, or still reasoning.')
         return 0
     except (OSError, ValueError, RuntimeError, KeyError, json.JSONDecodeError) as error:
         print('custos: ' + str(error), file=sys.stderr)

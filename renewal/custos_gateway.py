@@ -82,7 +82,7 @@ def payload(raw, max_tokens):
         if type(limit) is not int or not 1 <= limit <= max_tokens:
             raise ValueError("output limit outside policy")
         value["max_tokens"] = limit
-        effort = value.setdefault("reasoning_effort", "medium")
+        effort = value.setdefault("reasoning_effort", "xhigh")
         if effort not in ("medium", "xhigh"):
             raise ValueError("only medium or explicit xhigh effort is admitted")
         messages = value.get("messages")
@@ -389,9 +389,9 @@ def load_policy(path):
                 "connect_timeout_seconds", "io_timeout_seconds", "busy_max_age_seconds"}
     if not isinstance(policy, dict) or set(policy) != required:
         raise ValueError("policy keys do not match required schema")
-    bounds = {"request_seconds": 180,
-              "max_tokens": 32768, "max_connections": 16, "max_header_bytes": 16384,
-              "max_body_bytes": 131072, "max_response_bytes": 8388608, "header_timeout_seconds": 5,
+    bounds = {"request_seconds": 600,
+              "max_tokens": 65536, "max_connections": 16, "max_header_bytes": 16384,
+              "max_body_bytes": 131072, "max_response_bytes": 33554432, "header_timeout_seconds": 5,
               "body_timeout_seconds": 5, "connect_timeout_seconds": 3, "io_timeout_seconds": 5,
               "busy_max_age_seconds": 5}
     for key, maximum in bounds.items():

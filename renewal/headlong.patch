@@ -14,7 +14,7 @@ index f78cafc..72bccec 100755
      printf '%s' "$best_result"
  fi
 diff --git a/bin/llm b/bin/llm
-index e6a5b00..d13cf0f 100755
+index e6a5b00..b618a96 100755
 --- a/bin/llm
 +++ b/bin/llm
 @@ -47,7 +47,7 @@ LLM_PROVIDER="${LLM_PROVIDER:-}"
@@ -26,7 +26,31 @@ index e6a5b00..d13cf0f 100755
  LLM_RAW=0
  LLM_PROMPT=""
  # OpenRouter provider routing. OpenRouter fans a single model id out over
-@@ -711,6 +711,14 @@ build_payload_openai() {
+@@ -332,6 +332,7 @@ Environment:
+                            (same names as --provider); --provider takes
+                            precedence, and a value that disagrees with the
+                            name warns on stderr
++  LLM_MIN_OUTPUT_TOKENS    Optional floor for reasoning-heavy utility calls
+   LLM_MAX_TOKENS           Override the per-model default output cap (same as -t)
+   LLM_RETRIES              Retries for transient API failures (default: 2;
+                            0 disables). Never retries after partial output.
+@@ -596,6 +597,15 @@ if [[ ! "$LLM_MAX_TOKENS" =~ ^[0-9]+$ ]]; then
+     LLM_MAX_TOKENS=$(get_model_max_tokens "$LLM_MODEL")
+ fi
+ 
++# Opt-in budget for reasoning-heavy identities. Tiny utility-specific caps
++# otherwise spend all tokens in reasoning and return no usable JSON/answer.
++if [[ -n "${LLM_MIN_OUTPUT_TOKENS:-}" ]]; then
++    [[ "$LLM_MIN_OUTPUT_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "LLM_MIN_OUTPUT_TOKENS must be a positive integer"
++    if [[ "$LLM_MAX_TOKENS" -lt "$LLM_MIN_OUTPUT_TOKENS" ]]; then
++        LLM_MAX_TOKENS="$LLM_MIN_OUTPUT_TOKENS"
++    fi
++fi
++
+ # ---------------------------------------------------------------------------
+ # Build messages JSON
+ # ---------------------------------------------------------------------------
+@@ -711,6 +721,14 @@ build_payload_openai() {
          jq_filter="${jq_filter} + {stream_options: {include_usage: true}}"
      fi
  
@@ -41,7 +65,7 @@ index e6a5b00..d13cf0f 100755
      # Map --thinking LEVEL to OpenAI reasoning.effort (only when an explicit
      # level is given; bare --thinking without a level is ignored for OpenAI
      # since not all models support the reasoning parameter).
-@@ -1122,11 +1130,24 @@ stream_openai() {
+@@ -1122,11 +1140,24 @@ stream_openai() {
              # of "bash\n" would lose its newline. That silently reflows the
              # model's output onto one line, which turns a fenced code block
              # into an unparseable ```bash<first-line-of-code>.
@@ -72,7 +96,7 @@ index e6a5b00..d13cf0f 100755
              # Only the final chunk carries a non-null finish_reason; the glob
              # keeps jq off the hot per-delta path.
 diff --git a/bin/mem b/bin/mem
-index 98df4f9..d38819d 100755
+index 98df4f9..5f8ae89 100755
 --- a/bin/mem
 +++ b/bin/mem
 @@ -55,6 +55,16 @@ slugify() {
@@ -101,7 +125,100 @@ index 98df4f9..d38819d 100755
      created=$(date +"%Y-%m-%d %H:%M:%S")
  
      cat > "$MEM_DIR/${filename}.md" << EOF
-@@ -370,7 +380,7 @@ action_edit() {
+@@ -198,7 +208,7 @@ action_prefilter() {
+     mem_prefilter "$query" "$top"
+ }
+ 
+-action_search() {
++action_search() (
+     local query="$1"
+ 
+     local count
+@@ -215,14 +225,35 @@ action_search() {
+     candidates=$(mem_prefilter "$query" "$top")
+     [[ -n "$candidates" ]] || candidates=$(ls -1 "$MEM_DIR"/*.md | tail -n "$top")
+ 
+-    local memories="" f
+-    while IFS= read -r f; do
+-        [[ -f "$f" ]] || continue
+-        memories+="=== $(basename "$f") ===
+-$(cat "$f")
+-
+-"
+-    done <<< "$candidates"
++    local memories
++    memories=$(MEM_SEARCH_CANDIDATES="$candidates" python3 - "${MEM_SEARCH_MAX_BYTES:-65536}" <<'PYMEM'
++import json,os,sys
++from pathlib import Path
++limit=int(sys.argv[1])
++if limit<1024:raise SystemExit('MEM_SEARCH_MAX_BYTES must be at least 1024')
++parts=[];used=0;omitted=0;excerpts=0
++size=lambda s:len(json.dumps(s,ensure_ascii=False).encode('utf-8'))
++for name in os.environ['MEM_SEARCH_CANDIDATES'].splitlines():
++    p=Path(name)
++    if not p.is_file():continue
++    body=p.read_text(encoding='utf-8',errors='replace')
++    header='=== '+p.name+' ===\n'
++    text=header+body+'\n\n';cost=size(text)
++    if used+cost>limit:
++        if parts:omitted+=1;continue
++        suffix='\n[EXCERPT: remaining file was not searched; use mem show for the full memory.]\n\n'
++        lo,hi=0,len(body)
++        while lo<hi:
++            mid=(lo+hi+1)//2
++            if size(header+body[:mid]+suffix)<=limit:lo=mid
++            else:hi=mid-1
++        text=header+body[:lo]+suffix;cost=size(text);excerpts+=1
++    parts.append(text);used+=cost
++if omitted or excerpts:
++    print('mem search: bounded candidate coverage: %d included, %d omitted, %d excerpted; no-match is not an exhaustive search.'%(len(parts),omitted,excerpts),file=sys.stderr)
++print(''.join(parts),end='')
++PYMEM
++    )
+ 
+     # Stage 2: the model ranks the candidates. Utility call: use the cheap
+     # model class when one is configured. A reasoning model spends output
+@@ -234,15 +265,33 @@ $(cat "$f")
+     # before its first visible token (glm 5.3 flash: 31s on the box,
+     # 2026-09-03). MEM_SEARCH_HEARTBEAT_S=0 disables it.
+     local hb="${MEM_SEARCH_HEARTBEAT_S:-10}" _hb_pid=""
+-    [[ "$hb" != 0 ]] && { ( while :; do sleep "$hb"; printf 'mem search: waiting for the model...\n' >&2; done ) & _hb_pid=$!; }
++    local search_pid="${BASHPID:-$$}"
++    # Isolate traps from callers and clean up on model failure or cancellation.
++    # The heartbeat must never own the search result pipe: a failed llm used
++    # to leave it alive forever, keeping `mem search | head` open.
++    trap 'if [[ -n "$_hb_pid" ]]; then kill "$_hb_pid" 2>/dev/null || true; wait "$_hb_pid" 2>/dev/null || true; fi' EXIT
++    trap 'exit 143' TERM
++    trap 'exit 130' INT
++    if [[ "$hb" != 0 ]]; then
++        (
++            sleeper=""
++            trap '[[ -z "$sleeper" ]] || kill "$sleeper" 2>/dev/null || true; exit 0' TERM INT
++            while kill -0 "$search_pid" 2>/dev/null; do
++                sleep "$hb" & sleeper=$!
++                wait "$sleeper" || exit 0
++                kill -0 "$search_pid" 2>/dev/null || exit 0
++                printf 'mem search: waiting for the model...\n' >&2
++            done
++        ) >/dev/null &
++        _hb_pid=$!
++    fi
++    local rc=0
+     # shellcheck disable=SC2086
+     printf 'Search these memories for: %s\n\n%s' "$query" "$memories" | \
+         llm ${SHELLM_FAST_MODEL:+-m "$SHELLM_FAST_MODEL"} -t "${MEM_SEARCH_MAX_TOKENS:-16000}" \
+-            -s "You are a semantic search engine for memory files. Each memory has a filename header (=== filename ===), YAML frontmatter (summary, type), and a body. Return ONLY the filenames and summaries of semantically matching memories, one per line. If nothing matches, say 'No matches found.'"
+-    local rc=$?
+-    if [[ -n "$_hb_pid" ]]; then kill "$_hb_pid" 2>/dev/null || true; wait "$_hb_pid" 2>/dev/null || true; fi
+-    return "$rc"
+-}
++            -s "You are a semantic search engine for memory files. Each memory has a filename header (=== filename ===), YAML frontmatter (summary, type), and a body. Return ONLY the filenames and summaries of semantically matching memories, one per line. If nothing matches, say 'No matches found.'" || rc=$?
++    exit "$rc"
++)
+ 
+ action_list() {
+     local limit=0 short=0 filter_type="" filter_before="" filter_after=""
+@@ -370,7 +419,7 @@ action_edit() {
      # edit: a todo shortlist that is appended to during the day must still
      # expire that night.
      local summary type created id until
@@ -110,6 +227,14 @@ index 98df4f9..d38819d 100755
      type=$(frontmatter_field "$file" "type")
      created=$(frontmatter_field "$file" "created")
      id=$(frontmatter_field "$file" "id")
+@@ -474,6 +523,7 @@ Options:
+ Environment:
+   MEM_DIR   Override memory directory (default: ./.memories)
+   MEM_SEARCH_TOP         Candidates the keyword prefilter sends the model (40)
++  MEM_SEARCH_MAX_BYTES   Encoded candidate budget (65536); omissions/excerpts are reported
+   MEM_SEARCH_MAX_TOKENS  Output cap for the search call (16000; a reasoning
+                          model thinks against it, so keep it roomy)
+   MEM_SEARCH_HEARTBEAT_S Seconds between "waiting" lines on stderr while the
 diff --git a/bin/recap b/bin/recap
 index d3711eb..1668d33 100755
 --- a/bin/recap
@@ -251,6 +376,106 @@ index 1a27f50..5e52239 100755
                  rm -f "$feedback_file"
                  sleep 1
              else
+diff --git a/bin/traj b/bin/traj
+index a7deba3..0213422 100755
+--- a/bin/traj
++++ b/bin/traj
+@@ -1231,43 +1231,58 @@ cmd_search() {
+         local blob_base
+         blob_base="$(dirname "$_sf")"
+ 
+-        # Iterate over each row in the trajectory.
+-        while IFS= read -r row; do
+-            local step_id
+-            step_id=$(printf '%s' "$row" | jq -r '.step_id // empty')
+-            [[ -n "$step_id" ]] || continue
+-
+-            for f in $fields_to_search; do
+-                local content=""
+-
+-                # For stdout/stderr, check if there's a blob and use that for full search.
+-                local ref_key="${f}_ref"
+-                local ref_val
+-                ref_val=$(printf '%s' "$row" | jq -r ".${ref_key} // empty" 2>/dev/null)
+-
+-                if [[ -n "$ref_val" ]] && [[ -f "$blob_base/$ref_val" ]]; then
+-                    content=$(cat "$blob_base/$ref_val")
+-                else
+-                    content=$(printf '%s' "$row" | jq -r ".${f} // empty")
+-                fi
+-
+-                [[ -n "$content" ]] || continue
+-
+-                # Search the content.
+-                local matches
+-                matches=$(printf '%s\n' "$content" | grep "${grep_args[@]}" -- "$pattern" 2>/dev/null || true)
+-                [[ -n "$matches" ]] || continue
+-
+-                # Format output: <traj_hex>:<step>:<field>:<match> or <step>:<field>:<match>
+-                while IFS= read -r match_line; do
+-                    if [[ "$recursive" -eq 1 ]]; then
+-                        printf '%s:%s:%s:%s\n' "$_traj_hex" "$step_id" "$f" "$match_line"
+-                    else
+-                        printf '%s:%s:%s\n' "$step_id" "$f" "$match_line"
+-                    fi
+-                done <<< "$matches"
+-            done
+-        done < "$_sf"
++        # Parse JSON once and run grep once per file. The old loop spawned
++        # roughly fifteen jq/grep processes for every trajectory record.
++        python3 - "$_sf" "$pattern" "$field" "$use_regex" "$case_flag" "$context_lines" "$recursive" "$_traj_hex" <<'PYSEARCH'
++import json,sys,subprocess
++from pathlib import Path
++path,pattern,field,regex,case,context,recursive,trajhex=sys.argv[1:]
++context=int(context); groups=[]; all_lines=[]; offsets=[]; bad=[]
++fields=['content','thought','cmd','stdout','stderr'] if field=='all' else [field]
++with open(path,encoding='utf-8',errors='replace') as source:
++    for number,raw in enumerate(source,1):
++        try: row=json.loads(raw)
++        except ValueError: bad.append(number);continue
++        if not isinstance(row,dict) or not row.get('step_id'):continue
++        for name in fields:
++            value=row.get(name)
++            ref=row.get(name+'_ref')
++            blob=Path(path).parent/ref if isinstance(ref,str) else None
++            if blob and blob.is_file():value=blob.read_text(encoding='utf-8',errors='replace')
++            if value is None or value is False:continue
++            if not isinstance(value,str):value=json.dumps(value,ensure_ascii=False,indent=2)
++            lines=value.rstrip('\n').split('\n')
++            if lines==['']:continue
++            offsets.append(len(all_lines));groups.append((str(row['step_id']),name,lines));all_lines.extend(lines)
++args=['grep','-a','-n','-E' if regex=='1' else '-F']
++if case:args.append('-i')
++args.extend(['--',pattern])
++result=subprocess.run(args,input=('\n'.join(all_lines)+'\n' if all_lines else ''),text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
++if result.returncode not in (0,1):
++    sys.stderr.write(result.stderr);sys.exit(result.returncode)
++hits={int(line.split(':',1)[0])-1 for line in result.stdout.split('\n') if line}
++from bisect import bisect_right
++by_group={}
++for hit in hits:
++    group=bisect_right(offsets,hit)-1
++    by_group.setdefault(group,set()).add(hit-offsets[group])
++try:
++    for index,(step,name,lines) in enumerate(groups):
++        local_hits=by_group.get(index,set())
++        selected=set()
++        for n in local_hits:selected.update(range(max(0,n-context),min(len(lines),n+context+1)))
++        prefix=(trajhex+':' if recursive=='1' else '')+step+':'+name+':'
++        previous=None
++        for n in sorted(selected):
++            if context and previous is not None and n>previous+1:print(prefix+'--')
++            print(prefix+str(n+1)+(':' if n in local_hits else '-')+lines[n]);previous=n
++    sys.stdout.flush()
++except BrokenPipeError:
++    # `traj search ... | head` is normal caller truncation, not a run failure.
++    import os
++    os.dup2(os.open(os.devnull,os.O_WRONLY),sys.stdout.fileno())
++if bad:print('traj search: skipped malformed JSON records in '+path+' at lines '+','.join(map(str,bad)),file=sys.stderr)
++PYSEARCH
+     done <<< "$_search_files"
+ }
+ 
 diff --git a/tests/test_context.sh b/tests/test_context.sh
 index dc453ef..4e604df 100755
 --- a/tests/test_context.sh
@@ -2094,3 +2319,105 @@ index f209a3a..8b40128 100644
    /** Truncated on the wire when huge (head + trailing ACTION kept);
     * fetch the full text via fetchRunCommand when command_truncated. */
    command: string;
+diff --git a/tests/test_mem_search_cleanup.py b/tests/test_mem_search_cleanup.py
+new file mode 100644
+index 0000000..2165831
+--- /dev/null
++++ b/tests/test_mem_search_cleanup.py
+@@ -0,0 +1,28 @@
++#!/usr/bin/env python3
++"""A failed/cancelled search must not keep a result pipeline open via heartbeat."""
++import os,signal,subprocess,tempfile,shlex
++from pathlib import Path
++ROOT=Path(__file__).resolve().parents[1]
++with tempfile.TemporaryDirectory() as folder:
++    root=Path(folder);(root/'bin').mkdir();(root/'mem').mkdir()
++    (root/'mem/2026-09-08-00-00-00_abcd_capture.md').write_text('---\nsummary: capture race\ntype: fact\n---\ncapture race\n')
++    env=dict(os.environ,PATH=str(root/'bin')+':'+os.environ['PATH'],MEM_DIR=str(root/'mem'),MEM_SEARCH_HEARTBEAT_S='0.05')
++    for mode,body,expected in [('failed','exit 42',42),('cancelled','kill -TERM "$PPID"; exit 0',143)]:
++        stub=root/'bin/llm';stub.write_text('#!/bin/bash\ncat >/dev/null\nsleep 0.15\n'+body+'\n');stub.chmod(0o755)
++        p=subprocess.Popen(['bash','-o','pipefail','-c',shlex.quote(str(ROOT/'bin/mem'))+' search "capture race" | head -5'],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
++        try:out,err=p.communicate(timeout=3)
++        except subprocess.TimeoutExpired:
++            os.killpg(p.pid,signal.SIGKILL);p.communicate();raise AssertionError(mode+': orphan heartbeat kept pipeline open')
++        assert p.returncode==expected,(mode,p.returncode,err.decode())
++        assert b'waiting for the model' not in out
++        print('PASS',mode,'search closes its pipeline and preserves exit',expected)
++    # Unicode and JSON escaping must fit the actual wire budget, not only raw bytes.
++    (root/'mem/2026-09-08-00-00-00_abcd_capture.md').write_text('capture race\n'+('証人 "capture" \\ race\n'*20000))
++    capture=root/'captured.txt'
++    stub.write_text('#!/bin/bash\ncat > '+shlex.quote(str(capture))+'\nprintf "bounded reply\\n"\n')
++    r=subprocess.run([str(ROOT/'bin/mem'),'search','capture race'],env=dict(env,MEM_SEARCH_MAX_BYTES='8192'),text=True,capture_output=True,timeout=3)
++    assert r.returncode==0,r.stderr
++    import json
++    assert len(json.dumps(capture.read_text(),ensure_ascii=False).encode())<8500
++    assert 'EXCERPT' in capture.read_text() and 'not an exhaustive search' in r.stderr
++    print('PASS oversized Unicode memory is bounded with explicit incomplete-coverage notice')
+diff --git a/tests/test_traj_search.py b/tests/test_traj_search.py
+new file mode 100644
+index 0000000..1a25932
+--- /dev/null
++++ b/tests/test_traj_search.py
+@@ -0,0 +1,35 @@
++#!/usr/bin/env python3
++"""Verify real traj CLI output against per-field grep, including blob contents."""
++import json,os,subprocess,tempfile,time
++from pathlib import Path
++ROOT=Path(__file__).resolve().parents[1]
++with tempfile.TemporaryDirectory() as d:
++    root=Path(d);folder=root/'abcdef12-root';folder.mkdir();path=folder/'trajectory.jsonl'
++    rows=[{'step_id':'a','content':'Before\nCapture race\nafter\ngap\ngap\nCAPTURE tail','thought':'a+b literal\n尾 anchor','stdout':'stub','stdout_ref':'blob.txt'}, {'step_id':'b','cmd':'echo capture\nnext','stderr':'No matches'}]
++    (folder/'blob.txt').write_text('blob start\ncapture full output\nblob end\n')
++    path.write_text(''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in rows))
++    env=dict(os.environ,TRAJ_DIR=str(root),TRAJ_ID='abcdef12')
++    cases=[('capture',[],['content','thought','cmd','stdout','stderr']),('capture',['-i','-C','1'],['content','thought','cmd','stdout','stderr']),('Capture|a[+]b',['-E','-C','1'],['content','thought','cmd','stdout','stderr']),('capture',['--field','stdout'],['stdout']),('尾',[],['content','thought','cmd','stdout','stderr']),('absent',[],['content','thought','cmd','stdout','stderr'])]
++    for pattern,flags,fields in cases:
++        expected=[]
++        for row in rows:
++            for field in fields:
++                val=(folder/row[field+'_ref']).read_text() if row.get(field+'_ref') else row.get(field,'')
++                if not val:continue
++                opts=[x for x in flags]
++                if '--field' in opts:opts=opts[:opts.index('--field')]+opts[opts.index('--field')+2:]
++                if '-E' not in opts:opts+=['-F']
++                r=subprocess.run(['grep','-n',*opts,'--',pattern],input=val.rstrip('\n')+'\n',text=True,capture_output=True)
++                expected.extend(row['step_id']+':'+field+':'+l for l in r.stdout.splitlines())
++        r=subprocess.run([str(ROOT/'bin/traj'),'search',pattern,*flags],env=env,text=True,capture_output=True,timeout=5)
++        assert r.returncode==0,(r.returncode,r.stderr)
++        assert r.stdout==''.join(l+'\n' for l in expected),(pattern,flags,r.stdout,expected)
++    print('PASS literal, regex, case, context, blob, Unicode, field and no-match output matches grep')
++    path.write_text(path.read_text()+'{malformed\n'+json.dumps({'step_id':'c','content':'capture after malformed'})+'\n')
++    r=subprocess.run([str(ROOT/'bin/traj'),'search','capture'],env=env,text=True,capture_output=True,timeout=5)
++    assert 'c:content:1:capture after malformed' in r.stdout and 'malformed JSON' in r.stderr
++    print('PASS malformed records are reported and later valid records remain searchable')
++    path.write_text(''.join(json.dumps({'step_id':str(i),'content':'needle '+str(i)})+'\n' for i in range(5000)))
++    t=time.monotonic();r=subprocess.run([str(ROOT/'bin/traj'),'search','needle'],env=env,text=True,capture_output=True,timeout=5)
++    assert r.returncode==0 and len(r.stdout.splitlines())==5000
++    print('PASS 5000 matching records in %.3fs'%(time.monotonic()-t))
+diff --git a/tests/test_llm_reasoning_budget.py b/tests/test_llm_reasoning_budget.py
+new file mode 100644
+index 0000000..0842d1f
+--- /dev/null
++++ b/tests/test_llm_reasoning_budget.py
+@@ -0,0 +1,21 @@
++#!/usr/bin/env python3
++import os,json,subprocess,tempfile
++from pathlib import Path
++ROOT=Path(__file__).resolve().parents[1]
++with tempfile.TemporaryDirectory() as d:
++    root=Path(d);(root/'bin').mkdir();capture=root/'payload.json'
++    curl=root/'bin/curl';curl.write_text('''#!/usr/bin/env python3
++import os,sys,json
++from pathlib import Path
++a=sys.argv[1:];payload=Path(a[a.index('-d')+1][1:]).read_bytes();Path(os.environ['CAPTURE']).write_bytes(payload)
++Path(a[a.index('-o')+1]).write_text(json.dumps({'choices':[{'message':{'content':'ok'},'finish_reason':'stop'}],'usage':{'completion_tokens':1}}))
++print('200',end='')
++''');curl.chmod(0o755)
++    env=dict(os.environ,PATH=str(root/'bin')+':'+os.environ['PATH'],HEADLONG_HOME=str(root/'home'),LLM_PROVIDER='openai-compatible',LLM_API_URL='http://localhost/v1/chat/completions',LLM_API_KEY='fixture',LLM_EFFORT='xhigh',LLM_MIN_OUTPUT_TOKENS='65536',LLM_RETRIES='0',CAPTURE=str(capture))
++    cmd=[str(ROOT/'bin/llm'),'-m','qwen3.8-27b','-t','1024','--no-stream']
++    r=subprocess.run(cmd,input='fixture',text=True,capture_output=True,env=env,timeout=5);assert r.returncode==0,r.stderr
++    p=json.loads(capture.read_text());assert p['max_tokens']==65536 and p['reasoning_effort']=='xhigh',p
++    print('PASS xhigh utility request gets full configured reasoning budget despite -t 1024')
++    del env['LLM_MIN_OUTPUT_TOKENS'];r=subprocess.run(cmd,input='fixture',text=True,capture_output=True,env=env,timeout=5);assert r.returncode==0,r.stderr
++    assert json.loads(capture.read_text())['max_tokens']==1024
++    print('PASS identities without opt-in floor retain explicit token limits')
