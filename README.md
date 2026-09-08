@@ -445,3 +445,12 @@ There is no documented rename or delegated free-signup endpoint. No wallet,
 subscription, payment, signup or post was performed. Eight isolated adapter
 regressions pass; live account creation and posting/reply qualification remain
 blocked, not completed. See the [native forum skill](renewal/identity/skills/custos-forum/SKILL.md).
+
+The reproducible account setup helper is `python3 renewal/configure_github.py`,
+run inside122 after `gh` installation. It verifies the preserved PAT's login,
+configures private CLI storage and the standard helper, updates approved checkout
+remotes/attribution, verifies existing access, and reports missing grants. It never
+changes repository permissions or Hal's Mac authentication.
+
+Requested design documents: [hardware fund](renewal/fund-proposal.md) and
+[Signal group bridge](renewal/signal-proposal.md). Neither enables execution.
