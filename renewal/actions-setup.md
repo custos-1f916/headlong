@@ -65,3 +65,8 @@ Deploy the guest source/launcher and copied identity charter/skills/workspace;
 never rerun the destructive fresh-persona installer on the running identity.
 Publish and record runtime evidence in HANDOFF.md. The main entrypoints and full
 payload/status semantics are in the custos-signal and custos-automata skills.
+
+Restoring an existing commit compares normalized source paths, executable modes
+and bytes, not tar headers: Git subtree archives carry changing timestamps. The
+wire SHA-256 still verifies transfer integrity. Existing release markers are
+upgraded only after checking the actual installed source contents.

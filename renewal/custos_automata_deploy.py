@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import tarfile
+import tempfile
 import time
 import urllib.request
 
@@ -70,6 +71,20 @@ def health(port=8080):
             if route=='/api/species' and not isinstance(json.loads(body).get('species'),list):
                 raise RuntimeError('species health failed')
     return True
+
+
+def source_digest(root):
+    """Identify source bytes/paths/modes, independent of Git archive timestamps."""
+    entries=[]
+    for path in sorted(root.rglob('*')):
+        rel=path.relative_to(root).as_posix()
+        if rel.split('/')[0] in ('species','.source-sha256'):
+            continue
+        if path.is_symlink(): raise ValueError('unexpected release source symlink')
+        if path.is_dir(): entries.append([rel,'directory']); continue
+        if not path.is_file(): raise ValueError('unexpected release source file type')
+        entries.append([rel,path.stat().st_mode & 0o111,hashlib.sha256(path.read_bytes()).hexdigest()])
+    return hashlib.sha256(json.dumps(entries,separators=(',',':')).encode()).hexdigest()
 
 
 def wait_healthy(port=8080):
@@ -150,13 +165,20 @@ def deploy(commit, digest):
     if state['commit']==commit and health(): return {'ok':True,'unchanged':True,**status()}
     release=BASE/'releases'/commit
     release.parent.mkdir(parents=True,exist_ok=True)
-    if release.exists():
-        if not (release/'.source-sha256').is_file() or (release/'.source-sha256').read_text()!=digest:
-            raise RuntimeError('release exists with different or incomplete source; inspect it')
-    else:
-        release.mkdir(); extract(ARCHIVE,release)
-        (release/'species').symlink_to(DATA)
-        (release/'.source-sha256').write_text(digest)
+    # Git archives of a subtree object use the current time in tar headers.
+    # Verify the transfer digest above, but compare extracted source contents
+    # before reusing an existing release. This also upgrades old wire-digest
+    # markers only after the actual installed source has been verified.
+    with tempfile.TemporaryDirectory(prefix='candidate-',dir=BASE) as tmp:
+        candidate=Path(tmp); extract(ARCHIVE,candidate)
+        identity=source_digest(candidate)
+        if release.exists():
+            if source_digest(release)!=identity:
+                raise RuntimeError('release exists with different or incomplete source; inspect it')
+        else:
+            shutil.copytree(candidate,release)
+            (release/'species').symlink_to(DATA)
+        (release/'.source-sha256').write_text(identity)
     run(['/usr/bin/node','--check',str(release/'server.js')])
     run(['/usr/bin/node',str(release/'sim.test.js')])
     # A separate systemd cgroup prevents a canary child leaking after a check.

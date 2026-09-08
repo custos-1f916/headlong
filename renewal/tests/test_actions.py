@@ -112,6 +112,23 @@ class DeployTests(unittest.TestCase):
             dest=self.root/'dest';dest.mkdir(exist_ok=True)
             with self.subTest(name=name),self.assertRaises(ValueError): cad.extract(self.archive(name,kind),dest)
         self.assertFalse((self.root/'evil').exists())
+
+    def test_source_identity_ignores_archive_timestamps_but_detects_code_changes(self):
+        roots=[]
+        for number,mtime in enumerate((100,200)):
+            archive=self.root/f'source-{number}.tar'
+            with tarfile.open(archive,'w') as tf:
+                for name in ('server.js','sim.js','sim.test.js','index.html'):
+                    item=tarfile.TarInfo(name);item.mtime=mtime;item.mode=0o644
+                    content=b'unchanged code';item.size=len(content);tf.addfile(item,io.BytesIO(content))
+            dest=self.root/f'release-{number}';dest.mkdir();cad.extract(archive,dest);roots.append(dest)
+        self.assertNotEqual((self.root/'source-0.tar').read_bytes(),(self.root/'source-1.tar').read_bytes())
+        self.assertEqual(cad.source_digest(roots[0]),cad.source_digest(roots[1]))
+        (roots[1]/'.source-sha256').write_text('old wire digest')
+        (roots[1]/'species').symlink_to(self.root/'persistent-data')
+        self.assertEqual(cad.source_digest(roots[0]),cad.source_digest(roots[1]))
+        (roots[1]/'server.js').write_text('changed source')
+        self.assertNotEqual(cad.source_digest(roots[0]),cad.source_digest(roots[1]))
     def test_health_failure_restores_previous_release(self):
         state=self.root/'state.json';original={'current':'/previous','commit':'a'*40,'previous':None,'previous_commit':None}
         state.write_text(json.dumps(original))
