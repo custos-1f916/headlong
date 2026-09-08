@@ -156,6 +156,13 @@ def poll(observer, forum, kind):
     page=pending['page']
     for raw in page[kind]:
         row=raw.get('message',raw)
+        # Feed pages interleave thread metadata with actual message records.
+        # Thread rows have a title/id but no body or threadId. Their message
+        # events carry the searchable content; do not invent a message URL.
+        if kind=='feed' and row.get('type')=='thread':
+            ident=identifier(row.get('id'))
+            observer.store.disposition('forum:thread:'+ident,'thread_metadata_messages_follow',{'id':ident})
+            continue
         ident=identifier(row.get('id'));thread=identifier(row.get('threadId'));author=identifier(row.get('authorName'))
         event=('forum:message:' if kind=='inbox' else 'forum:feed:')+ident
         if observer.store.seen(event):continue

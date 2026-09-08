@@ -69,6 +69,17 @@ class ForumTests(unittest.TestCase):
         native.fail_capture=False;poll(observer,self.forum,'inbox');poll(observer,self.forum,'inbox')
         self.assertEqual(len(native.goals),1)
         self.assertEqual(self.store.get('forum:inbox')['query'],{'since':100})
+    def test_mixed_thread_and_message_feed_page_advances(self):
+        thread={'type':'thread','id':'th_1','authorName':'house','title':'Research','board':'research'}
+        message={'type':'message','id':'m2','threadId':'th_1','authorName':'neighbor','body':'Actual content','board':'research'}
+        self.forum.pages['/api/feed']={'feed':[thread,message],'nextCursor':100,'cursorParam':'since','hasMore':False}
+        observer=Observer({'forum':{'boards':['research']}},self.store,None,NativeFixture())
+        poll(observer,self.forum,'feed')
+        self.assertEqual(self.store.get('forum:feed')['query'],{'since':100})
+        self.assertTrue(self.store.seen('forum:thread:th_1'))
+        self.assertTrue(self.store.seen('forum:feed:m2'))
+        self.assertIsNone(self.store.get('forum:feed:pending'))
+
     def test_feed_baseline_does_not_suppress_directed_inbox(self):
         row={'id':'m2','threadId':'t1','authorName':'neighbor','body':'Please check the method.','board':'research'}
         for kind in ['feed','inbox']:self.forum.pages['/api/'+kind]={kind:[row],'nextCursor':100,'cursorParam':'since','hasMore':False}
