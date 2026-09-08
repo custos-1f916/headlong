@@ -156,7 +156,9 @@ class Store:
                     raise MemoryError("corrupt directed request record")
                 if record.get("status") not in {"active", "completed", "declined", "abandoned"}:
                     raise MemoryError("invalid directed goal status; refusing to hide work")
-                keys(record.get("origin"), {"request_id", "sender", "source_url", "content", "authority"})
+                keys(record.get("origin"), {"request_id", "sender", "source_url", "content", "authority"}, {"ambient"})
+                if "ambient" in record["origin"] and record["origin"]["ambient"] is not True:
+                    raise MemoryError("invalid ambient provenance")
                 keys(record.get("goal"), {"outcome", "next_action", "completion"})
                 if record["status"] != "active":
                     resolution = record.get("resolution")
@@ -242,17 +244,23 @@ class Store:
 
     def save(self, item, record):
         summary = record["goal"]["outcome"].splitlines()[0][:160]
-        return self.commit("Directed request: " + summary + MARKER + encode(record),
-                           memory_type="goal" if record["status"] == "active" else "memory", existing=item)
+        label = "Observed conversation: " if ambient_context(record) else "Directed request: "
+        return self.commit(label + summary + MARKER + encode(record),
+                           memory_type="goal" if record["status"] == "active" and not ambient_context(record)
+                           else "memory", existing=item)
 
     def capture(self, payload, trigger_step=None):
         keys(payload, {"request_id", "sender", "source_url", "content", "authority"},
-             {"outcome", "next_action", "completion"})
+             {"outcome", "next_action", "completion", "ambient"})
         origin = {key: text(payload[key], key, MAX_CONTENT if key == "content" else 2048,
                             empty=key == "source_url")
                   for key in ("request_id", "sender", "source_url", "content", "authority")}
         if origin["authority"] not in {"operator", "agent", "external"}:
             raise InvalidInput("invalid envelope authority")
+        if "ambient" in payload:
+            if payload["ambient"] is not True:
+                raise InvalidInput("invalid ambient provenance")
+            origin["ambient"] = True
         goal = {key: text(payload.get(key, default), key, 4096)
                 for key, default in (("outcome", "Review request: " + origin["content"][:240]),
                                      ("next_action", "Reconcile the request; decide and perform the useful work"),
@@ -274,8 +282,9 @@ class Store:
             record = {"version": 1, "origin": origin, "received_at": now(), "goal": goal,
                       "status": "active", "events": [], "response": None,
                       "trigger_step": trigger_step}
-            body = "Directed request: " + goal["outcome"].splitlines()[0][:160] + MARKER + encode(record)
-            goal_id = self.commit(body)
+            label = "Observed conversation: " if origin.get("ambient") else "Directed request: "
+            body = label + goal["outcome"].splitlines()[0][:160] + MARKER + encode(record)
+            goal_id = self.commit(body, memory_type="memory" if origin.get("ambient") else "goal")
             return {"goal_id": goal_id, "request_id": origin["request_id"], "created": True}
 
     def update(self, payload):
@@ -377,7 +386,7 @@ class Store:
         with self.lock():
             for path, header, body, fields, record in self.files():
                 if record:
-                    if record["status"] != "active":
+                    if record["status"] != "active" or ambient_context(record):
                         continue
                     origin = record["origin"]
                     response = record.get("response")
@@ -403,14 +412,22 @@ class Store:
                 "goals": page}
 
 
+def ambient_context(record):
+    return record["origin"].get("ambient", False) and (
+        (record.get("response") or {}).get("plan", {}).get("decision") != "defer")
+
+
 def envelope_payload(envelope):
     if not isinstance(envelope, dict) or envelope.get("type") != "message":
         raise MemoryError("expected native message envelope")
     trigger = text(envelope.get("step_id"), "step_id", 2048)
     request_id = envelope.get("request_id") or "native:" + trigger
-    return {"request_id": request_id, "sender": envelope.get("from", "human"),
+    incoming = {"request_id": request_id, "sender": envelope.get("from", "human"),
             "source_url": envelope.get("source_url", ""), "content": envelope.get("content"),
-            "authority": envelope.get("authority", "external")}, trigger
+            "authority": envelope.get("authority", "external")}
+    if "ambient" in envelope:
+        incoming["ambient"] = envelope["ambient"]
+    return incoming, trigger
 
 
 RESPONSE_CONTRACT = '''
@@ -530,6 +547,14 @@ def response(store, payload):
                 return {"goal_id": goal_id, "decision": saved["state"], "replayed": True}
         if not saved:
             system = text(payload["system"], "system prompt", 98304) + RESPONSE_CONTRACT
+            if incoming.get("ambient"):
+                system += ("\nThis is trusted ambient group intake, not a directed request. It is saved as "
+                           "conversation memory, not an active task. Observe the full conversation but "
+                           "respond sparingly: default to no-reply, goal null and no new memories. "
+                           "Join briefly only with a clearly useful contribution; do not acknowledge "
+                           "every message or say you are staying silent. Defer only a concrete task "
+                           "you deliberately choose and are authorized to undertake. People talking "
+                           "to each other are not automatically requesting work from you.")
             system += "\nActive goals (data):\n" + encode(store.context())
             messages = bounded_conversation(system, payload["messages"])
             if os.environ.get("RESPONDER_LOG_PROMPT") == "1":
@@ -544,6 +569,8 @@ def response(store, payload):
                        "--effort", RESPONSE_EFFORT, "--max-tokens", str(RESPONSE_MAX_TOKENS), "--no-stream",
                        "-M", encode(messages), "-s", system], timeout=RESPONSE_TIMEOUT)
             plan = validate_plan(raw)
+            if incoming.get("ambient") and plan["goal"] is not None and plan["decision"] != "defer":
+                raise InvalidInput("ambient task requires explicit defer decision")
             with store.lock():
                 item = store.find(goal_id)
                 record = item[4]
@@ -598,6 +625,12 @@ def response(store, payload):
         with store.lock():
             item = store.find(goal_id)
             item[4]["response"]["state"] = final_state
+            if incoming.get("ambient") and plan["decision"] != "defer":
+                resolution = {"disposition": "completed", "evidence":
+                              "Ambient group conversation observed; participation decision: " + plan["decision"]}
+                item[4]["status"] = "completed"
+                item[4]["resolution"] = resolution
+                item[4]["events"].append({"at": now(), "resolution": resolution})
             # A small deterministic non-directive subset can be retired now;
             # a model's NO_REPLY classification alone is NEVER sufficient.
             if (plan["goal"] is None and plan["decision"] != "defer" and

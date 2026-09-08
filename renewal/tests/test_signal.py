@@ -40,14 +40,21 @@ class SignalPolicyTests(unittest.TestCase):
     def test_other_group_is_rejected_even_from_hal(self):
         self.assertIsNone(cs.classify(envelope(groupInfo={'groupId': 'other'}), POLICY))
 
-    def test_group_requires_mention_or_reply(self):
+    def test_group_observes_all_text_and_marks_direct_addresses(self):
         base = envelope(message='ordinary chat', groupInfo={'groupId': 'agreed-group'})
-        self.assertIsNone(cs.classify(base, POLICY))
+        self.assertFalse(cs.classify(base, POLICY)['directed'])
         base['dataMessage']['mentions'] = [{'uuid': BOT}]
-        self.assertIsNotNone(cs.classify(base, POLICY))
+        self.assertTrue(cs.classify(base, POLICY)['directed'])
         base['dataMessage']['mentions'] = []
         base['dataMessage']['quote'] = {'authorUuid': BOT}
-        self.assertIsNotNone(cs.classify(base, POLICY))
+        self.assertTrue(cs.classify(base, POLICY)['directed'])
+
+    def test_dani_has_same_authority_as_hal(self):
+        policy = copy.deepcopy(POLICY)
+        dani = '00000000-0000-4000-8000-000000000005'
+        policy['people'][dani] = {'label': 'Dani', 'authority': 'operator'}
+        self.assertEqual(cs.classify(envelope(dani), policy)['authority'],
+                         cs.classify(envelope(HAL), policy)['authority'])
 
     def test_ephemeral_empty_large_and_receipt_are_not_intake(self):
         for changes in ({'expiresInSeconds': 30}, {'viewOnce': True}, {'message': ''},

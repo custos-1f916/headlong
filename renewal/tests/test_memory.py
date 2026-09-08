@@ -19,6 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import custos_memory as cm
+import custos_transport as ct
 
 HEADLONG = Path(os.environ.get("HEADLONG_ROOT", Path(__file__).resolve().parents[3] / "headlong"))
 
@@ -218,6 +219,57 @@ class ResponderTests(MemoryFixture):
             cm.response(self.store, self.request)
         self.assertEqual(self.model_calls, 1)
         self.assertEqual(len(self.outgoing()), 1)
+
+    def ambient(self):
+        self.envelope['ambient'] = True
+        self.log.write_text(cm.encode(self.envelope) + '\n')
+
+    def test_ambient_capture_survives_as_context_without_task(self):
+        self.ambient()
+        self.store.capture(*cm.envelope_payload(self.envelope))
+        self.assertEqual(self.store.context()['active_directed'], 0)
+        self.assertEqual(self.store.request('operator:42')[3]['type'], 'memory')
+
+    def test_transport_preserves_ambient_provenance_and_deduplicates(self):
+        import argparse
+        args = argparse.Namespace(request_id='signal:ambient-test', sender='signal-group',
+                                  authority='external', source_url='signal:ambient-test', ambient=True)
+        def native(argv, payload=None):
+            if argv == ['custos-memory', 'capture']:
+                return cm.encode(self.store.capture(json.loads(payload)))
+            return self.real_run(argv, payload)
+        with mock.patch.object(ct, 'native', side_effect=native):
+            first = ct.send(args, 'Ordinary group conversation.')
+            self.assertEqual(first, ct.send(args, 'Ordinary group conversation.'))
+        event = next(step for step in self.steps() if step.get('request_id') == args.request_id)
+        self.assertTrue(event['ambient'])
+        incoming, trigger = cm.envelope_payload(event)
+        self.assertFalse(self.store.capture(incoming, trigger)['created'])
+        self.assertEqual(self.store.context()['active_directed'], 1)  # fixture's original direct ask only
+
+    def test_ambient_no_reply_retires_context_without_sending(self):
+        self.ambient()
+        self.plan = {'reply': '', 'decision': 'no-reply', 'goal': None, 'memories': []}
+        with mock.patch.object(cm, 'run', side_effect=self.model):
+            cm.response(self.store, self.request)
+            cm.response(self.store, self.request)
+        self.assertEqual(self.model_calls, 1)
+        self.assertEqual(self.outgoing(), [])
+        self.assertEqual(self.store.context()['active_directed'], 0)
+        self.assertEqual(self.store.request('operator:42')[4]['status'], 'completed')
+
+    def test_ambient_deliberate_task_is_promoted_and_remains_active(self):
+        self.ambient()
+        with mock.patch.object(cm, 'run', side_effect=self.model):
+            cm.response(self.store, self.request)
+        self.assertEqual(self.store.context()['active_directed'], 1)
+        self.assertEqual(self.store.request('operator:42')[3]['type'], 'goal')
+
+    def test_direct_no_reply_still_preserves_requested_work(self):
+        self.plan = {'reply': '', 'decision': 'no-reply', 'goal': None, 'memories': []}
+        with mock.patch.object(cm, 'run', side_effect=self.model):
+            cm.response(self.store, self.request)
+        self.assertEqual(self.store.context()['active_directed'], 1)
 
     def test_memory_before_ack_and_native_followup_does_not_complete_goal(self):
         def checked(argv, *args, **kwargs):

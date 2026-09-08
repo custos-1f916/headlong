@@ -9,8 +9,11 @@ ID remain private operator configuration outside this repository and LXC122.
 
 Hal and Dani have equal operator authority. Ryan and the other consenting
 friend have external authority. The allowlist admits DMs with those four people
-and the single approved group. Group intake requires addressing Custos by name,
-mention, or reply; unknown group members or pending invitations suspend group
+and the single approved group. All eligible text in the approved group reaches Custos. Direct addresses by
+name, mention or reply invite a response; other messages are ambient context,
+with silence the default and occasional useful contributions allowed. Ambient
+messages are native memories, not active tasks; deliberate deferred work promotes
+them to goals. Unknown group members or pending invitations suspend group
 intake/delivery. Display names and message text cannot grant authority.
 
 ## Runtime and recovery
@@ -65,3 +68,8 @@ in that interval can lose an incoming event: this is not an end-to-end exactly
 once guarantee. Keep restart/reconnect and phone round-trip verification separate
 from unit tests. The integration suite covers routing, authority spoofing,
 roster changes, deduplication, pause, deletion and uncertain/partial delivery.
+
+Live qualification: direct messages and group messages both reached native memory
+and received replies with successful Signal submission results on 2026-09-08.
+The profile avatar chosen by Custos is installed; stopped-state backup/restart
+recovered both services successfully.

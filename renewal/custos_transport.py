@@ -77,6 +77,8 @@ def send(args, content):
         fcntl.flock(lock, fcntl.LOCK_EX)
         original = {'request_id': args.request_id, 'sender': args.sender,
                     'authority': args.authority, 'source_url': args.source_url, 'content': content}
+        if getattr(args, 'ambient', False):
+            original['ambient'] = True
         if receipt.exists():
             record = json.loads(receipt.read_text())
             if record['original'] != original:
@@ -97,6 +99,8 @@ def send(args, content):
                          'to': os.environ.get('IDENTITY_NAME', 'custos'), 'content': content,
                          'request_id': args.request_id, 'authority': args.authority,
                          'source_url': args.source_url}
+                if original.get('ambient'):
+                    event['ambient'] = True
                 native(['traj', 'append', root], json.dumps(event))
                 with trajectory.open('rb') as source:
                     os.fsync(source.fileno())
@@ -178,6 +182,7 @@ def reconcile():
         original = record['original']
         args = argparse.Namespace(**{key: original[key] for key in
                                   ('request_id', 'sender', 'authority', 'source_url')})
+        args.ambient = original.get('ambient', False)
         try:
             send(args, original['content'])
             retried.append(original['request_id'])
@@ -196,6 +201,7 @@ def main():
     put.add_argument('--authority', choices=['operator', 'agent', 'external'], default='operator')
     put.add_argument('--request-id', required=True)
     put.add_argument('--source-url', default='')
+    put.add_argument('--ambient', action='store_true', help='Observed conversation, not a directed task')
     get = commands.add_parser('poll')
     get.add_argument('--request-id', required=True)
     outgoing = commands.add_parser('outbox')

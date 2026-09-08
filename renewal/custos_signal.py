@@ -74,6 +74,7 @@ def classify(envelope, policy):
     if not isinstance(stamp, int) or isinstance(stamp, bool) or stamp <= 0:
         return None
     group = (message.get('groupInfo') or {}).get('groupId')
+    directed = True
     if group:
         if group not in policy['groups']:
             return None
@@ -83,8 +84,6 @@ def classify(envelope, policy):
         directed |= any(isinstance(m, dict) and
                         aci(m.get('uuid') or m.get('author')) == policy['self_aci'] for m in mentions)
         directed |= aci(quote.get('authorUuid') or quote.get('author')) == policy['self_aci']
-        if not directed:
-            return None
     conversation = 'group:' + group if group else 'dm:' + sender
     route = 'signal-' + hashlib.sha256(conversation.encode()).hexdigest()[:24]
     # Timestamp identity and payload digest are separate so conflicts fail closed.
@@ -94,6 +93,7 @@ def classify(envelope, policy):
     return {'request_id': request_id, 'sender_aci': sender, 'timestamp': stamp,
             'conversation': conversation, 'route': route, 'group': group,
             'authority': person['authority'], 'label': person['label'], 'body': body,
+            'directed': directed,
             'digest': hashlib.sha256(body.encode()).hexdigest()}
 
 
@@ -285,8 +285,13 @@ class Bridge:
                        + encoded({'speaker': item['label'], 'aci': item['sender_aci'],
                                   'scope': 'group' if item['group'] else 'direct'})
                        + '\nMessage:\n' + item['body'])
+            ambient = bool(item['group']) and not item.get('directed', True)
+            content += ('\nParticipation: ambient group conversation; observe and usually stay silent. '
+                        'Join briefly only when you add clear value. This is not automatically a task.'
+                        if ambient else '\nParticipation: you were addressed directly; respond to the speaker.')
             receipt = transport(['send', '--sender', item['route'], '--authority', item['authority'],
-                                 '--request-id', item['request_id'], '--source-url', item['request_id']], content)
+                                 '--request-id', item['request_id'], '--source-url', item['request_id']]
+                                + (['--ambient'] if ambient else []), content)
             if receipt.get('queued'):
                 with db:
                     db.execute("UPDATE inbox SET phase='queued',receipt=? WHERE id=? AND phase='pending'",
