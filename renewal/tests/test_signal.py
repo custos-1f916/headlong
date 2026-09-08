@@ -41,6 +41,17 @@ class SignalPolicyTests(unittest.TestCase):
         self.assertIsNone(cs.classify(envelope(STRANGER,message=None,attachments=[image]),POLICY))
         self.assertIsNone(cs.classify(envelope(message=None,attachments=[image],viewOnce=True),POLICY))
 
+    def test_signal_cli_filename_attachment_ids_are_admitted_without_path_traversal(self):
+        for ident in ('fixture-photo.jpeg','abc_123.png','safe.file.webp','123456'):
+            image={'contentType':'image/jpeg','id':ident,'size':462998}
+            item=cs.classify(envelope(message='Describe it',attachments=[image]),POLICY)
+            self.assertEqual(item['image_attachments'][0]['id'],ident)
+        for ident in ('../photo.jpeg','a/../photo.jpeg','/photo.jpeg',r'a\photo.jpeg',
+                      '.hidden','a..jpeg','a.','x'*161):
+            image={'contentType':'image/jpeg','id':ident,'size':462998}
+            item=cs.classify(envelope(message='Describe it',attachments=[image]),POLICY)
+            self.assertNotIn('image_attachments',item)
+
     def test_image_attachment_limits_are_not_silently_presented_as_seen(self):
         image={'contentType':'image/png','id':'../../secret','size':1234}
         item=cs.classify(envelope(message=None,attachments=[image]),POLICY)

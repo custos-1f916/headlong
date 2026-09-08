@@ -78,7 +78,11 @@ def classify(envelope, policy):
     for attachment in attachments[:MAX_IMAGES]:
         if (isinstance(attachment,dict) and attachment.get('contentType') in
                 ('image/jpeg','image/png','image/webp','image/gif') and
-                isinstance(attachment.get('id'),str) and re.fullmatch(r'[A-Za-z0-9_-]{1,160}',attachment['id']) and
+                # signal-cli IDs are stored filenames and may include a suffix
+                # such as .jpeg. Permit nonempty dot-separated basename parts,
+                # never separators, traversal segments or arbitrary paths.
+                isinstance(attachment.get('id'),str) and len(attachment['id'])<=160 and
+                re.fullmatch(r'[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*',attachment['id']) and
                 type(attachment.get('size')) is int and 0 < attachment['size'] <= MAX_RAW):
             images.append({'id':attachment['id'],'size':attachment['size'],'mime':attachment['contentType']})
     if images and reaction is None and body in (None,''):
