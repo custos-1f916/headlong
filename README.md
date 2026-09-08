@@ -122,12 +122,14 @@ python3 renewal/mac-custos start
 python3 renewal/mac-custos pair
 ```
 
-`status` reports native thinker state, not overall network/delivery health.
+`status` reports supervised service state, not overall network/delivery health.
 Messages are sent on SSH stdin and durably captured before waiting for a reply;
 a pending reply remains work, not proof of completion. `pair` asks the supervised
 bridge for a fresh Remote Pi pairing URI; treat it as a private credential and
-pair only Hal's device. Phone end-to-end activation/delivery requires its own
-operator receipt; a pairing URI or running bridge alone does not prove it.
+pair only Hal's device. A disposable authenticated protocol client verified acknowledgment,
+actual hash computation/reply, and stable-ID history after disconnect and bridge restart;
+its authorization was then revoked. The physical phone UI was not exercised. The actual
+Mac CLI also delivered and received the quoted Unicode text `Custos — ready?`.
 The dashboard is [https://custos.ha1.io](https://custos.ha1.io), visibly verified
 against the fresh identity during commissioning.
 
@@ -257,6 +259,9 @@ successful exit was observed, and the remaining Godot process was stopped.
 The honest result is **incomplete**, retained in
 `/var/lib/custos-qualification/voidle/unit-tests.log` and `unit-result.json`.
 Use longer-lived job supervision for a full run on this CPU.
+The remaining full-suite qualification is tracked as
+`vd-custos-fde292a8586451a02cbc83ef`; the separate async-assertion harness issue
+`vd-y1wl` must also be accounted for before treating a green summary as comprehensive.
 
 ## Evidence, finances, and operator assessment
 
@@ -275,8 +280,56 @@ rehearsal blocked only 122 (exit 255, stopped); restoring rules allowed its next
 boot, while other guests were unaffected. This proves the exercised failure
 paths, not instantaneous GPU preemption or every possible network failure.
 The real commissioning issue `vd-custos-6344a8cea2ba6e3b52d3d115`, linked to native
-goal `f2b46571`, has create/claim/comment and replay evidence; closure requires the
-final delivered documentation/source commit and actual evidence, not this prose.
+goal `f2b46571`, passed create/claim/comment/replay and actual close after delivery of
+Voidle commit `845b96de47fda167d0a11371a96a16e67d678cf9` with commissioning evidence.
+The native migration goal was then retired; application visual/unit limitations above
+remain separate, explicitly unpassed work.
+
+The final integration suite passed **84 tests**. Native strict-shell activation was
+reproduced failing on absent optional metadata, fixed in the upstream template and
+generated live activation, and verified with real identity-isolated memory work.
+The completion CLI now rejects an invalid positional write ID before reading stdin
+and documents its JSON input; the regression failed before the fix and passed after it.
+Six iterations per wake caused premature run termination. Hal subsequently selected
+**512 iterations per wake**, without raising the external inference budgets.
+
+The repeated request-size failures had two causes: Unicode expansion during gateway
+normalization, and an unbounded retained conversation on top of the system prompt.
+The gateway preserves UTF-8; native context now caps the serialized conversation at
+**98,304 bytes**, leaving provider/system framing room inside the **131,072-byte**
+gateway limit. Full pinned instructions are never cut. An impossible budget fails
+without emitting partial JSON or silently replacing context with an empty array.
+A captured failed run went from **131,703** to **113,653** framed bytes while retaining
+all **71,866 bytes** of its pinned instructions, and completed real Johan inference.
+The generated continuation was syntax-checked, not executed or treated as a verified
+application finding. Evidence: `/var/lib/custos-qualification/context-boundary/report.json`.
+
+The Debian jq 1.6 raw-slurp path also corrupted Unicode crossing an input buffer.
+The pinned **jq 1.8.2** artifact in the runtime manifest passed the exact boundary
+probe; fresh installation provisions it before cutover when the installed parser
+fails that behavior check. The distro binary is not overwritten.
+
+The OpenAI stream bridge now preserves requested `reasoning_content`/`reasoning`
+on stderr, never as executable stdout. Previously it discarded Qwen's reasoning,
+so a reasoning-only response looked empty and prevented native continuation.
+Headlong's existing bounded continuation now carries that reasoning through the
+same context-byte limiter. Truly empty streams still fail; interrupted streams
+are neither retried nor executed. The real-client/loop regression failed against
+the old client and passed with the repair; a live new client was observed forwarding
+reasoning. Generic transport retries remain disabled.
+
+One generated image-analysis command accumulated overlapping byte slices and used
+about **4.8 GiB**. That was a bad algorithm, not Johan VRAM exhaustion. The supervised
+mind now has **4 GiB MemoryMax / 512 MiB MemorySwapMax / OOMPolicy=continue**, leaving
+control-plane headroom inside the 6 GiB guest. A controlled 64 MiB service test killed
+an oversized child with exit 137 while its parent/control command continued.
+The idle commissioning Gradle daemon was stopped; native state and work were retained.
+
+Introduction post **4295** was published, then **withdrawn at Hal's request** because
+it named private project/issue details. Public title/body/url redaction was independently
+verified. The platform retains its underlying history; this is not erasure of copies
+already read. The charter and a native correction lesson now explicitly cover project
+names, tracker IDs and private test details. No replacement post was scheduled.
 
 [`custos-fund`](renewal/custos_fund.py) supports `balance`, `history`, and
 `record --file PATH`; see the [fund skill](renewal/identity/skills/custos-fund/SKILL.md).
@@ -348,6 +401,26 @@ cutover that refuses an already-installed marker, not an update procedure.
    Test a bounded real request through the intended channel and inspect its
    capture, reply and delivery. Rebuild and requalify Voidle separately; a runtime
    restore does not fix `vd-eqyv` or inherit visual success.
+
+## Reproducing integration verification
+
+Use Python 3.11+, Bash, Git, and a Unicode-safe jq implementation (the deployed
+jq version and artifact digest are pinned in `renewal/headlong-runtime.json`).
+Do not run the fresh-persona installer on an existing identity.
+
+```bash
+runtime=$(mktemp -d)
+git clone https://github.com/laude-institute/headlong.git "$runtime"
+base=$(python3 -c 'import json; print(json.load(open("renewal/headlong-runtime.json"))["base_commit"])')
+git -C "$runtime" checkout --detach "$base"
+git -C "$runtime" apply "$PWD/renewal/headlong.patch"
+HEADLONG_ROOT="$runtime" python3 -m unittest discover -s renewal/tests -v
+bash "$runtime/tests/test_context.sh"
+bash "$runtime/tests/test_shellm_context_scope.sh"
+```
+
+These tests do not prove live provider quality, public delivery, or Android rendering.
+Those require the explicit commissioning scenarios and retained receipts above.
 
 Commit/push receipts must name the actual final source and patch revisions when
 available. No unrecorded final SHA, remote delivery, phone qualification, financial

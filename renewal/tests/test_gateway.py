@@ -253,6 +253,18 @@ class WireTests(unittest.IsolatedAsyncioTestCase):
         await writer.drain()
         return reader, writer
 
+    async def test_valid_utf8_request_is_not_expanded_past_the_admission_limit(self):
+        body = json.dumps({
+            "model": gateway.MODEL,
+            "messages": [{"role": "user", "content": "界" * 24000}],
+            "stream": True,
+        }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        request = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: gateway\r\n"
+                   f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n").encode() + body
+        status, _, response = await self.response(raw=request)
+        self.assertEqual(status, 200)
+        self.assertIn(b"[DONE]", response)
+
     async def test_health_reflects_uncertain_leases_without_spending_quota(self):
         lease = self.gateway.ledger.reserve(self.now, 180)
         reader, writer = await self.connect("/health", "GET")

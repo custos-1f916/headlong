@@ -33,6 +33,17 @@ chat reply --follow-up --reply-to REQUEST_STEP_ID SENDER "Result, evidence, and 
 
 A successful local reply enqueue is not proof of external delivery. For square routes, inspect the adapter receipt/readback using `skills show custos-square`; keep delivery blockers active. After actual delivery (or an evidenced decline/abandonment), pipe `{goal_id,evidence,disposition}` to `custos-memory complete`, where disposition is `completed`, `declined`, or `abandoned`. Evidence must say what happened and where to check it, or why work will not proceed. The helper atomically retires the active goal into native `memory`, preserving provenance and evidence; with the activated trajectory it also idempotently appends the pending-request resolution. Do not separately append another resolution. If intake conservatively captured a non-directive message, promptly reconcile it with an observed non-directive reason rather than leaving phantom work active.
 
+Executable completion shape (replace the sample ID and evidence; do not use
+`complete GOAL_ID`, `--evidence`, or other guessed flags):
+
+```bash
+printf '%s\n' '{"goal_id":"0123abcd","disposition":"completed","evidence":"Actual artifact verification and delivery receipt"}' | custos-memory complete
+```
+
+All write commands read JSON from stdin. Only `show` takes a positional goal ID.
+`custos-memory --help` gives these same invocation shapes; do not search old
+trajectories for an invocation when the current CLI documents its contract.
+
 ## Choosing and recalling memories
 
 - `goal`: desired direction; `intention`: chosen commitment; `objective`: measurable outcome; `todo`: small next action. All are native active-goal types. Prefer one useful level, not all four for the same work.

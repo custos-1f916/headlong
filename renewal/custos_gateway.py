@@ -114,7 +114,7 @@ def payload(raw, max_tokens):
                     raise ValueError("only inline text content is admitted")
             elif content is not None and not isinstance(content, str):
                 raise ValueError("invalid content")
-        return json.dumps(value, allow_nan=False, separators=(",", ":")).encode()
+        return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
     except (ValueError, TypeError, RecursionError, OverflowError):
         raise Denied(400, "invalid_completion_request") from None
 

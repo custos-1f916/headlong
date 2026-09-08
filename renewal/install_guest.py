@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import urllib.request
 
 
 def run(args, **kwargs):
@@ -38,6 +39,38 @@ def unpack(archive, destination):
             os.chown(root, 0, 0)
             for name in directories + files:
                 os.chown(Path(root) / name, 0, 0, follow_symlinks=False)
+
+
+def ensure_jq(manifest_path):
+    # jq 1.6 raw slurp corrupts multibyte characters crossing its input buffer.
+    # Check behavior, so a working compatible implementation need not be replaced.
+    sample = ("a" * 4093 + "界end").encode()
+    try:
+        probe = subprocess.run(['jq', '-Rs', '.'], input=sample, capture_output=True, timeout=10)
+        if probe.returncode == 0 and json.loads(probe.stdout) == sample.decode():
+            return
+    except (OSError, ValueError):
+        pass
+    if os.uname().machine != 'x86_64':
+        raise RuntimeError('pinned jq artifact requires the documented x86_64 guest')
+    spec = json.loads(Path(manifest_path).read_text())['dependencies']['jq']
+    with urllib.request.urlopen(spec['url'], timeout=60) as response:
+        binary = response.read(spec['size'] + 1)
+    if len(binary) != spec['size'] or hashlib.sha256(binary).hexdigest() != spec['sha256']:
+        raise RuntimeError('jq artifact size or digest mismatch')
+    with tempfile.NamedTemporaryFile(dir='/usr/local/bin', prefix='.jq-', delete=False) as output:
+        temporary = Path(output.name)
+        output.write(binary)
+        output.flush()
+        os.fsync(output.fileno())
+    try:
+        temporary.chmod(0o755)
+        probe = subprocess.run([str(temporary), '-Rs', '.'], input=sample, capture_output=True, check=True)
+        if json.loads(probe.stdout) != sample.decode():
+            raise RuntimeError('pinned jq failed Unicode qualification')
+        temporary.replace('/usr/local/bin/jq')
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def main():
@@ -68,6 +101,7 @@ def main():
         fresh_app, fresh_repo = stage / 'headlong', stage / 'custos'
         if not (fresh_app / 'bin/thinkers').is_file() or not (fresh_repo / 'renewal/custos_memory.py').is_file():
             raise RuntimeError('incomplete deployment bundle')
+        ensure_jq(fresh_repo / 'renewal/headlong-runtime.json')
         # Preserve ONLY the retained citizen's own keys and scoped source key.
         keep = {'ed25519.key', 'ed25519-openssh.key', 'git-deploy.key', 'git-deploy.key.pub'}
         home = Path('/opt/custos')

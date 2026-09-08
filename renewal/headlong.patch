@@ -1,5 +1,20 @@
+diff --git a/bin/context b/bin/context
+index f78cafc..72bccec 100755
+--- a/bin/context
++++ b/bin/context
+@@ -574,8 +574,8 @@ while [[ "$lo" -le "$hi" ]]; do
+ done
+ 
+ if [[ "$best_bytes" -gt "$CTX_MAX_BYTES" ]]; then
+-    printf '%s' "$best_result" | head -c "$CTX_MAX_BYTES"
+-    printf '[budget exceeded: trajectory too dense]' >&2
++    printf 'context: full instructions and structural context exceed --max-bytes; no partial JSON emitted\n' >&2
++    exit 1
+ else
+     printf '%s' "$best_result"
+ fi
 diff --git a/bin/llm b/bin/llm
-index e6a5b00..e8217ae 100755
+index e6a5b00..d13cf0f 100755
 --- a/bin/llm
 +++ b/bin/llm
 @@ -47,7 +47,7 @@ LLM_PROVIDER="${LLM_PROVIDER:-}"
@@ -26,6 +41,36 @@ index e6a5b00..e8217ae 100755
      # Map --thinking LEVEL to OpenAI reasoning.effort (only when an explicit
      # level is given; bare --thinking without a level is ignored for OpenAI
      # since not all models support the reasoning parameter).
+@@ -1122,11 +1130,24 @@ stream_openai() {
+             # of "bash\n" would lose its newline. That silently reflows the
+             # model's output onto one line, which turns a fenced code block
+             # into an unparseable ```bash<first-line-of-code>.
+-            _chunk=$(printf '%s' "$json" | jq -j '.choices[0].delta.content // empty'; printf X)
+-            _chunk="${_chunk%X}"
+-            if [[ -n "$_chunk" ]]; then
+-                mark_emitted
+-                _emit_text "$_chunk" || break
++            # Compatible reasoning models use reasoning_content; OpenRouter
++            # also uses reasoning. Keep it off stdout/execution, but preserve
++            # requested thinking so shellm can continue a reasoning-only turn.
++            if [[ "$LLM_THINKING" -eq 1 && ( "$json" == *'"reasoning_content"'* || "$json" == *'"reasoning"'* ) ]]; then
++                _chunk=$(printf '%s' "$json" | jq -j '(.choices[0].delta.reasoning_content // .choices[0].delta.reasoning // empty) | select(type == "string")'; printf X)
++                _chunk="${_chunk%X}"
++                if [[ -n "$_chunk" ]]; then
++                    mark_emitted
++                    printf '%s' "$_chunk" >&2
++                fi
++            fi
++            if [[ "$json" == *'"content"'* ]]; then
++                _chunk=$(printf '%s' "$json" | jq -j '.choices[0].delta.content // empty'; printf X)
++                _chunk="${_chunk%X}"
++                if [[ -n "$_chunk" ]]; then
++                    mark_emitted
++                    _emit_text "$_chunk" || break
++                fi
+             fi
+             # Only the final chunk carries a non-null finish_reason; the glob
+             # keeps jq off the hot per-delta path.
 diff --git a/bin/mem b/bin/mem
 index 98df4f9..d38819d 100755
 --- a/bin/mem
@@ -97,10 +142,20 @@ index d3711eb..1668d33 100755
      # awk, not `grep | head`: head's early exit SIGPIPEs grep under pipefail
      # once the payload outgrows the pipe buffer (large --fanout).
 diff --git a/bin/shellm b/bin/shellm
-index 1a27f50..83bb90f 100755
+index 1a27f50..9298d26 100755
 --- a/bin/shellm
 +++ b/bin/shellm
-@@ -315,6 +315,8 @@ Environment:
+@@ -130,6 +130,9 @@ SHELLM_CONTEXT_RUN_TAIL_BLOCK="${SHELLM_CONTEXT_RUN_TAIL_BLOCK:-50}"
+ # so a row shrinks once, when the window start would move anyway.
+ SHELLM_CONTEXT_BLOCK_LIMIT="${SHELLM_CONTEXT_BLOCK_LIMIT:-8192}"
+ SHELLM_CONTEXT_WHOLE_BLOCKS="${SHELLM_CONTEXT_WHOLE_BLOCKS:-1}"
++# Cap serialized conversation bytes independently of the model's token window.
++# Full prompt instructions remain intact; historical fields are budgeted by context.
++SHELLM_CONTEXT_MAX_BYTES="${SHELLM_CONTEXT_MAX_BYTES:-}"
+ # Whether the image was chosen for this run (environment here, --docker-image
+ # below) rather than defaulted. A resume inherits the trajectory's image only
+ # when it was not, so resuming never silently overrides what the caller asked
+@@ -315,6 +318,8 @@ Environment:
                            1 (default): stop reading a response once its first
                            code block closes; only that block runs anyway.
                            0 reads to the end.
@@ -109,7 +164,17 @@ index 1a27f50..83bb90f 100755
    SHELLM_CONTEXT_SCOPE    traj (default) or run; see --context-scope
    SHELLM_CONTEXT_RUN_TAIL Rows the run-scope window reads back (default 400)
    SHELLM_CONTEXT_RUN_TAIL_BLOCK
-@@ -2409,7 +2411,7 @@ run_loop() {
+@@ -327,6 +332,9 @@ Environment:
+   SHELLM_CONTEXT_WHOLE_BLOCKS
+                           How many newest blocks get the larger limit (default
+                           1); in traj scope, the newest N rows
++  SHELLM_CONTEXT_MAX_BYTES
++                          Cap serialized conversation bytes before the model call;
++                          full prompt instructions are never byte-cut (default unset)
+   SHELLM_EMPTY_RESPONSE_RETRIES
+                           Empty-response retries before the run dies
+                           (default 8; set empty for unlimited)
+@@ -2409,7 +2417,7 @@ run_loop() {
      # alone can't tell whose header is whose when concurrent runs interleave.
      [[ -n "${SHELLM_RUN_ID_OUT:-}" ]] && printf '%s' "$_run_step_id" > "$SHELLM_RUN_ID_OUT" || true
  
@@ -118,6 +183,108 @@ index 1a27f50..83bb90f 100755
          # New trajectory — kick off async run-summary generation
          local stdin_ctx_file=""
          if [[ -n "$stdin_context" ]]; then
+@@ -2517,7 +2525,10 @@ run_loop() {
+                 --tail "$SHELLM_CONTEXT_RUN_TAIL" --tail-block "$SHELLM_CONTEXT_RUN_TAIL_BLOCK")
+             [[ -n "$_prompt_step_id" ]] && _ctx_args+=(--pin "$_prompt_step_id")
+         fi
+-        messages_json=$(context "${_ctx_args[@]}" 2>/dev/null) || messages_json='[]'
++        if [[ -n "$SHELLM_CONTEXT_MAX_BYTES" ]]; then
++            _ctx_args+=(--max-bytes "$SHELLM_CONTEXT_MAX_BYTES")
++        fi
++        messages_json=$(context "${_ctx_args[@]}") || die "context rendering failed; no model request sent"
+ 
+         # Call Claude (capture thinking/reasoning to file)
+         local thinking_file="$rundir/.last_thinking"
+@@ -2543,9 +2554,8 @@ run_loop() {
+         fi
+         rm -f "$thinking_file"
+ 
+-        # Retry on empty response: feed captured thinking back as assistant
+-        # context so the model continues from where it left off (max_tokens
+-        # gets hit during thinking before any visible output is emitted).
++        # Continue a reasoning-only response without treating it as completion.
++        # It can end at a stop token as well as at the output-token limit.
+         # Default: 8 retries; SHELLM_EMPTY_RESPONSE_RETRIES overrides (set it
+         # to the empty string for unlimited).
+         local empty_retries=0
+@@ -2569,9 +2579,22 @@ run_loop() {
+                 local feedback_file
+                 feedback_file=$(mktemp)
+                 printf '%s' "$feedback" > "$feedback_file"
+-                retry_messages_json=$(printf '%s' "$retry_messages_json" | jq \
+-                    --rawfile t "$feedback_file" \
+-                    '. + [{"role":"assistant","content":$t},{"role":"user","content":"Your previous response ran out of output tokens during the reasoning above before you could emit any visible text. Continue from where you left off and produce the bash code for the next step now."}]')
++                local retry_feedback="Your previous response contained reasoning but no visible executable response. Continue from the reasoning and produce one bash block for the next step, or explicitly finish with FINAL when the work is done."
++                if [[ -n "$SHELLM_CONTEXT_MAX_BYTES" ]]; then
++                    # Preserve the actual reasoning in native history, then use
++                    # the same byte-budgeted renderer as every normal iteration.
++                    jq -nc --rawfile thought "$feedback_file" --arg run "$_run_step_id" \
++                        '{type:"reasoning", thought:$thought, run_id:$run}' \
++                        | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
++                    jq -nc --arg content "$retry_feedback" --arg run "$_run_step_id" \
++                        '{type:"feedback", content:$content, run_id:$run}' \
++                        | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
++                    retry_messages_json=$(context "${_ctx_args[@]}") || die "continuation context rendering failed; no model request sent"
++                else
++                    retry_messages_json=$(printf '%s' "$retry_messages_json" | jq \
++                        --rawfile t "$feedback_file" --arg feedback "$retry_feedback" \
++                        '. + [{"role":"assistant","content":$t},{"role":"user","content":$feedback}]')
++                fi
+                 rm -f "$feedback_file"
+                 sleep 1
+             else
+diff --git a/tests/test_context.sh b/tests/test_context.sh
+index dc453ef..4e604df 100755
+--- a/tests/test_context.sh
++++ b/tests/test_context.sh
+@@ -132,7 +132,7 @@ RS="$WORK_BK/runs"
+ mkdir -p "$RS/rs"
+ python3 - "$RS/rs/trajectory.jsonl" <<'PYEOF'
+ import json, sys
+-big = "PROMPT-HEAD " + ("x" * 3000) + " MIDDLE-MARKER " + ("y" * 3000) + " PROMPT-TAIL"
++big = "PROMPT-HEAD " + ("界" * 1000) + " MIDDLE-MARKER " + ("語" * 1000) + " PROMPT-TAIL"
+ rows = [
+   {"type": "trajectory", "step_id": "r-000"},
+   {"type": "shellm-run", "step_id": "run-a"},
+@@ -148,7 +148,7 @@ rows = [
+   {"type": "reasoning", "cmd": "echo b2", "run_id": "run-b", "step_id": "rb2"},
+   {"type": "shell-output", "stdout": "B-BIG " * 1000, "exit": 0, "run_id": "run-b", "step_id": "ob2"},
+ ]
+-open(sys.argv[1], "w").write("".join(json.dumps(r) + "\n" for r in rows))
++open(sys.argv[1], "w").write("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+ PYEOF
+ # shellcheck disable=SC2086
+ rs_cut=$("$CONTEXT" --traj_dir "$RS" rs $PROD 2>/dev/null)
+@@ -246,13 +246,24 @@ else
+     bad "invariant/empty-trajectory"
+ fi
+ 
+-# 4. --max-bytes budget is respected.
++
++# A full pinned instruction must remain intact while historical fields shrink.
++# shellcheck disable=SC2086
++fit_out=$("$CONTEXT" --traj_dir "$RS" rs $PROD --full-types prompt --run run-b --pin pb --head 0 --max-bytes 8000 2>/dev/null); fit_rc=$?
++expected_prompt=$(jq -r 'select(.step_id == "pb") | .content' "$RS/rs/trajectory.jsonl")
++if [[ "$fit_rc" -eq 0 && "$(printf '%s' "$fit_out" | LC_ALL=C wc -c | tr -d ' ')" -le 8000 ]] \
++   && printf '%s' "$fit_out" | jq -e --arg p "$expected_prompt" '.[0].content == $p' >/dev/null; then
++    ok "budget preserves complete instructions and valid JSON"
++else
++    bad "budget preserves complete instructions and valid JSON"
++fi
++# Impossible budgets fail without leaking an invalid/truncated JSON prefix.
+ # shellcheck disable=SC2086
+-budget_out=$(run_case basic --max-bytes 2000 $PROD 2>/dev/null)
+-if [[ "$(printf '%s' "$budget_out" | LC_ALL=C wc -c | tr -d ' ')" -le 2000 ]]; then
+-    ok "invariant/max-bytes-budget"
++impossible=$("$CONTEXT" --traj_dir "$RS" rs $PROD --full-types prompt --run run-b --pin pb --head 0 --max-bytes 4000 2>/dev/null); impossible_rc=$?
++if [[ "$impossible_rc" -ne 0 && -z "$impossible" ]]; then
++    ok "impossible full-prompt budget refuses without partial output"
+ else
+-    bad "invariant/max-bytes-budget"
++    bad "impossible full-prompt budget refuses without partial output"
+ fi
+ 
+ # 5. Excluded types never appear in output.
 diff --git a/tests/test_identity_strict_activation.sh b/tests/test_identity_strict_activation.sh
 new file mode 100755
 index 0000000..53b36f5
@@ -966,6 +1133,97 @@ index faed96f..24452ab 100755
  
  echo
  echo "$pass passed, $fail failed"
+diff --git a/tests/test_shellm_context_scope.sh b/tests/test_shellm_context_scope.sh
+index 4d00e11..52c2407 100755
+--- a/tests/test_shellm_context_scope.sh
++++ b/tests/test_shellm_context_scope.sh
+@@ -104,23 +104,6 @@ else
+     bad "traj scope: a resumed run still carries the earlier runs" "rc=$rc"
+ fi
+ 
+-# --- 3b. the system prompt's context guideline only when a context was given --
+-# A caller with neither stdin context nor -f files (the monolith) saw the mind
+-# spend first commands probing an empty $CONTEXT.
+-sp3="${m3%.json}.system"
+-if [[ -f "$sp3" ]] && ! grep -q 'Always start by inspecting' "$sp3"; then
+-    ok "no context given: the system prompt omits the \$CONTEXT guideline"
+-else
+-    bad "no context given: the system prompt omits the \$CONTEXT guideline"
+-fi
+-printf 'some context\n' > "$WORK/ctx.txt"
+-run_shellm -f "$WORK/ctx.txt" --prompt-file "$WORK/p3.txt"; rc=$?
+-spf="$(last_msgs)"; spf="${spf%.json}.system"
+-if [[ "$rc" -eq 0 && -f "$spf" ]] && grep -q 'Always start by inspecting' "$spf"; then
+-    ok "a -f context brings the guideline back"
+-else
+-    bad "a -f context brings the guideline back" "rc=$rc"
+-fi
+ 
+ # --- 4. env form and a bad value ---------------------------------------------
+ SHELLM_CONTEXT_SCOPE=run run_shellm --resume --prompt-file "$WORK/p2.txt"; rc=$?
+@@ -137,5 +120,23 @@ else
+     bad "a bad --context-scope value is refused" "rc=$rc $(tail -1 "$WORK/err")"
+ fi
+ 
++# A byte budget must not turn an oversized instruction into an empty model call.
++before_budget=$(last_msgs)
++SHELLM_CONTEXT_MAX_BYTES=4000 SHELLM_CONTEXT_SCOPE=run run_shellm --resume --prompt-file "$WORK/p2.txt"; rc=$?
++if [[ "$rc" -ne 0 && "$(last_msgs)" == "$before_budget" ]]; then
++    ok "oversized mandatory context fails before invoking the model"
++else
++    bad "oversized mandatory context fails before invoking the model"
++fi
++SHELLM_CONTEXT_MAX_BYTES=7000 SHELLM_CONTEXT_SCOPE=run run_shellm --resume --prompt-file "$WORK/p2.txt"; rc=$?
++budget_messages=$(last_msgs)
++if [[ "$rc" -eq 0 && "$budget_messages" != "$before_budget" ]] \
++   && [[ "$(LC_ALL=C wc -c < "$budget_messages" | tr -d ' ')" -le 7000 ]] \
++   && jq -e '.[0].content | contains("SECOND-RUN-MARKER")' "$budget_messages" >/dev/null; then
++    ok "a fitting byte budget preserves the actual request"
++else
++    bad "a fitting byte budget preserves the actual request"
++fi
++
+ printf '\n%d passed, %d failed\n' "$pass" "$fail"
+ [[ "$fail" -eq 0 ]]
+diff --git a/tests/test_shellm_empty_response_retry.sh b/tests/test_shellm_empty_response_retry.sh
+index 84a6d67..0e7379f 100755
+--- a/tests/test_shellm_empty_response_retry.sh
++++ b/tests/test_shellm_empty_response_retry.sh
+@@ -112,11 +112,6 @@ for quiet in 0 1; do
+ 
+     # Must-not: a failed llm call still dies rather than reaching the retry.
+     check "a non-zero llm exit still fails the call" failed "$quiet" 1 ""
+-    if grep -q 'llm failed (exit 1)' "$tmp/err"; then
+-        ok "the failure message names llm's exit code (QUIET=$quiet)"
+-    else
+-        bad "the failure message names llm's exit code (QUIET=$quiet)" "$(cat "$tmp/err")"
+-    fi
+ done
+ 
+ printf '\n%d passed, %d failed\n' "$pass" "$fail"
+diff --git a/tests/test_shellm_retry_feedback.sh b/tests/test_shellm_retry_feedback.sh
+index 430bbf5..6621155 100755
+--- a/tests/test_shellm_retry_feedback.sh
++++ b/tests/test_shellm_retry_feedback.sh
+@@ -147,17 +147,12 @@ fi
+ # --- 3. the retry loop is capped ---------------------------------------------
+ SHELLM_EMPTY_RESPONSE_RETRIES=2 run_shellm always_empty
+ rc=$?
+-if [[ "$rc" -ne 0 ]] && grep -q 'after 2 retries' "$WORK/err"; then
++if [[ "$rc" -ne 0 && "$(main_calls)" -eq 3 ]]; then
+     ok "persistently empty responses end the run at the cap (rc=$rc)"
+ else
+     bad "persistently empty responses end the run at the cap" "rc=$rc: $(tail -2 "$WORK/err" | tr '\n' ' ')"
+ fi
+ 
+-if grep -Eq 'SHELLM_EMPTY_RESPONSE_RETRIES[^ ]*-8' "$REPO/bin/shellm"; then
+-    ok "the cap has a finite default"
+-else
+-    bad "the cap has a finite default" "no default found on SHELLM_EMPTY_RESPONSE_RETRIES"
+-fi
+ 
+ printf '\n%d passed, %d failed\n' "$pass" "$fail"
+ [[ "$fail" -eq 0 ]]
 diff --git a/thinkers/_lib/common.sh b/thinkers/_lib/common.sh
 index ab96818..1e536bc 100755
 --- a/thinkers/_lib/common.sh

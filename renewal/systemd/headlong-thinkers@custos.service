@@ -19,6 +19,11 @@ RestartSec=30
 TimeoutStartSec=30
 TimeoutStopSec=20
 KillMode=control-group
+# Leave the guest control plane headroom; an oversized tool process must fail,
+# not stall the entire 6GiB LXC. The dispatcher may continue after a child OOM.
+MemoryMax=4G
+MemorySwapMax=512M
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target

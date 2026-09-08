@@ -622,13 +622,22 @@ def context_text(result):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''Write commands consume one JSON object on stdin; no positional goal ID.
+Examples (replace the sample ID and evidence with actual values):
+  printf '%s\\n' '{"goal_id":"0123abcd","disposition":"completed","evidence":"Verified artifact and delivered result"}' | custos-memory complete
+  printf '%s\\n' '{"goal_id":"0123abcd","next_action":"Inspect the retained failure report"}' | custos-memory update
+  custos-memory show 0123abcd
+An acknowledgment alone is not completion. Valid dispositions: completed, declined, abandoned.''')
     parser.add_argument("command", choices=["capture", "capture-envelope", "context", "pending", "show", "update", "complete", "respond"])
-    parser.add_argument("goal_id", nargs="?")
+    parser.add_argument("goal_id", nargs="?", help="Positional ID for show only; writes take JSON on stdin")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=32)
     args = parser.parse_args()
+    if args.goal_id is not None and args.command != "show":
+        parser.error("Only show takes a positional goal ID. Pipe JSON into write commands; see --help for examples.")
     try:
         store = Store()
         if args.command in {"context", "pending"}:

@@ -46,6 +46,19 @@ class MemoryFixture(unittest.TestCase):
 
 
 class MemoryTests(MemoryFixture):
+    def test_positional_write_id_rejected_before_reading_stdin(self):
+        goal_id = self.store.capture(self.payload)["goal_id"]
+        with subprocess.Popen(
+            [sys.executable, cm.__file__, "complete", goal_id],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        ) as process:
+            try:
+                self.assertEqual(process.wait(timeout=3), 2)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+        self.assertEqual(self.store.find(goal_id)[4]["status"], "active")
+
     def test_duplicate_capture_and_conflicting_provenance(self):
         first = self.store.capture(self.payload)
         second = self.store.capture(self.payload)
