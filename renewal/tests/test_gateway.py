@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import sys
+from zoneinfo import ZoneInfo
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -18,103 +19,7 @@ import custos_busy as producer
 
 
 def epoch(local):
-    return dt.datetime.fromisoformat(local).replace(tzinfo=gateway.DENVER).timestamp()
-
-
-class LedgerTests(unittest.TestCase):
-    def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.path = Path(self.directory.name) / "quota.sqlite3"
-        self.now = epoch("2026-09-07T12:00:00")
-        self.ledger = gateway.Ledger(self.path, 360, 360)
-
-    def tearDown(self):
-        self.ledger.close()
-        self.directory.cleanup()
-
-    def test_crash_restart_keeps_reservation_and_uncertain_cooldown(self):
-        self.ledger.reserve(self.now, 180)
-        self.ledger.close()
-        self.ledger = gateway.Ledger(self.path, 360, 360)
-        with self.assertRaises(gateway.Denied) as caught:
-            self.ledger.reserve(self.now + 1, 180)
-        self.assertEqual(caught.exception.code, "previous_request_unsettled")
-        self.assertEqual(caught.exception.retry, 179)
-        self.ledger.reserve(self.now + 180, 180)
-        with self.assertRaises(gateway.Denied) as caught:
-            self.ledger.reserve(self.now + 360, 1)
-        self.assertEqual(caught.exception.code, "daily_quota")
-
-    def test_success_refunds_only_unused_walltime(self):
-        request = self.ledger.reserve(self.now, 180)
-        self.ledger.finish(request, 100)
-        request = self.ledger.reserve(self.now + 100, 180)
-        self.ledger.finish(request, 100)
-        with self.assertRaises(gateway.Denied) as caught:
-            self.ledger.reserve(self.now + 200, 180)
-        self.assertEqual(caught.exception.code, "daily_quota")
-        self.ledger.reserve(self.now + 200, 160)
-
-    def test_rolling_quota_survives_local_day_rollover(self):
-        self.ledger.reserve(self.now, 180)
-        self.ledger.reserve(self.now + 180, 180)
-        next_morning = epoch("2026-09-08T06:00:00")
-        with self.assertRaises(gateway.Denied) as caught:
-            self.ledger.reserve(next_morning, 180)
-        self.assertEqual(caught.exception.code, "rolling_quota")
-        self.assertGreater(caught.exception.retry, 0)
-        self.ledger.reserve(self.now + 86400 + 180, 180)
-
-    def test_daily_quota_reopens_at_local_midnight_on_short_and_long_days(self):
-        for day, next_day, hours in (("2026-03-08", "2026-03-09", 23),
-                                     ("2026-09-07", "2026-09-08", 24),
-                                     ("2026-11-01", "2026-11-02", 25)):
-            with self.subTest(day=day), contextlib.closing(
-                    gateway.Ledger(self.path.parent / (day + ".sqlite3"), 360, 720)) as ledger:
-                start = epoch(day + "T00:00:00")
-                reservation = ledger.reserve(start, 360)
-                ledger.finish(reservation, 360)
-                now = start + 360
-                for admission in (ledger.check, ledger.reserve):
-                    with self.assertRaises(gateway.Denied) as caught:
-                        admission(now, 1)
-                    self.assertEqual(caught.exception.code, "daily_quota")
-                    self.assertEqual(caught.exception.retry, hours * 3600 - 360)
-                midnight = epoch(next_day + "T00:00:00")
-                ledger.reserve(midnight, 360)
-
-    def test_repeated_fall_hour_shares_one_daily_budget(self):
-        first = dt.datetime(2026, 11, 1, 1, tzinfo=gateway.DENVER, fold=0).timestamp()
-        second = dt.datetime(2026, 11, 1, 1, tzinfo=gateway.DENVER, fold=1).timestamp()
-        for now in (first, second):
-            reservation = self.ledger.reserve(now, 180)
-            self.ledger.finish(reservation, 180)
-        with self.assertRaises(gateway.Denied) as caught:
-            self.ledger.reserve(second + 180, 1)
-        self.assertEqual(caught.exception.code, "daily_quota")
-        self.assertEqual(caught.exception.retry, 23 * 3600 - 180)
-
-    def test_rolling_expiry_uses_elapsed_seconds_across_dst(self):
-        for day in ("2026-03-08", "2026-11-01"):
-            with self.subTest(day=day), contextlib.closing(
-                    gateway.Ledger(self.path.parent / (day + ".sqlite3"), 720, 360)) as ledger:
-                start = epoch(day + "T00:00:00")
-                reservation = ledger.reserve(start, 360)
-                ledger.finish(reservation, 360)
-                with self.assertRaises(gateway.Denied) as caught:
-                    ledger.reserve(start + 86400 + 359, 1)
-                self.assertEqual(caught.exception.code, "rolling_quota")
-                self.assertEqual(caught.exception.retry, 1)
-                ledger.reserve(start + 86400 + 360, 360)
-
-    def test_second_process_and_backwards_clock_fail_closed(self):
-        with self.assertRaises(BlockingIOError):
-            gateway.Ledger(self.path, 360, 360)
-        request = self.ledger.reserve(self.now, 180)
-        self.ledger.finish(request, 1)
-        with self.assertRaises(gateway.Denied) as caught:
-            self.ledger.reserve(self.now - 10, 180)
-        self.assertEqual(caught.exception.code, "clock_moved_backwards")
+    return dt.datetime.fromisoformat(local).replace(tzinfo=ZoneInfo("America/Denver")).timestamp()
 
 
 class PayloadTests(unittest.TestCase):
@@ -190,7 +95,7 @@ class WireTests(unittest.IsolatedAsyncioTestCase):
         self.backend = await asyncio.start_server(self.backend_handle, "127.0.0.1", 0)
         upstream = self.backend.sockets[0].getsockname()[:2]
         policy = gateway.load_policy(Path(__file__).resolve().parents[1] / "gateway-policy.json")
-        policy.update(allowed_clients=["127.0.0.1"], state_db=str(Path(self.directory.name) / "quota.sqlite3"),
+        policy.update(allowed_clients=["127.0.0.1"],
                       pause_file=str(Path(self.directory.name) / "paused"))
         self.busy = MutableBusy()
         self.gateway = gateway.Gateway(policy, busy=self.busy, clock=lambda: self.now, upstream=upstream)
@@ -206,7 +111,6 @@ class WireTests(unittest.IsolatedAsyncioTestCase):
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        self.gateway.ledger.close()
         self.directory.cleanup()
 
     async def backend_handle(self, reader, writer):
@@ -265,22 +169,15 @@ class WireTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"[DONE]", response)
 
-    async def test_health_reflects_uncertain_leases_without_spending_quota(self):
-        lease = self.gateway.ledger.reserve(self.now, 180)
-        reader, writer = await self.connect("/health", "GET")
-        response = await reader.read()
-        await gateway.close_writer(writer)
-        self.assertTrue(response.startswith(b"HTTP/1.1 429"))
-        self.assertIn(b"previous_request_unsettled", response)
-        self.gateway.ledger.finish(lease, 100)
-        for _ in range(2):
-            reader, writer = await self.connect("/health", "GET")
-            response = await reader.read()
-            await gateway.close_writer(writer)
-            self.assertTrue(response.startswith(b"HTTP/1.1 200"))
-            allowance = json.loads(response.split(b"\r\n\r\n", 1)[1])
-            self.assertAlmostEqual(allowance["remaining_daily_seconds"], 7100)
-        self.assertEqual(self.calls, 0)
+    async def test_health_has_no_usage_quota_and_never_opens_historical_ledger(self):
+        old = Path(self.directory.name) / "quota.sqlite3"
+        old.write_bytes(b"historical exhausted quota - preserve verbatim")
+        for _ in range(3):
+            status, _, body = await self.response("/health", "GET")
+            self.assertEqual(status, 200)
+            self.assertIsNone(json.loads(body)["usage_quota"])
+        self.assertEqual(old.read_bytes(), b"historical exhausted quota - preserve verbatim")
+        self.assertFalse(hasattr(self.gateway, "ledger"))
 
     async def response(self, path="/v1/chat/completions", method="POST", raw=None):
         reader, writer = await self.connect(path, method, raw)
@@ -314,7 +211,7 @@ class WireTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("200", line)
         count = int((await reader.readline()).strip(), 16)
         first = await reader.readexactly(count + 2)
-        self.busy.foreign = True
+        Path(self.gateway.p["pause_file"]).touch()
         raw = first + await asyncio.wait_for(reader.read(), 2)
         self.assertIn(b"partial", raw)
         self.assertNotIn(b"[DONE]", raw)
@@ -322,22 +219,22 @@ class WireTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self.disconnected.wait(), 2)
         await gateway.close_writer(writer)
 
-    async def test_health_and_completion_share_midnight_retry_and_rolling_quota(self):
-        self.now = epoch("2026-09-07T23:59:59")
-        reservation = self.gateway.ledger.reserve(self.now - 7200, 7200)
-        self.gateway.ledger.finish(reservation, 7200)
-        for path, method in (("/health", "GET"), ("/v1/chat/completions", "POST")):
-            status, headers, body = await self.response(path, method)
-            self.assertEqual(status, 429)
-            self.assertEqual(json.loads(body)["error"]["code"], "daily_quota")
-            self.assertEqual(headers["retry-after"], "1")
-        self.now += 1
-        for path, method in (("/health", "GET"), ("/v1/chat/completions", "POST")):
-            status, headers, body = await self.response(path, method)
-            self.assertEqual(status, 429)
-            self.assertEqual(json.loads(body)["error"]["code"], "rolling_quota")
-            self.assertEqual(headers["retry-after"], "86399")
-        self.assertEqual(self.calls, 0)
+    async def test_many_calls_across_midnight_have_no_accumulated_limit(self):
+        for i in range(45):
+            self.now = epoch("2026-09-07T23:00:00") + i * 180
+            self.assertEqual((await self.response())[0], 200)
+        self.assertEqual(self.calls, 45)
+
+    async def test_foreign_arrival_and_stale_probe_do_not_preempt_custos(self):
+        self.mode = "gated_sse"
+        response = asyncio.create_task(self.response())
+        await asyncio.wait_for(self.started.wait(), 2)
+        self.busy.foreign = self.busy.stale = True
+        await asyncio.sleep(0.2)
+        self.assertFalse(response.done())
+        self.release_response.set()
+        status, _, body = await asyncio.wait_for(response, 2)
+        self.assertEqual((status, body), (200, self.sse))
 
     async def test_evening_midnight_and_early_morning_admit_every_surface(self):
         for local in ("2026-09-07T20:59:59", "2026-09-07T21:00:00",
@@ -412,35 +309,19 @@ class WireTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(body)["error"]["message"], "busy")
         self.assertEqual(self.calls, 1)
 
-    async def test_client_cancel_closes_upstream_and_keeps_uncertain_lease(self):
+    async def test_client_cancel_closes_upstream_and_releases_slot(self):
         self.mode = "wait"
         reader, writer = await self.connect()
         await asyncio.wait_for(self.started.wait(), 2)
         await gateway.close_writer(writer)
         await asyncio.wait_for(self.disconnected.wait(), 2)
-        status, _, body = await self.response()
-        self.assertEqual(status, 429)
-        self.assertIn(json.loads(body)["error"]["code"], {"custos_request_in_flight", "previous_request_unsettled"})
-        self.assertEqual(self.calls, 1)
-
-    async def test_foreign_priority_stale_signal_and_pause_cancel_inflight(self):
-        for offset, cause in enumerate(("foreign", "stale", "pause")):
-            with self.subTest(cause=cause):
-                self.mode = "wait"
-                self.started.clear()
-                self.disconnected.clear()
-                self.busy.foreign = self.busy.stale = False
-                self.now = epoch("2026-09-07T21:00:00") + offset * 180
-                reader, writer = await self.connect()
-                await asyncio.wait_for(self.started.wait(), 2)
-                if cause == "pause":
-                    Path(self.gateway.p["pause_file"]).touch()
-                else:
-                    setattr(self.busy, cause, True)
-                await asyncio.wait_for(self.disconnected.wait(), 2)
-                await gateway.close_writer(writer)
-                while self.gateway.inflight:
-                    await asyncio.sleep(0.01)
+        for _ in range(100):
+            if not self.gateway.inflight:
+                break
+            await asyncio.sleep(0.01)
+        self.mode = "sse"
+        self.assertEqual((await self.response())[0], 200)
+        self.assertEqual(self.calls, 2)
 
     async def test_runtime_limit_and_single_inflight(self):
         self.mode = "wait"

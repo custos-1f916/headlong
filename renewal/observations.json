@@ -3,16 +3,33 @@
   "inbox_pages_per_run": 1,
   "changes_pages_per_run": 1,
   "square_interests": {
-    "terms": ["agent memory", "inference", "open source", "evaluation", "bounty"],
+    "terms": [
+      "agent memory",
+      "inference",
+      "open source",
+      "evaluation",
+      "bounty"
+    ],
     "handles": [],
     "post_ids": []
   },
-  "opportunity_terms": ["documentation", "source", "memory", "test", "security"],
+  "opportunity_terms": [
+    "documentation",
+    "source",
+    "memory",
+    "test",
+    "security"
+  ],
   "research_feeds": [
     {
       "name": "arxiv-cs-ai",
       "url": "https://rss.arxiv.org/rss/cs.AI",
-      "terms": ["memory", "agent", "evaluation", "inference"],
+      "terms": [
+        "memory",
+        "agent",
+        "evaluation",
+        "inference"
+      ],
       "interval_seconds": 21600,
       "enabled": true
     }
@@ -28,8 +45,31 @@
     }
   ],
   "local_projects": [
-    {"name": "custos", "path": "/opt/custos/repo", "interval_seconds": 1800, "enabled": true},
-    {"name": "voidle", "path": "/opt/custos/work/voidle", "interval_seconds": 1800, "enabled": true}
+    {
+      "name": "custos",
+      "path": "/opt/custos/repo",
+      "interval_seconds": 1800,
+      "enabled": true
+    },
+    {
+      "name": "voidle",
+      "path": "/opt/custos/work/voidle",
+      "interval_seconds": 1800,
+      "enabled": true
+    }
   ],
-  "goal_reviews": []
+  "goal_reviews": [],
+  "forum": {
+    "enabled": false,
+    "publish_enabled": false,
+    "expected_name": "custos",
+    "boards": [
+      "agent-services",
+      "bounties",
+      "research",
+      "tooling",
+      "results"
+    ],
+    "blocker": "Supplied key authenticates as kevin-s-bot. Await intended identity approval or a Custos-specific key; no payments authorized."
+  }
 }

@@ -24,7 +24,7 @@ continue through native goals.
 | Guest `/opt/custos/work`, `/opt/custos/work/voidle` | Working area and canonical Voidle checkout. Source delivery uses only verified repository-scoped Git access. |
 | Guest `/var/lib/custos-observe` | Inbox cursors, replay state, observation and public outbox receipts. These are transport records, not a planner. |
 | Guest `/var/lib/custos-fund/ledger.jsonl` | Evidence-backed accounting only, not a wallet or payment executor. |
-| blink1 `/etc/custos-gateway/`, `/var/lib/custos-gateway/` | Operator-owned admission policy and pause file; durable `quota.sqlite3`. Live busy observation is `/run/custos-gateway/busy.json`. |
+| blink1 `/etc/custos-gateway/`, `/var/lib/custos-gateway/` | Operator-owned admission policy and pause file; historical, unenforced `quota.sqlite3`. Live busy observation is `/run/custos-gateway/busy.json`. |
 | blink1 `/etc/custos-work.env`, `/etc/custos-work/`, `/var/lib/custos-work/` | External Voidle broker credentials, policy, operation receipts and private tracker metadata. No database password belongs in 122. |
 | blink1 `/etc/custos-boundary.nft` and PVE container unit drop-in | External network boundary and fail-closed guest startup enforcement. |
 
@@ -42,7 +42,7 @@ permission for Custos to change PVE.
 
 The retained forum bearer is in guest `/etc/custos.env`; the citizen signer files
 are `/opt/custos/ed25519.key` (PKCS8) and `/opt/custos/ed25519-openssh.key`.
-`/opt/custos/git-deploy.key` is scoped source access. Never print these files,
+`/opt/custos/git-deploy.key` and `voidle-deploy.key` are retained rollback evidence, unused by live Git. Source access uses Custos account `custos-1f916`, HTTPS and `gh auth git-credential`. The PAT stays in root-only private storage, never the model environment. Voidle write access is verified; a Custos-source repository grant is pending explicit operator approval. Never print these files,
 include them in public evidence, or expose them to model prompts. Retained
 public-key derivation and sign/verify checks passed. The old persona archive,
 including old external credentials, was removed from the guest and kept privately
@@ -81,19 +81,17 @@ Inference admission is continuous, **at any hour**: no 21:00–06:00 cutoff, nig
 reservation, or model-driving cron/timer. All inference, including recall and
 summaries, goes to blink1 `:18080`, then Johan's existing NInfer. NInfer
 `max_concurrency=1` is unchanged. The external gateway admits one Custos request
-at a time, subject to operator pause and foreign work priority:
+at a time, subject to operator pause and backend availability. Custos is Johan's
+primary user. There is **no daily or rolling inference quota**, no reservations,
+and no foreign-client preemption. The former `quota.sqlite3` is historical evidence
+and is neither opened nor modified by the gateway.
 
-- 7200 seconds per America/Denver day **and** per rolling 24 hours;
-- at most 180 seconds/request, 32768 output tokens, 128 KiB request body and
-  128 messages;
-- medium reasoning by default; explicit bounded synchronous xhigh is allowed
-  under the same limits, not a fallback model or extra worker.
-
-These are ceilings, not usage targets. Socket observations provide **cooperative
-foreign priority**, not instantaneous GPU preemption. New admission is denied and
-a Custos stream can be cancelled when foreign work appears; uncertain leases
-remain charged/held rather than assumed free. Missing or stale busy evidence fails
-closed. Do not restart services or erase quota state to evade a denial. See
+The gateway retains 180 seconds/request, 32768 output tokens, 128 KiB request body,
+128 messages, and medium reasoning by default (explicit xhigh allowed). A fresh
+idle socket observation is required for new admission. Once admitted, a stream
+continues even if another client appears or the observation goes stale; operator
+pause, timeout and client disconnection still cancel it. NInfer owns its one-slot
+queue; this observation is not atomic arbitration between independent clients. See
 [gateway policy](renewal/gateway-policy.json), [gateway implementation](renewal/custos_gateway.py),
 [busy observer](renewal/custos_busy.py), and [experiment skill](renewal/identity/skills/custos-experiments/SKILL.md).
 
@@ -162,7 +160,7 @@ ssh -i ~/.ssh/id_ed25519 user@192.168.86.44 'sudo -n pct exec 122 -- journalctl 
 ```
 
 Read logs privately: messages and pair URIs may be sensitive. Distinguish busy,
-quota, pause, backend outage, capture failure and uncertain delivery; do not
+pause, backend outage, capture failure and uncertain delivery; do not
 report them all as idle. If a boundary startup load fails, repair the host policy
 rather than removing the startup guard. After recovery, start 122 if stopped,
 check the retained native root and receipts, then start the web/bridge/observer
@@ -396,7 +394,7 @@ cutover that refuses an already-installed marker, not an update procedure.
    point the recovered pipeline at the live tracker/inference server.
 5. **Reconcile before resuming.** Check native goals, uncertain external work
    operations and outgoing receipts against their actual destinations; reuse
-   existing IDs. Verify boundary load, busy freshness, quota state and scoped
+   existing IDs. Verify boundary load, busy freshness, preserved historical quota state and scoped
    work access, then start transports/observer and unpause using Mac `start`.
    Test a bounded real request through the intended channel and inspect its
    capture, reply and delivery. Rebuild and requalify Voidle separately; a runtime
@@ -425,3 +423,25 @@ Those require the explicit commissioning scenarios and retained receipts above.
 Commit/push receipts must name the actual final source and patch revisions when
 available. No unrecorded final SHA, remote delivery, phone qualification, financial
 result, or visual pass is implied by the upstream base pin or this runbook.
+
+## GitHub account and second forum — continuation
+
+Live guest Git uses `custos-1f916` (GitHub ID320211121), HTTPS and `gh` private
+credential storage. Its noreply attribution is
+`320211121+custos-1f916@users.noreply.github.com`. No PAT is exported to model
+processes. Voidle access and credential-helper `ls-remote` passed. The account
+lacks a grant to `collettiquette/custos`; explicit operator approval is pending.
+Live source access fails visibly until granted; retained deploy keys are unused.
+Fresh provisioning requires `gh` and separately installed account authentication;
+the fresh-persona installer never restores deploy-key fallback.
+
+The second forum adapter is [`custos_forum.py`](renewal/custos_forum.py), with
+native observer inbox/feed intake and native-chat outbox delivery. Both observation
+and publishing are disabled in `observations.json`: the supplied key belongs to
+`kevin-s-bot` with house membership, not the requested Custos identity. The key
+remains on the Mac; no unrelated account credential was placed in the guest.
+A Custos key or explicit authorization to use the existing identity is needed.
+There is no documented rename or delegated free-signup endpoint. No wallet,
+subscription, payment, signup or post was performed. Eight isolated adapter
+regressions pass; live account creation and posting/reply qualification remain
+blocked, not completed. See the [native forum skill](renewal/identity/skills/custos-forum/SKILL.md).

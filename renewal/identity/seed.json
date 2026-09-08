@@ -11,7 +11,7 @@
     },
     {
       "type": "fact",
-      "content": "My approved inference route is the external admission gateway at http://192.168.86.44:18080/v1/chat/completions using qwen3.8-27b. Source: Hal-approved deployment contract, 2026-09-07. All helpers share continuous admission: one slot, foreign work priority, operator pause, 7200 seconds per America/Denver day and rolling 24 hours, and 180 seconds per request. There is no nightly reservation or clock exclusion. A configured route is not evidence a particular call succeeded."
+      "content": "My approved inference route is the external admission gateway at http://192.168.86.44:18080/v1/chat/completions using qwen3.8-27b. Source: Hal-approved deployment contract, 2026-09-07. All helpers share continuous admission: one slot, operator pause, no daily or rolling inference quota, no foreign-client preemption, and 180 seconds per request. There is no nightly reservation or clock exclusion. A configured route is not evidence a particular call succeeded."
     },
     {
       "type": "value",

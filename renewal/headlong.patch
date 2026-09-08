@@ -1398,7 +1398,7 @@ index 5bcd50d..7e15e3b 100644
  
  For `act`, run the actual commands first, then append the observation: one sentence, the fact, as in the example. Do not write the handoff twice.
 diff --git a/thinkers/monolith/step b/thinkers/monolith/step
-index bfe362b..1832348 100755
+index bfe362b..4706084 100755
 --- a/thinkers/monolith/step
 +++ b/thinkers/monolith/step
 @@ -201,39 +201,9 @@ if [[ $(printf '%s\n' "$last_three" | jq -r '.type' 2>/dev/null | sort -u | tr '
@@ -1453,6 +1453,23 @@ index bfe362b..1832348 100755
  "
  fi
  # The query for related memories is the wake's own material: the real hints
+@@ -453,6 +423,16 @@ if [[ "$did_work" -eq 0 ]]; then
+             | traj append >/dev/null || true
+     fi
+ fi
++# Always record launcher termination, including failures after durable work.
++# Missing records (e.g. SIGKILL) remain unclosed, never inferred successful/live.
++terminal_run_id=$(cat "$run_id_file" 2>/dev/null) || terminal_run_id=""
++if [[ -n "$terminal_run_id" ]]; then
++    jq -nc --arg source "$THINKER_NAME" --arg run_id "$terminal_run_id" \
++        --argjson rc "$run_rc" \
++        '{type:"run-end", source:$source, run_id:$run_id, rc:$rc,
++          content:(if $rc == 0 then "monolith run exited successfully" else "monolith run exited with rc=\($rc)" end)}' \
++        | traj append >/dev/null || true
++fi
+ rm -f "$run_id_file"
+ 
+ # ---------------------------------------------------------------------------
 diff --git a/thinkers/responder/step b/thinkers/responder/step
 index 9a0de4b..c8c23f2 100755
 --- a/thinkers/responder/step
@@ -1811,3 +1828,219 @@ index dadfddc..df2c2ee 100755
  [[ -z "$_root_traj" ]] && _root_traj="trajectory.jsonl"
  export TRAJ_ID="$_root_traj"
  export ROOT_TRAJ_ID="$_root_traj"
+diff --git a/web/src/headlong_web/trajectory.py b/web/src/headlong_web/trajectory.py
+index 6345d1c..9e5c836 100644
+--- a/web/src/headlong_web/trajectory.py
++++ b/web/src/headlong_web/trajectory.py
+@@ -120,7 +120,7 @@ class RunGroup:
+     step_ids: list[str] = field(default_factory=list)
+     started_ts: str = ""
+     ended_ts: str | None = None
+-    status: str = "running"  # running | done
++    status: str = "unclosed"  # unclosed (liveness unknown) | done | failed
+     # Stored TRUNCATED (commands embed the whole prompt; thousands of runs
+     # times 100s of KB was a large share of the cache's memory). The full
+     # text is rehydrated from header_span by TrajectoryCache.run_command.
+@@ -275,6 +275,18 @@ class _Normalizer:
+                 "from_step": raw.get("from_step"),
+             }
+ 
++        # Launcher terminal records are separate visible events, but also close
++        # the explicitly linked run. Do not absorb them into machinery grouping.
++        terminal_run = self._runs_by_id.get(raw.get("run_id") or "")
++        if terminal_run is not None and (
++            (step_type == "error" and raw.get("reason") == "run-failed")
++            or (step_type == "run-end" and type(raw.get("rc")) is int)
++            or (step_type == "idle" and source == "monolith")
++        ):
++            terminal_run.status = "failed" if step_type == "error" or raw.get("rc", 0) != 0 else "done"
++            terminal_run.ended_ts = ts
++            terminal_run.last_touch = len(self.steps)
++
+         # Inline-run grouping (machinery steps carry no source)
+         if source is None and step_type in MACHINERY_TYPES:
+             if step_type == "shellm-run":
+@@ -330,8 +342,9 @@ class _Normalizer:
+                     if step_type == "run-summary":
+                         run.tldr = raw.get("tldr") or run.tldr
+                     elif step_type == "final":
+-                        run.status = "done"
+-                        run.ended_ts = ts
++                        if run.status != "failed":
++                            run.status = "done"
++                            run.ended_ts = ts
+         elif step_type == "action":
+             self._unmatched_actions.append(normalized)
+ 
+diff --git a/web/tests/test_trajectory.py b/web/tests/test_trajectory.py
+index 6a1779d..cde04a2 100644
+--- a/web/tests/test_trajectory.py
++++ b/web/tests/test_trajectory.py
+@@ -5,7 +5,7 @@ from pathlib import Path
+ import pytest
+ 
+ from headlong_web import discovery
+-from headlong_web.trajectory import load_trajectory, step_preview
++from headlong_web.trajectory import load_trajectory, step_preview, normalize
+ 
+ REPO = Path(__file__).parents[2]
+ GEN1 = REPO / "improve" / "generations" / "gen-001" / "identities"
+@@ -33,7 +33,7 @@ def test_g001r1_legacy_log_run_header_only():
+     assert len(result["runs"]) == 1
+     run = result["runs"][0]
+     assert run["step_ids"] == [run["run_id"]]
+-    assert run["status"] == "running"
++    assert run["status"] == "unclosed"
+     # the action -> run join must land
+     assert run["trigger_step_id"] is not None
+     action = next(s for s in result["steps"] if s["step_id"] == run["trigger_step_id"])
+@@ -58,7 +58,7 @@ def test_g001r2_legacy_machinery_stays_ungrouped():
+     assert machinery
+     assert all(s["run_id"] is None for s in machinery)
+     # without run_id-stamped finals, legacy runs never close
+-    assert all(run["status"] == "running" for run in runs)
++    assert all(run["status"] == "unclosed" for run in runs)
+     # thinker steps are never swallowed into runs
+     thinker = [s for s in result["steps"] if s["source"] is not None]
+     assert all(s["run_id"] is None for s in thinker)
+@@ -270,3 +270,27 @@ def test_file_bytes_stripped_from_dashboard_raw():
+     assert step["raw"]["filename"] == "note.txt"
+     assert step["raw"]["content"] == "hello file"
+     assert "content_b64" not in step["raw"]
++
++
++def test_launcher_terminal_failure_closes_run_without_hiding_error(tmp_path):
++    result = normalize([
++        _step("shellm-run", "r1"),
++        _step("shellm-run", "r2"),
++        _step("error", "e1", source="monolith", reason="run-failed", run_id="r1", rc=1, ts="end"),
++        _step("run-end", "e2", source="monolith", run_id="r2", rc=0, ts="end2"),
++    ], tmp_path)
++    assert [r["status"] for r in result["runs"]] == ["failed", "done"]
++    assert result["runs"][0]["ended_ts"] == "end"
++    assert result["runs"][0]["last_touch"] == 2
++    assert result["steps"][2]["run_id"] is None  # error remains separately visible
++
++
++def test_partial_work_failure_and_orphan_error(tmp_path):
++    result = normalize([
++        _step("shellm-run", "r1"),
++        _step("reasoning", "s1", run_id="r1"),
++        _step("run-end", "end", source="monolith", run_id="r1", rc=137),
++        _step("error", "orphan", source="monolith", reason="run-failed", run_id="missing"),
++        _step("shellm-run", "unclosed"),
++    ], tmp_path)
++    assert [r["status"] for r in result["runs"]] == ["failed", "unclosed"]
+diff --git a/web/tests/test_trajectory_cache.py b/web/tests/test_trajectory_cache.py
+index d080d7d..56bd326 100644
+--- a/web/tests/test_trajectory_cache.py
++++ b/web/tests/test_trajectory_cache.py
+@@ -384,3 +384,20 @@ def test_window_rehydrate_strips_content_b64(traj_dir: Path):
+     assert file_step["raw"]["filename"] == "note.txt"
+     assert file_step["raw"]["content"] == "hello file"
+     assert "content_b64" not in file_step["raw"]
++
++
++def test_incremental_terminal_error_updates_previous_run(tmp_path):
++    from headlong_web.trajectory import TrajectoryCache
++    import json
++    path = tmp_path / "trajectory.jsonl"
++    path.write_text(json.dumps({"type":"shellm-run", "step_id":"r1", "ts":"start"}) + "\n")
++    cache = TrajectoryCache()
++    assert cache.load(tmp_path)["runs"][0]["status"] == "unclosed"
++    with path.open("a") as stream:
++        stream.write(json.dumps({"type":"error", "step_id":"err", "run_id":"r1",
++                                 "source":"monolith", "reason":"run-failed", "rc":1, "ts":"end"}) + "\n")
++    result = cache.load(tmp_path)
++    assert result["runs"][0]["status"] == "failed"
++    assert result["runs"][0]["last_touch"] == 1
++    assert result["steps"][1]["type"] == "error"
++    assert cache.load(tmp_path)["runs"] == result["runs"]
+diff --git a/web/viewer/app/components/run-group.tsx b/web/viewer/app/components/run-group.tsx
+index 3bdfeea..a94c1dd 100644
+--- a/web/viewer/app/components/run-group.tsx
++++ b/web/viewer/app/components/run-group.tsx
+@@ -81,12 +81,12 @@ export function RunGroupBlock({
+               "text-[10px]",
+               run.status === "done"
+                 ? "text-muted-foreground"
+-                : live
+-                  ? "text-green-700 dark:text-green-400"
++                : run.status === "failed"
++                  ? "text-red-700 dark:text-red-400"
+                   : "text-amber-700 dark:text-amber-400"
+             )}
+           >
+-            {run.status === "done" ? "done" : live ? "running" : "incomplete"}
++            {run.status}
+           </Badge>
+           {duration && <span>{duration}</span>}
+           <span>{steps.length} steps</span>
+diff --git a/web/viewer/app/components/timeline-view.tsx b/web/viewer/app/components/timeline-view.tsx
+index c861aee..59fc11a 100644
+--- a/web/viewer/app/components/timeline-view.tsx
++++ b/web/viewer/app/components/timeline-view.tsx
+@@ -757,7 +757,6 @@ export function TimelineView({
+             {layout.blocks.map((block) => {
+               const r = blockRect(block);
+               if (!r) return null; // hidden lane
+-              const running = block.open && live;
+               const hot = hovered === block.run.run_id;
+               return (
+                 <button
+@@ -769,7 +768,6 @@ export function TimelineView({
+                   className={cn(
+                     "absolute z-10 rounded-md border text-left",
+                     "border-cyan-400/50 bg-cyan-400/[0.06] hover:bg-cyan-400/[0.12]",
+-                    running && "animate-pulse",
+                     hot && "ring-2 ring-cyan-300/70",
+                     freshIds.has(block.run.run_id) && "tl-pop",
+                     flashId === block.run.run_id && "tl-flash"
+@@ -922,11 +920,7 @@ export function TimelineView({
+                       {route && (
+                         <span className="text-fuchsia-300/90">→ {route} · </span>
+                       )}
+-                      {block.open && !block.run.ended_ts
+-                        ? live
+-                          ? "running"
+-                          : "incomplete"
+-                        : duration ?? "done"}
++                      {block.run.status === "done" ? duration ?? "done" : block.run.status}
+                       {iters > 0 && <> · {iters} iter</>}
+                       {block.run.model && (
+                         <> · {block.run.model.replace(/^claude-/, "")}</>
+diff --git a/web/viewer/app/lib/timeline-model.ts b/web/viewer/app/lib/timeline-model.ts
+index c630230..b7a4784 100644
+--- a/web/viewer/app/lib/timeline-model.ts
++++ b/web/viewer/app/lib/timeline-model.ts
+@@ -43,7 +43,7 @@ export interface TimelineBlock {
+   startRow: number;
+   endRow: number; // inclusive
+   members: NormalizedStep[];
+-  open: boolean; // still running (no final seen)
++  open: boolean; // no terminal evidence (does not establish process liveness)
+ }
+ 
+ export interface TimelineGapRow {
+@@ -247,7 +247,7 @@ export function buildTimeline(mindlog: Pick<Mindlog, "steps" | "runs">): Timelin
+         startRow: row,
+         endRow: row,
+         members: membersByRun.get(run.run_id) ?? [],
+-        open: run.status !== "done",
++        open: run.status === "unclosed",
+       };
+       blocks.push(block);
+       blockByRunId.set(run.run_id, block);
+diff --git a/web/viewer/app/lib/types.ts b/web/viewer/app/lib/types.ts
+index f209a3a..8b40128 100644
+--- a/web/viewer/app/lib/types.ts
++++ b/web/viewer/app/lib/types.ts
+@@ -451,7 +451,7 @@ export interface RunGroup {
+   step_ids: string[];
+   started_ts: string;
+   ended_ts: string | null;
+-  status: "running" | "done";
++  status: "unclosed" | "done" | "failed";
+   /** Truncated on the wire when huge (head + trailing ACTION kept);
+    * fetch the full text via fetchRunCommand when command_truncated. */
+   command: string;

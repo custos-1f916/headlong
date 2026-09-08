@@ -350,6 +350,19 @@ class Observer:
                         payload["parent_id"] = int(parent)
                     receipt = self.square.write("traj:" + row["step_id"], "comment", payload)
                     self.native.append("delivery:" + row["step_id"], {"type": "observation", "source": "square-outbox", "content": "Public square reply delivered: " + canonical(receipt), "reply_to": row["step_id"]})
+                if row.get("type") == "message" and row.get("from") == "custos" and str(row.get("to", "")).startswith("forum:"):
+                    from custos_forum import Forum
+                    match = re.fullmatch(r"forum:([A-Za-z0-9_-]{1,100}):([A-Za-z0-9_-]{1,100}):([A-Za-z0-9_-]{1,100})", row["to"])
+                    if not match or not row.get("step_id"):
+                        raise APIError("invalid_forum_outbox_target")
+                    author, thread, parent = match.groups()
+                    forum = Forum(config=self.config.get("forum", {}))
+                    forum.identity()
+                    target = forum.request("/api/messages/" + parent)["message"]
+                    if target.get("authorName") != author or target.get("threadId") != thread:
+                        raise APIError("forum_outbox_recipient_mismatch")
+                    receipt = forum.write("traj:" + row["step_id"], "reply", {"threadId":thread, "parentId":parent, "body":row["content"]})
+                    self.native.append("delivery:" + row["step_id"], {"type":"observation", "source":"forum-outbox", "content":"Forum reply delivered: " + canonical(receipt), "reply_to":row["step_id"]})
                 cursor["offset"] = source.tell()
                 self.store.put("outbox:cursor", cursor)
 
@@ -448,13 +461,14 @@ class Observer:
         try:
             with opener.open(url, timeout=5) as response:
                 value = json.loads(response.read(8192))
-            remaining = min(float(value["remaining_daily_seconds"]), float(value["remaining_rolling_seconds"]))
-            state = "low_budget" if remaining < 600 else "admitted"
-            message = "Inference admitted; remaining shared-gateway walltime allowance is about " + str(int(remaining)) + " seconds. Budget is an upper bound, not an obligation to spend it."
+            if value.get("status") != "ok":
+                raise ValueError("invalid admission health response")
+            state = "admitted"
+            message = "Inference admitted. Custos is Johan's primary user; there is no daily or rolling usage quota. Operator pause and backend concurrency still apply."
         except urllib.error.HTTPError as error:
             value = json.loads(error.read(8192))["error"]
             code = value["code"]
-            if code in {"custos_request_in_flight", "backend_busy_or_unavailable", "previous_request_unsettled"}:
+            if code in {"custos_request_in_flight", "backend_busy_or_unavailable"}:
                 return  # Expected short-lived self-use/drain, not a new duty.
             state = "deferred:" + code
             message = "Inference deferred by the external gateway: " + code + ". Preserve goals and respect this boundary; it is not permission to bypass it. Retry guidance: " + str(value.get("retry_after_seconds", 0)) + " seconds."
@@ -464,9 +478,16 @@ class Observer:
             if self.emit("admission:" + str(sequence), message, url):
                 self.store.put("admission:status", {"state": state, "sequence": sequence})
 
+    def forum_poll(self, kind):
+        from custos_forum import Forum, poll
+        poll(self, Forum(config=self.config["forum"]), kind)
+
     def run(self):
         self.source("square-outbox", 60, self.outbox)
         self.source("square-inbox", 300, self.inbox)
+        if self.config.get("forum", {}).get("enabled"):
+            self.source("forum-inbox", 300, lambda: self.forum_poll("inbox"))
+            self.source("forum-feed", 1800, lambda: self.forum_poll("feed"))
         self.source("owned-work-results", 300, self.local_results)
         self.source("inference-admission", 300, self.admission)
         for project in self.config.get("local_projects", [])[:4]:

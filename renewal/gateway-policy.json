@@ -1,12 +1,11 @@
 {
   "bind_host": "192.168.86.44",
   "bind_port": 18080,
-  "allowed_clients": ["192.168.86.52"],
-  "state_db": "/var/lib/custos-gateway/quota.sqlite3",
+  "allowed_clients": [
+    "192.168.86.52"
+  ],
   "busy_signal": "/run/custos-gateway/busy.json",
   "pause_file": "/etc/custos-gateway/paused",
-  "daily_seconds": 7200,
-  "rolling_24h_seconds": 7200,
   "request_seconds": 180,
   "max_tokens": 32768,
   "max_connections": 16,

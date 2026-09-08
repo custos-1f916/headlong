@@ -1,35 +1,24 @@
 #!/usr/bin/env python3
-"""Outside-guest, fixed-destination inference admission. Python 3.11+, no dependencies.
+"""Outside-guest fixed-destination inference gateway. No usage quota.
 
-Busy signal is host-produced, never guest-controlled: atomically replace JSON with
-observed_at (Unix seconds), foreign_busy (bool), backend_idle (bool). Missing,
-stale, future-dated or malformed observations fail closed. This is conservative
-snapshot admission, NOT atomic arbitration or GPU preemption. All competing
-callers must share a host arbiter to obtain hard interactive priority.
-
-SQLite FULL transactions reserve the entire possible upstream walltime BEFORE
-connecting. Only a fully delivered response refunds unused time. Crash, client
-cancellation and uncertain upstream failures retain the reservation and prevent
-another request until its deadline. Never delete/reset this host-owned database.
+Custos is Johan's primary client. New calls wait for an idle backend snapshot;
+other callers never preempt an admitted Custos stream. The operator pause,
+per-request timeout, single in-flight call and bounded framing remain enforced.
+Historical quota.sqlite3 is intentionally neither read nor modified.
 """
 import argparse
 import asyncio
 import contextlib
-import datetime as dt
-import fcntl
 import json
 import math
 import os
 from pathlib import Path
 import signal
-import sqlite3
 import stat
 import time
-from zoneinfo import ZoneInfo
 
 UPSTREAM = ("192.168.86.117", 8080)
 MODEL = "qwen3.8-27b"
-DENVER = ZoneInfo("America/Denver")
 MODEL_PATHS = {"/v1/models", "/v1/models/" + MODEL}
 REASONS = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found",
            405: "Method Not Allowed", 408: "Request Timeout", 413: "Content Too Large",
@@ -119,78 +108,6 @@ def payload(raw, max_tokens):
         raise Denied(400, "invalid_completion_request") from None
 
 
-class Ledger:
-    def __init__(self, path, daily_seconds, rolling_seconds):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.lock = open(str(path) + ".lock", "a")
-        try:
-            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            self.lock.close()
-            raise
-        self.db = sqlite3.connect(path, isolation_level=None)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=FULL")
-        self.db.executescript("""
-            CREATE TABLE IF NOT EXISTS reservations (
-                id INTEGER PRIMARY KEY, day TEXT NOT NULL, started REAL NOT NULL,
-                deadline REAL NOT NULL, charged REAL NOT NULL, uncertain INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS clock (id INTEGER PRIMARY KEY CHECK(id=1), latest REAL NOT NULL);
-        """)
-        self.daily, self.rolling = daily_seconds, rolling_seconds
-
-    def check(self, now, duration):
-        """Read-only admission check shared by health and durable reservation."""
-        latest = self.db.execute("SELECT latest FROM clock WHERE id=1").fetchone()
-        if latest and now < latest[0] - 1:
-            raise Denied(503, "clock_moved_backwards", latest[0] - now)
-        day = dt.datetime.fromtimestamp(now, DENVER).date().isoformat()
-        uncertain = self.db.execute("SELECT MAX(deadline) FROM reservations WHERE uncertain=1").fetchone()[0]
-        if uncertain and uncertain > now:
-            raise Denied(429, "previous_request_unsettled", uncertain - now)
-        daily = self.db.execute("SELECT COALESCE(SUM(charged),0) FROM reservations WHERE day=?", (day,)).fetchone()[0]
-        # Whole overlapping reservations conservatively cover interrupted work.
-        rolling = self.db.execute("SELECT COALESCE(SUM(charged),0) FROM reservations WHERE deadline>?", (now - 86400,)).fetchone()[0]
-        if daily + duration > self.daily:
-            tomorrow = dt.datetime.fromtimestamp(now, DENVER).date() + dt.timedelta(days=1)
-            retry = dt.datetime.combine(tomorrow, dt.time.min, DENVER).timestamp() - now
-            raise Denied(429, "daily_quota", retry)
-        if rolling + duration > self.rolling:
-            available = rolling
-            rows = self.db.execute("SELECT deadline, charged FROM reservations WHERE deadline>? ORDER BY deadline", (now - 86400,)).fetchall()
-            for deadline, charge in rows:
-                available -= charge
-                if available + duration <= self.rolling:
-                    raise Denied(429, "rolling_quota", deadline + 86400 - now)
-            raise Denied(429, "rolling_quota", 86400)
-        return {"day": day, "remaining_daily_seconds": self.daily - daily,
-                "remaining_rolling_seconds": self.rolling - rolling}
-
-    def reserve(self, now, duration):
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            state = self.check(now, duration)
-            self.db.execute("INSERT OR REPLACE INTO clock VALUES (1, ?)", (now,))
-            cursor = self.db.execute("INSERT INTO reservations(day,started,deadline,charged,uncertain) VALUES(?,?,?,?,1)",
-                                     (state["day"], now, now + duration, duration))
-            self.db.execute("DELETE FROM reservations WHERE deadline<?", (now - 3 * 86400,))
-            self.db.execute("COMMIT")
-            return cursor.lastrowid
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
-
-    def finish(self, reservation, elapsed):
-        # Single fully durable update. Failure leaves the conservative reservation.
-        self.db.execute("UPDATE reservations SET charged=MIN(charged,?), uncertain=0 WHERE id=?",
-                        (max(0.001, elapsed), reservation))
-
-    def close(self):
-        self.db.close()
-        self.lock.close()
-
-
 class BusySignal:
     def __init__(self, path, max_age):
         self.path, self.max_age = path, max_age
@@ -214,8 +131,6 @@ class BusySignal:
                 raise ValueError("invalid busy observation")
         except (OSError, ValueError, TypeError, RecursionError):
             raise Denied(503, "busy_observation_unavailable", 30) from None
-        if value["foreign_busy"]:
-            raise Denied(503, "backend_reserved_for_other_users", 30)
         if admission and not value["backend_idle"]:
             raise Denied(503, "backend_busy_or_unavailable", 30)
 
@@ -255,9 +170,8 @@ async def close_writer(writer):
 
 
 class Gateway:
-    def __init__(self, policy, ledger=None, busy=None, clock=time.time, upstream=UPSTREAM):
+    def __init__(self, policy, busy=None, clock=time.time, upstream=UPSTREAM):
         self.p = policy
-        self.ledger = ledger or Ledger(policy["state_db"], policy["daily_seconds"], policy["rolling_24h_seconds"])
         self.busy = busy or BusySignal(policy["busy_signal"], policy["busy_max_age_seconds"])
         self.clock, self.upstream = clock, upstream
         self.inflight = False
@@ -287,7 +201,6 @@ class Gateway:
                 self.check_pause()
                 if time.monotonic() >= monotonic_deadline:
                     raise Denied(503, "request_walltime_limit", 30)
-                self.busy.check(now, admission=False)
                 await asyncio.wait({eof}, timeout=min(0.1, max(0, monotonic_deadline - time.monotonic())))
         finally:
             eof.cancel()
@@ -429,15 +342,13 @@ class Gateway:
                 raise Denied(429, "custos_request_in_flight", 30)
             duration = self.p["request_seconds"]
             if path == "/health":
-                allowance = self.ledger.check(now, duration)
                 response = json.dumps({"status": "ok", "scope": "gateway_admission_snapshot",
-                                       **allowance}).encode()
+                                       "usage_quota": None}).encode()
                 writer.write((f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response)}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n").encode() + response)
                 sent[0] = True
                 await asyncio.wait_for(writer.drain(), self.p["io_timeout_seconds"])
                 return
             self.inflight, owned = True, True
-            reservation = self.ledger.reserve(now, duration)
             started = time.monotonic()
             jobs = [asyncio.create_task(self.proxy(writer, method, path, body, sent)),
                     asyncio.create_task(self.watch(reader, started + duration))]
@@ -445,7 +356,6 @@ class Gateway:
             if jobs[1] in done:
                 await jobs[1]
             await jobs[0]
-            self.ledger.finish(reservation, time.monotonic() - started)
         except Denied as denial:
             for job in jobs:
                 job.cancel()
@@ -453,7 +363,7 @@ class Gateway:
             if not sent[0]:
                 with contextlib.suppress(ConnectionError, OSError, asyncio.TimeoutError):
                     await self.error(writer, denial)
-        except (OSError, ValueError, sqlite3.Error, asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+        except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
             for job in jobs:
                 job.cancel()
             await asyncio.gather(*jobs, return_exceptions=True)
@@ -474,13 +384,12 @@ class Gateway:
 def load_policy(path):
     with open(path, "rb") as stream:
         policy = strict_json(stream.read(16385))
-    required = {"bind_host", "bind_port", "allowed_clients", "state_db", "busy_signal", "pause_file", "daily_seconds",
-                "rolling_24h_seconds", "request_seconds", "max_tokens", "max_connections", "max_header_bytes",
+    required = {"bind_host", "bind_port", "allowed_clients", "busy_signal", "pause_file", "request_seconds", "max_tokens", "max_connections", "max_header_bytes",
                 "max_body_bytes", "max_response_bytes", "header_timeout_seconds", "body_timeout_seconds",
                 "connect_timeout_seconds", "io_timeout_seconds", "busy_max_age_seconds"}
     if not isinstance(policy, dict) or set(policy) != required:
         raise ValueError("policy keys do not match required schema")
-    bounds = {"daily_seconds": 7200, "rolling_24h_seconds": 7200, "request_seconds": 180,
+    bounds = {"request_seconds": 180,
               "max_tokens": 32768, "max_connections": 16, "max_header_bytes": 16384,
               "max_body_bytes": 131072, "max_response_bytes": 8388608, "header_timeout_seconds": 5,
               "body_timeout_seconds": 5, "connect_timeout_seconds": 3, "io_timeout_seconds": 5,
@@ -493,7 +402,7 @@ def load_policy(path):
             raise ValueError("integer policy limit required: " + key)
     if policy["bind_host"] != "192.168.86.44" or policy["bind_port"] != 18080 or policy["allowed_clients"] != ["192.168.86.52"]:
         raise ValueError("production endpoint/client policy is fixed")
-    for key in ("state_db", "busy_signal", "pause_file"):
+    for key in ("busy_signal", "pause_file"):
         if not isinstance(policy[key], str) or not os.path.isabs(policy[key]):
             raise ValueError("host-owned absolute policy path required")
     return policy
@@ -507,14 +416,11 @@ async def serve(policy):
         loop.add_signal_handler(sig, stop.set)
     server = await asyncio.start_server(gateway.accept, policy["bind_host"], policy["bind_port"],
                                         limit=policy["max_header_bytes"], backlog=policy["max_connections"])
-    try:
-        async with server:
-            await stop.wait()
-        for task in list(gateway.tasks):
-            task.cancel()
-        await asyncio.gather(*gateway.tasks, return_exceptions=True)
-    finally:
-        gateway.ledger.close()
+    async with server:
+        await stop.wait()
+    for task in list(gateway.tasks):
+        task.cancel()
+    await asyncio.gather(*gateway.tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":

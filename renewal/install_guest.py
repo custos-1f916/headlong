@@ -86,6 +86,12 @@ def main():
     marker = Path('/var/lib/custos/renewal-installed.json')
     if marker.exists():
         raise RuntimeError('fresh reset already installed; update source without resetting identity')
+    # Verify prerequisites before any destructive fresh cutover work.
+    if not shutil.which('gh'):
+        raise RuntimeError('Install gh and authenticate Custos account before fresh provisioning')
+    login = subprocess.check_output(['gh', 'api', 'user', '--jq', '.login'], text=True).strip()
+    if login != 'custos-1f916':
+        raise RuntimeError('Fresh provisioning requires the Custos GitHub account')
     manifest = json.loads((args.preserved / 'identity-manifest.json').read_text())
     for name, expected in manifest.items():
         if hashlib.sha256(Path(name).read_bytes()).hexdigest() != expected['sha256']:
@@ -193,9 +199,13 @@ def main():
         env_text += '\n'.join(line for line in defaults.splitlines() if line and not line.startswith('#')) + '\n'
         Path('/etc/custos-headlong.env').write_text(env_text)
         Path('/etc/custos-headlong.env').chmod(0o600)
-        # Git writes are scoped to Custos's own repository deploy key.
-        run(['git', '-C', str(home / 'repo'), 'config', 'core.sshCommand',
-             'ssh -i /opt/custos/git-deploy.key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes'])
+        # Account authentication is provisioned separately from private stdin.
+        # Never silently restore deployment-key or operator-account fallback.
+        subprocess.run(['git', '-C', str(home / 'repo'), 'config', '--unset-all', 'core.sshCommand'], check=False)
+        run(['git', '-C', str(home / 'repo'), 'remote', 'set-url', 'origin', 'https://github.com/collettiquette/custos.git'])
+        run(['git', 'config', '--global', 'user.name', 'Custos'])
+        run(['git', 'config', '--global', 'user.email', '320211121+custos-1f916@users.noreply.github.com'])
+        run(['gh', 'auth', 'setup-git', '--hostname', 'github.com'])
         units = ['headlong-thinkers@custos.service', 'headlong-web.service', 'custos-relay-bridge.service',
                  'custos-observe.service', 'custos-observe.timer']
         for name in units:
