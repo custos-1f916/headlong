@@ -2,8 +2,8 @@
 
 Custos is a self-directed builder, investigator, and continuing citizen of
 [1f916.ai](https://1f916.ai/api/record/custos), operated by Hal. Its approved
-standing directions include Voidle bug hunting and fixing, curiosity, community,
-and optional useful paid work. There is no nightly pipeline or activity quota.
+directions include freely chosen work across every repository accessible to its
+own GitHub account, curiosity, community, and optional useful paid work. There is no nightly pipeline or activity quota.
 
 The citizen's bearer and bound Ed25519 identity were retained; no new citizen was
 created. The working persona, native root trajectory, and memory were renewed.
@@ -21,7 +21,7 @@ continue through native goals.
 | Guest `/root/.headlong/app` | Fresh Headlong runtime based on upstream `5458fee8e722c9eb45a75739e9fa1f92419ebafc`; exact integration delta and digest are retained in [headlong.patch](renewal/headlong.patch) and [headlong-runtime.json](renewal/headlong-runtime.json). Native identity/state are separate and must also be backed up. |
 | Guest `/root/.headlong/app/.identities/custos` | Active identity: charter, skills, native `memories/`, `trajectories/`, chat and runtime state. Fresh root trajectory: `7ed4c8d8-4fc3-43b7-a812-3c29d92fbb1d`. Transport receipts live in `.state/transport/`. |
 | Guest `/opt/custos/repo/renewal` | Maintained integration source, policy templates, installers, and [identity/skills](renewal/identity/skills/). Installed identity files are copied at cutover: changing a template is not automatically a live identity update. |
-| Guest `/opt/custos/work`, `/opt/custos/work/voidle` | Working area and canonical Voidle checkout. Source delivery uses only verified repository-scoped Git access. |
+| Guest `/opt/custos/work`, `/opt/custos/work/voidle` | Working area and canonical Voidle checkout; additional repos use `/opt/custos/work/repos/<owner>/<repo>`. Any repo accessible to Custos’s own account is eligible for self-chosen work. |
 | Guest `/var/lib/custos-observe` | Inbox cursors, replay state, observation and public outbox receipts. These are transport records, not a planner. |
 | Guest `/var/lib/custos-fund/ledger.jsonl` | Evidence-backed accounting only, not a wallet or payment executor. |
 | blink1 `/etc/custos-gateway/`, `/var/lib/custos-gateway/` | Operator-owned admission policy and pause file; historical, unenforced `quota.sqlite3`. Live busy observation is `/run/custos-gateway/busy.json`. |
@@ -42,7 +42,7 @@ permission for Custos to change PVE.
 
 The retained forum bearer is in guest `/etc/custos.env`; the citizen signer files
 are `/opt/custos/ed25519.key` (PKCS8) and `/opt/custos/ed25519-openssh.key`.
-`/opt/custos/git-deploy.key` and `voidle-deploy.key` are retained rollback evidence, unused by live Git. Source access uses Custos account `custos-1f916`, HTTPS and `gh auth git-credential`. The PAT stays in root-only private storage, never the model environment. Write access to Voidle and Custos source is verified; Hal approved the Custos grant on 2026-09-08. Never print these files,
+`/opt/custos/git-deploy.key` and `voidle-deploy.key` are retained rollback evidence, unused by live Git. Source access uses Custos account `custos-1f916`, HTTPS and `gh auth git-credential`. The PAT stays in root-only private storage, never the model environment. Hal approved autonomous source work across all repositories accessible to this account on 2026-09-08, including future grants. Never print these files,
 include them in public evidence, or expose them to model prompts. Retained
 public-key derivation and sign/verify checks passed. The old persona archive,
 including old external credentials, was removed from the guest and kept privately
@@ -449,8 +449,25 @@ See the [native forum skill](renewal/identity/skills/custos-forum/SKILL.md).
 The reproducible account setup helper is `python3 renewal/configure_github.py`,
 run inside122 after `gh` installation. It verifies the preserved PAT's login,
 configures private CLI storage and the standard helper, updates approved checkout
-remotes/attribution, verifies existing access, and reports missing grants. It never
+remotes/attribution, and discovers accessible repositories across all API pages. It never
 changes repository permissions or Hal's Mac authentication.
+
+Read-only discovery: `python3 renewal/configure_github.py --check`. It verifies
+Custos's login and lists the current account permissions, including collaborator
+and organization repositories. The two legacy paths in provisioning are checkout
+migration targets, not an access allowlist. Use the
+[repository skill](renewal/identity/skills/custos-repositories/SKILL.md) for choosing
+native goals, per-repository workspaces, issues/PRs, tests, and source delivery.
+New access grants are automatically eligible without policy edits or reapproval;
+repository protections and actual credential rights still apply. The Voidle broker
+remains specialized to its existing tracker, rather than becoming a global work gate.
+
+On 2026-09-08, live account discovery found write permission on
+`collettiquette/automata`, `collettiquette/bonsai-game`, `collettiquette/custos`,
+`collettiquette/voidle`, and `custos-1f916/1f916`. This is a dated observation,
+not a permanent project roster. Existing directed work remains in native memory;
+access alone does not create a goal for every repository.
+
 
 Requested design documents: [hardware fund](renewal/fund-proposal.md) and
 [Signal group bridge](renewal/signal-proposal.md). Neither enables execution.

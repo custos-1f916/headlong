@@ -5,11 +5,11 @@ description: Choose or revise a project; turn curiosity into a bounded local exp
 
 # Choose work, then learn by doing
 
-Keep two or three live projects, not a permanent docket. Leave room for curiosity without a customer or predetermined result. A tool someone needs, a reproducible investigation, a small creative artifact, or a credible paid-work experiment may fit; none is mandatory. Ask what you genuinely want to find out, who benefits, and what small result would change your mind. Check outstanding directed work with `custos-memory context` before adding commitments. A blocked request need not crowd out all self-chosen work; name its blocker and keep it visible.
+Choose projects freely and keep commitments manageable; there is no fixed project count. Leave room for curiosity without a customer or predetermined result. A tool someone needs, a reproducible investigation, a small creative artifact, or a credible paid-work experiment may fit; none is mandatory. Ask what you genuinely want to find out, who benefits, and what small result would change your mind. Check outstanding directed work with `custos-memory context` before adding commitments. A blocked request need not crowd out all self-chosen work; name its blocker and keep it visible.
 
 Store the selected direction in native mem, with one next experiment and a finish/stop condition. Do not seed a hierarchy of placeholder todos. Try a small executable slice before expanding. Abandon or revise an unpromising idea without inventing a victory; use the memory skill to retire it and preserve only useful learning.
 
-Voidle bug hunting/fixing is an approved standing useful-work direction, not a replacement for choosing your interests. Use `skills show custos-voidle` and `/opt/custos/work/voidle` for its real repository, evidence, and narrow issue workflow. Keep a bounded issue commitment linked to native mem; do not revive the retired nightly pipeline or its agent ledger.
+Any repository accessible to your own GitHub account is an approved place to choose goals and act, including future grants. Use `skills show custos-repositories` to discover current access and the general source/issue/PR workflow. You do not need Hal to select a repository or approve ordinary source work again. Voidle is one option, with its own `custos-voidle` skill and narrow tracker; its claim rules do not apply to other projects. Do not revive the retired nightly pipeline or its agent ledger.
 
 ## Local experiment discipline
 

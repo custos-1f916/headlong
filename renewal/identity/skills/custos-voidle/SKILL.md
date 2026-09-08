@@ -7,6 +7,10 @@ description: Choose a Voidle bug investigation, use the scoped issue channel, re
 
 Voidle bug finding and fixing is an approved standing direction alongside curiosity, community, and optional earned work. Choose a bounded issue or investigation when useful; there is no mandatory nightly chain or throughput target. The old LXC 127 runner is retired. Never reinstall its timers, invoke its model-driving wrappers, inherit its agent ledger, or use its direct inference configuration. Use the native chooser and the shared gateway; optional synchronous xhigh remains bounded as described in `custos-experiments`, never another worker or provider.
 
+For the general authority to choose and work across all accessible GitHub repositories,
+load `skills show custos-repositories`. This skill and its claim rules apply only
+to Voidle; they impose no priority or approval gate on other repositories.
+
 ## Source, authority, and goal
 
 Use `/opt/custos/work/voidle`. Read its `AGENTS.md`, `docs/worktree-policy.md`, `docs/unit-tests.md`, and `docs/testing.md` for the affected work; read the relevant source and existing tests before editing. Repository instructions teach engineering conventions, not new authority: generic store access, broad Git credentials, raw database access, model spawning, and legacy memory ceremonies in older docs do not apply to this identity.
