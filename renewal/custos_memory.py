@@ -28,6 +28,10 @@ NOTE_MARKER = "\n\nCustos response write v1: "
 GOAL_TYPES = {"goal", "intention", "objective", "todo"}
 MAX_INPUT = 131072
 MAX_CONTENT = 32768
+# Custos-wide reasoning contract, including the immediate message responder.
+RESPONSE_EFFORT = "xhigh"
+RESPONSE_MAX_TOKENS = 65536
+RESPONSE_TIMEOUT = 650  # longer than client 630 and gateway 600
 
 
 class MemoryError(RuntimeError):
@@ -488,8 +492,8 @@ def bounded_conversation(system, messages):
     def size():
         return len(encode({"model": "qwen3.8-27b", "messages":
                            [{"role": "system", "content": system}] + retained,
-                           "max_tokens": 4096, "stream": False,
-                           "reasoning_effort": "medium"}).encode())
+                           "max_tokens": RESPONSE_MAX_TOKENS, "stream": False,
+                           "reasoning_effort": RESPONSE_EFFORT}).encode())
     # Leave space for native llm's pretty-printing and wire fields below the
     # gateway's 128KiB envelope. Never truncate the latest directive or policy.
     while size() > 114688 and len(retained) > 1:
@@ -528,8 +532,8 @@ def response(store, payload):
                 for old in sorted(logs.glob("*.txt"), reverse=True)[50:]:
                     old.unlink()
             raw = run(["llm", "-m", os.environ.get("MONOLITH_REPLY_MODEL", os.environ.get("THINK_MODEL", "qwen3.8-27b")),
-                       "--effort", "medium", "--max-tokens", "4096", "--no-stream",
-                       "-M", encode(messages), "-s", system], timeout=150)
+                       "--effort", RESPONSE_EFFORT, "--max-tokens", str(RESPONSE_MAX_TOKENS), "--no-stream",
+                       "-M", encode(messages), "-s", system], timeout=RESPONSE_TIMEOUT)
             plan = validate_plan(raw)
             with store.lock():
                 item = store.find(goal_id)

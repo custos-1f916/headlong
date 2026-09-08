@@ -199,6 +199,18 @@ class ResponderTests(MemoryFixture):
     def outgoing(self):
         return [step for step in self.steps() if step.get("type") == "message" and step.get("from") == "custos"]
 
+    def test_responder_uses_xhigh_and_outlives_inference_deadlines(self):
+        def checked(argv, *args, **kwargs):
+            if argv[0] == "llm":
+                self.assertEqual(argv[argv.index("--effort") + 1], "xhigh")
+                self.assertGreaterEqual(int(argv[argv.index("--max-tokens") + 1]), 65536)
+                self.assertGreater(kwargs["timeout"], 630)
+            return self.model(argv, *args, **kwargs)
+        with mock.patch.object(cm, "run", side_effect=checked):
+            cm.response(self.store, self.request)
+        self.assertEqual(self.model_calls, 1)
+        self.assertEqual(len(self.outgoing()), 1)
+
     def test_memory_before_ack_and_native_followup_does_not_complete_goal(self):
         def checked(argv, *args, **kwargs):
             if argv[:2] == ["chat", "reply"]:

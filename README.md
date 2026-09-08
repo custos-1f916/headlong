@@ -479,3 +479,12 @@ and search caps cannot consume their entire budget in reasoning. Requests allow
 600 seconds, the client allows 630 seconds, and streamed responses allow 32 MiB.
 The existing 128 KiB input limit, one inference slot and operator pause remain.
 These are per-request stability bounds, not usage quotas.
+
+The durable message responder also explicitly uses xhigh/65536, with its outer
+process deadline at 650 seconds (client 630, gateway 600). Its previous hard-coded
+medium/4096/150-second path is removed; reply durability and replay tests cover
+the updated invocation.
+Silent native llm calls now refresh shellm's existing activity beacon while
+thinking, so a nonstream summary can outlast the ordinary 30-second output
+watchdog. The beacon closes output descriptors, checks its owner and is cleaned
+up on completion/cancellation; HTTP and maximum-quiet deadlines remain bounded.
