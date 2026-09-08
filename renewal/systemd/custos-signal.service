@@ -17,7 +17,7 @@ RuntimeDirectoryMode=0700
 EnvironmentFile=/etc/custos-signal/account.env
 Environment=JAVA_HOME=/opt/custos-signal/java25
 Environment=JAVA_OPTS=-Xmx512m
-ExecStart=/opt/custos-signal/jvm/bin/signal-cli --scrub-log --config /var/lib/custos-signal/data --account ${SIGNAL_ACCOUNT} daemon --socket /run/custos-signal/socket --receive-mode manual --no-receive-stdout --ignore-attachments --ignore-stories --ignore-avatars --ignore-stickers
+ExecStart=/opt/custos-signal/jvm/bin/signal-cli --scrub-log --config /var/lib/custos-signal/data --account ${SIGNAL_ACCOUNT} daemon --socket /run/custos-signal/socket --receive-mode manual --no-receive-stdout --ignore-stories --ignore-avatars --ignore-stickers
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=30

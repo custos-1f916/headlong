@@ -16,6 +16,7 @@ from pathlib import Path
 import signal
 import stat
 import time
+from custos_images import inline_jpeg, MAX_IMAGES
 
 UPSTREAM = ("192.168.86.117", 8080)
 MODEL = "qwen3.8-27b"
@@ -90,6 +91,8 @@ def payload(raw, max_tokens):
         messages = value.get("messages")
         if not isinstance(messages, list) or not 1 <= len(messages) <= 128:
             raise ValueError("invalid messages")
+        image_count = 0
+        text_bytes = 0
         for message in messages:
             if not isinstance(message, dict) or set(message) - {"role", "content", "name", "tool_calls", "tool_call_id"}:
                 raise ValueError("unsupported message")
@@ -97,14 +100,25 @@ def payload(raw, max_tokens):
                 raise ValueError("unsupported role")
             content = message.get("content")
             if isinstance(content, list):
-                # Deliberately text-only: upstream URL-bearing vision/audio inputs
-                # would turn even a fixed-host proxy into a server-side fetch surface.
-                if not all(isinstance(part, dict) and set(part) == {"type", "text"}
-                           and part["type"] == "text" and isinstance(part["text"], str)
-                           for part in content):
-                    raise ValueError("only inline text content is admitted")
+                for part in content:
+                    if not isinstance(part,dict):
+                        raise ValueError('invalid content part')
+                    if set(part)=={'type','text'} and part['type']=='text' and isinstance(part['text'],str):
+                        text_bytes += len(part['text'].encode())
+                    elif (set(part)=={'type','image_url'} and part['type']=='image_url' and
+                          message['role']=='user' and isinstance(part['image_url'],dict) and
+                          set(part['image_url'])=={'url'}):
+                        inline_jpeg(part['image_url']['url'])
+                        image_count += 1
+                        if image_count > MAX_IMAGES: raise ValueError('too many images')
+                    else:
+                        raise ValueError('only inline text and bounded embedded JPEG images are admitted')
             elif content is not None and not isinstance(content, str):
                 raise ValueError("invalid content")
+            elif isinstance(content,str):
+                text_bytes += len(content.encode())
+        if text_bytes > 131072:
+            raise ValueError('text exceeds admitted envelope')
         return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
     except (ValueError, TypeError, RecursionError, OverflowError):
         raise Denied(400, "invalid_completion_request") from None
@@ -414,7 +428,7 @@ def load_policy(path):
         raise ValueError("policy keys do not match required schema")
     bounds = {"request_seconds": 600,
               "max_tokens": 65536, "max_connections": 16, "max_header_bytes": 16384,
-              "max_body_bytes": 131072, "max_response_bytes": 33554432, "header_timeout_seconds": 5,
+              "max_body_bytes": 4194304, "max_response_bytes": 33554432, "header_timeout_seconds": 5,
               "body_timeout_seconds": 5, "connect_timeout_seconds": 3, "io_timeout_seconds": 5,
               "busy_max_age_seconds": 5}
     for key, maximum in bounds.items():

@@ -30,6 +30,22 @@ def reaction(sender=HAL, target=BOT, stamp=98765, removed=False, **changes):
 
 
 class SignalPolicyTests(unittest.TestCase):
+    def test_image_only_and_caption_preserve_direct_and_ambient_routing(self):
+        image={'contentType':'image/png','id':'12345','size':1234}
+        dm=cs.classify(envelope(message=None,attachments=[image]),POLICY)
+        self.assertTrue(dm['directed']); self.assertEqual(len(dm['image_attachments']),1)
+        group=cs.classify(envelope(message=None,attachments=[image],groupInfo={'groupId':'agreed-group'}),POLICY)
+        self.assertFalse(group['directed'])
+        group=cs.classify(envelope(message='Custos, describe this',attachments=[image],groupInfo={'groupId':'agreed-group'}),POLICY)
+        self.assertTrue(group['directed'])
+        self.assertIsNone(cs.classify(envelope(STRANGER,message=None,attachments=[image]),POLICY))
+        self.assertIsNone(cs.classify(envelope(message=None,attachments=[image],viewOnce=True),POLICY))
+
+    def test_image_attachment_limits_are_not_silently_presented_as_seen(self):
+        image={'contentType':'image/png','id':'../../secret','size':1234}
+        item=cs.classify(envelope(message=None,attachments=[image]),POLICY)
+        self.assertNotIn('image_attachments',item)
+        self.assertIn('unavailable',item['body'])
     def test_reactions_are_ambient_in_dm_and_group_including_removals(self):
         for group in (None, {'groupId': 'agreed-group'}):
             for removed in (False, True):
@@ -106,6 +122,25 @@ class SignalPolicyTests(unittest.TestCase):
 
 
 class SignalSpoolTests(unittest.TestCase):
+    def test_image_request_is_prepared_once_and_replayed_after_transport_failure(self):
+        image={'contentType':'image/png','id':'12345','size':3}
+        self.spool.receive(cs.classify(envelope(message='Look',attachments=[image]),POLICY))
+        bridge=cs.Bridge(self.policy_path,self.spool); bridge.rpc=mock.Mock()
+        bridge.rpc.call.return_value={'data':'YWJj'}
+        calls=[]
+        def transport(args,content=''):
+            if args[0]=='send':
+                calls.append(content)
+                self.assertIn('--media',args)
+                if len(calls)==1: raise RuntimeError('interrupted after native capture')
+                return {'queued':True}
+            return {'events':[],'trajectory':'one','offset':0}
+        with mock.patch.object(cs,'paused',return_value=False),mock.patch.object(cs,'transport',side_effect=transport):
+            with self.assertRaises(RuntimeError): bridge.tick()
+            bridge.rpc.call.side_effect=AssertionError('attachment must not be fetched again')
+            bridge.tick()
+        self.assertEqual(calls[0],calls[1])
+        self.assertEqual(self.spool.db.execute('SELECT prepared FROM inbox').fetchone()[0],None)
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

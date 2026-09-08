@@ -232,6 +232,37 @@ class ResponderTests(MemoryFixture):
         self.assertEqual(self.outgoing()[0]['reaction'],'👍🏽')
         self.assertEqual(self.outgoing()[0]['reply_to'],'trigger-1')
 
+    def test_image_pixels_use_message_file_and_memory_keeps_only_refs(self):
+        import base64, io
+        import PIL
+        from PIL import Image
+        from custos_images import import_images, image_dir
+        out=io.BytesIO(); Image.new('RGB',(20,20),'blue').save(out,format='PNG')
+        # This fixture replaces HOME; keep a developer's user-site Pillow
+        # discoverable by the isolated decoder (Linux uses system Pillow).
+        with mock.patch.dict(os.environ,{'PYTHONPATH':str(Path(PIL.__file__).parent.parent)}):
+            refs,errors=import_images([base64.b64encode(out.getvalue()).decode()])
+        self.assertEqual(errors,[])
+        self.envelope['images']=refs
+        self.log.write_text(cm.encode(self.envelope)+'\n')
+        self.plan={'decision':'reply','reply':'A blue square.','goal':None,'memories':[]}
+        seen=[]
+        def model(argv,*args,**kwargs):
+            if argv[0]=='llm':
+                self.assertNotIn('-M',argv)
+                path=Path(argv[argv.index('--messages-file')+1]); seen.append(path)
+                messages=json.loads(path.read_text())
+                self.assertEqual(messages[-1]['content'][1]['type'],'image_url')
+                self.assertTrue(messages[-1]['content'][1]['image_url']['url'].startswith('data:image/jpeg;base64,'))
+            return self.model(argv,*args,**kwargs)
+        with mock.patch.object(cm,'run',side_effect=model):
+            cm.response(self.store,self.request)
+        self.assertFalse(seen[0].exists())
+        record=self.store.request('operator:42')[4]
+        self.assertEqual(record['origin']['images'],refs)
+        self.assertNotIn('data:image',cm.encode(record))
+        self.assertNotIn('base64',self.log.read_text())
+
     def test_reaction_requires_transport_capability_and_one_emoji(self):
         self.plan = {'reply':'👍','decision':'react','goal':None,'memories':[]}
         with mock.patch.object(cm,'run',side_effect=self.model), self.assertRaises(cm.InvalidInput):

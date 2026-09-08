@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from custos_images import MAX_UPLOAD, import_images, validate_refs
 
 
 def atomic_json(path, value):
@@ -67,7 +68,7 @@ def contains_step(trajectory, step_id):
     return False
 
 
-def send(args, content):
+def send(args, content, images=None):
     if not content.strip() or len(content.encode()) > 32768:
         raise ValueError('message must contain 1..32768 UTF-8 bytes')
     if not args.request_id or len(args.request_id) > 512 or len(args.sender) > 160:
@@ -81,6 +82,8 @@ def send(args, content):
             original['ambient'] = True
         if getattr(args, 'allow_reaction', False):
             original['allow_reaction'] = True
+        if images:
+            original['images'] = validate_refs(images)
         if receipt.exists():
             record = json.loads(receipt.read_text())
             if record['original'] != original:
@@ -105,6 +108,8 @@ def send(args, content):
                     event['ambient'] = True
                 if original.get('allow_reaction'):
                     event['allow_reaction'] = True
+                if original.get('images'):
+                    event['images'] = original['images']
                 native(['traj', 'append', root], json.dumps(event))
                 with trajectory.open('rb') as source:
                     os.fsync(source.fileno())
@@ -190,7 +195,7 @@ def reconcile():
         args.ambient = original.get('ambient', False)
         args.allow_reaction = original.get('allow_reaction', False)
         try:
-            send(args, original['content'])
+            send(args, original['content'], original.get('images'))
             retried.append(original['request_id'])
         except (ValueError, OSError, RuntimeError, subprocess.TimeoutExpired):
             failed.append(original['request_id'])
@@ -209,6 +214,7 @@ def main():
     put.add_argument('--source-url', default='')
     put.add_argument('--ambient', action='store_true', help='Observed conversation, not a directed task')
     put.add_argument('--allow-reaction', action='store_true', help='Host can deliver an emoji reaction to this message')
+    put.add_argument('--media', action='store_true', help='Read text and bounded base64 images from stdin JSON')
     get = commands.add_parser('poll')
     get.add_argument('--request-id', required=True)
     outgoing = commands.add_parser('outbox')
@@ -219,7 +225,16 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == 'send':
-            result = send(args, sys.stdin.read(32769))
+            if args.media:
+                raw=sys.stdin.read(MAX_UPLOAD+1)
+                if len(raw)>MAX_UPLOAD: raise ValueError('image transfer too large')
+                media=json.loads(raw)
+                if not isinstance(media,dict) or set(media)!={'content','images'} or not isinstance(media['content'],str):
+                    raise ValueError('invalid image transfer')
+                refs,errors=import_images(media['images'])
+                result=send(args, media['content'] + ('\n'+'\n'.join(errors) if errors else ''), refs)
+            else:
+                result = send(args, sys.stdin.read(32769))
         elif args.command == 'outbox':
             result = outbox(args)
         elif args.command == 'reconcile':

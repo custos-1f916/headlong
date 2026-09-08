@@ -301,7 +301,7 @@ class WireTests(unittest.IsolatedAsyncioTestCase):
             status, _, _ = await self.response(path, "GET")
             self.assertEqual(status, 404)
         for raw, expected in ((b"POST /v1/chat/completions HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", 400),
-                              (b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 131073\r\n\r\n", 413),
+                              (b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 4194305\r\n\r\n", 413),
                               (b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\n", 400)):
             status, _, _ = await self.response(raw=raw)
             self.assertEqual(status, expected)

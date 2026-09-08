@@ -19,8 +19,9 @@ import subprocess
 import time
 import uuid
 from custos_reactions import valid_emoji
+from custos_images import MAX_IMAGES, MAX_RAW, MAX_TOTAL_RAW
 
-MAX_FRAME = 262144
+MAX_FRAME = 12 * 1024 * 1024  # one bounded attachment RPC response
 MAX_TEXT = 12000
 
 
@@ -70,6 +71,22 @@ def classify(envelope, policy):
         return None
     body = message.get('message')
     reaction = message.get('reaction')
+    attachments = message.get('attachments') or []
+    if not isinstance(attachments,list):
+        return None
+    images=[]
+    for attachment in attachments[:MAX_IMAGES]:
+        if (isinstance(attachment,dict) and attachment.get('contentType') in
+                ('image/jpeg','image/png','image/webp','image/gif') and
+                isinstance(attachment.get('id'),str) and re.fullmatch(r'[A-Za-z0-9_-]{1,160}',attachment['id']) and
+                type(attachment.get('size')) is int and 0 < attachment['size'] <= MAX_RAW):
+            images.append({'id':attachment['id'],'size':attachment['size'],'mime':attachment['contentType']})
+    if images and reaction is None and body in (None,''):
+        body='[Image attached]' if len(images)==1 else '[Images attached]'
+    image_count=sum(isinstance(a,dict) and isinstance(a.get('contentType'),str) and
+                    a['contentType'].startswith('image/') for a in attachments)
+    if image_count>len(images) and reaction is None:
+        body=(body or '')+'\n[Some image attachments are unavailable: unsupported format, too large, or more than four images.]'
     stamp = message.get('timestamp')
     if not isinstance(stamp, int) or isinstance(stamp, bool) or stamp <= 0:
         return None
@@ -116,8 +133,9 @@ def classify(envelope, policy):
             'conversation': conversation, 'route': route, 'group': group,
             'authority': person['authority'], 'label': person['label'], 'body': body,
             'directed': directed,
+            **({'image_attachments':images} if images and reaction is None else {}),
             **({'reaction': reaction, 'self_aci': policy['self_aci']} if reaction is not None else {}),
-            'digest': hashlib.sha256(body.encode()).hexdigest()}
+            'digest': hashlib.sha256((encoded({'body':body,'images':images}) if images else body).encode()).hexdigest()}
 
 
 def allowed(item, policy):
@@ -160,6 +178,8 @@ class Spool:
         ''')
         if 'reaction' not in {row[1] for row in self.db.execute('PRAGMA table_info(outbox)')}:
             self.db.execute('ALTER TABLE outbox ADD COLUMN reaction TEXT')
+        if 'prepared' not in {row[1] for row in self.db.execute('PRAGMA table_info(inbox)')}:
+            self.db.execute('ALTER TABLE inbox ADD COLUMN prepared TEXT')
         # A crash after send started cannot safely be retried without reconciliation.
         with self.db:
             self.db.execute("UPDATE outbox SET phase='uncertain' WHERE phase='sending'")
@@ -207,7 +227,7 @@ class Spool:
                 item = json.loads(row['payload'])
                 if (item['sender_aci'], item['timestamp'], item['group']) == (sender, target, group):
                     item['body'] = '[Deleted on Signal]'
-                    self.db.execute("UPDATE inbox SET phase='deleted',payload=? WHERE id=?",
+                    self.db.execute("UPDATE inbox SET phase='deleted',payload=?,prepared=NULL WHERE id=?",
                                     (encoded(item), row['id']))
                     self.db.execute("UPDATE outbox SET phase='deleted',content='' WHERE request_id=? AND phase='pending'",
                                     (row['id'],))
@@ -285,7 +305,8 @@ def transport(args, content=''):
                'source /root/.headlong/app/.identities/custos/activate >/dev/null 2>&1; '
                'exec /usr/bin/python3 /opt/custos/repo/renewal/custos_transport.py "$@"',
                'custos-signal', *args]
-    result = subprocess.run(command, input=content, text=True, capture_output=True, timeout=40)
+    result = subprocess.run(command, input=content, text=True, capture_output=True,
+                            timeout=120 if '--media' in args else 40)
     if result.returncode or len(result.stdout.encode()) > 2097152:
         raise RuntimeError('native transport unavailable')
     return json.loads(result.stdout)
@@ -322,6 +343,28 @@ class Bridge:
         groups = self.rpc.call('listGroups', {'detailed': True})
         return any(g.get('id') == item['group'] and safe_group(g, self.policy) for g in groups)
 
+    def prepare_images(self, item):
+        images, failures, total = [], [], 0
+        for attachment in item.get('image_attachments',[]):
+            if total + attachment['size'] > MAX_TOTAL_RAW:
+                failures.append('An image exceeded the attachment transfer limit.')
+                continue
+            params={'id':attachment['id']}
+            params.update({'groupId':item['group']} if item['group'] else {'recipient':item['sender_aci']})
+            try:
+                result=self.rpc.call('getAttachment',params)
+                data=result.get('data') if isinstance(result,dict) else None
+                if not isinstance(data,str) or len(data)>MAX_RAW*4//3+8:
+                    raise ValueError('invalid image attachment response')
+                # Count actual encoded bytes too; sender-declared sizes are not
+                # sufficient to bound the combined transfer.
+                size=len(data)*3//4
+                if total+size>MAX_TOTAL_RAW: raise ValueError('images exceed total transfer limit')
+                total+=size; images.append(data)
+            except (RuntimeError,ValueError):
+                failures.append('An attached image could not be retrieved.')
+        return images,failures
+
     def tick(self):
         self.policy = load_policy(self.policy_file)
         db = self.spool.db
@@ -343,13 +386,31 @@ class Bridge:
             content += ('\nParticipation: ambient conversation; observe and usually stay silent. '
                         'Join briefly only when you add clear value. This is not automatically a task.'
                         if ambient else '\nParticipation: you were addressed directly; respond to the speaker.')
-            receipt = transport(['send', '--sender', item['route'], '--authority', item['authority'],
+            if row['prepared']:
+                prepared=json.loads(row['prepared'])
+            else:
+                image_data,failures=self.prepare_images(item)
+                if failures: content+='\n'+'\n'.join(failures)
+                prepared={'media':bool(image_data),'content':
+                          encoded({'content':content,'images':image_data}) if image_data else content}
+                # Persist the exact wire request before intake so a crash after
+                # native capture replays identically even if retrieval changes.
+                with db:
+                    db.execute('UPDATE inbox SET prepared=? WHERE id=? AND phase=\'pending\'',
+                               (encoded(prepared),row['id']))
+            args=['send', '--sender', item['route'], '--authority', item['authority'],
                                  '--request-id', item['request_id'], '--source-url', item['request_id']]
-                                + (['--ambient'] if ambient else [])
-                                + ([] if item.get('reaction') else ['--allow-reaction']), content)
+            args+=(['--ambient'] if ambient else [])+([] if item.get('reaction') else ['--allow-reaction'])
+            if prepared['media']:
+                args+=['--media']
+            content=prepared['content']
+            # RPC reception can admit a remote delete while retrieving images.
+            if db.execute('SELECT phase FROM inbox WHERE id=?',(row['id'],)).fetchone()[0]!='pending':
+                continue
+            receipt = transport(args, content)
             if receipt.get('queued'):
                 with db:
-                    db.execute("UPDATE inbox SET phase='queued',receipt=? WHERE id=? AND phase='pending'",
+                    db.execute("UPDATE inbox SET phase='queued',receipt=?,prepared=NULL WHERE id=? AND phase='pending'",
                                (encoded(receipt), row['id']))
         routes = {json.loads(r['payload'])['route'] for r in
                   db.execute("SELECT payload FROM inbox WHERE phase='queued'")}

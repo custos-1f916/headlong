@@ -58,8 +58,9 @@ a human read the message. Any partial send or crash during sending becomes
 
 The guest operator-pause marker suspends intake into memory and outbound sends;
 incoming allowed messages can still be spooled. Changing the host allowlist
-revokes pending delivery. The daemon ignores attachments, avatars, stories and
-stickers; ephemeral/view-once content is excluded from model intake. Message
+revokes pending delivery. The daemon downloads attachments; the bridge admits only allowed conversations
+and supported bounded images. Avatars, stories, stickers and ephemeral/view-once
+content remain excluded from model intake. Message
 edits are ignored. Remote deletion cancels matching queued spool work but does
 not erase an already-captured native memory. The spool has no automatic aging.
 
@@ -97,3 +98,37 @@ SQLite outbox gains a nullable reaction column without dropping existing rows.
 Both host bridge modules (`custos_signal.py`, `custos_reactions.py`) must be
 installed together. Emoji validation supports common Unicode emoji, modifiers,
 ZWJ sequences, flags and keycaps; malformed/text payloads fail closed.
+
+
+## Incoming images
+
+JPEG, PNG, WebP and GIF images in allowed DMs/group messages can reach Qwen's
+vision input. Image-only DMs are direct requests; unaddressed group pictures are
+ambient context. Captions, addressing and emoji-reaction capability are retained.
+Up to four images per message, 8 MiB each and 16 MiB combined, are transferred
+from signal-cli's private `getAttachment` RPC. Other image formats/over-limit
+attachments are marked unavailable; errors do not become claims of seeing them.
+
+Install `python3-pil` inside LXC122 (already present on the live guest). A separate
+CPU/time/address-space-bounded subprocess decodes at most 25 million source
+pixels, applies EXIF orientation, takes the first animated frame, removes
+metadata including GPS, and produces JPEG at most 1600 pixels on either edge
+and 512 KiB. Originals downloaded by signal-cli stay outside the guest; only
+approved image transfers reach the guest decoder. Disallowed-message attachments
+can still be downloaded by signal-cli, since its download flag is account-wide.
+There is no attachment aging policy yet; monitor private account storage.
+
+Normalized files live in the identity's `.state/signal-images/<sha256>.jpg`.
+Native memory and trajectory retain only image references and text. Images are
+reattached to the current message for the responder using a temporary private
+`llm --messages-file` payload; no image base64 enters command arguments, prompt
+logs or searchable native memory. Correlation uses the exact incoming directive.
+
+The gateway's total body bound is 4 MiB, with the original 128 KiB text-content
+bound. It admits at most four embedded JPEG data URLs with validated size and
+bounded JPEG dimensions; remote/file URLs remain rejected. Queue fairness,
+xhigh/65536, one inference slot and the 600-second total timeout remain intact.
+Install `custos_images.py` beside gateway, host bridge and native memory/transport.
+Prepared image transfers persist in the private SQLite spool until native intake
+is acknowledged, so a crash replays the identical request. Normalized files are
+retained for native request recovery; outgoing image delivery is not enabled.
