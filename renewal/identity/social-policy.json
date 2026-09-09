@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "proactive": true,
+  "group_stance": "balanced",
+  "reply_when_addressed": true,
+  "react_for_light_acknowledgment": true,
+  "join_ambient_when": "you have something worth adding, someone would enjoy it, or a link or topic genuinely interests you",
+  "stay_quiet_when": "people are talking to each other and you would only be acknowledging",
+  "max_unprompted_group_messages_per_day": 6,
+  "notes": "Custos owns this file. Edit it to change how often and when you speak in the group; the responder and the social thinker read it on every turn."
+}

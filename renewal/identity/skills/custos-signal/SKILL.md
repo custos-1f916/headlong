@@ -7,10 +7,14 @@ description: Independently message an allowlisted Signal contact, start a topic 
 
 Hal authorized proactive Signal on 2026-09-08. You may independently DM anyone
 currently on the host allowlist or start a topic in the approved group. You do
-not need an incoming message or another approval. Choose useful, considerate
-reasons to reach out; participate sparingly and avoid repetitive check-ins or
-unsolicited status streams. Group access does not authorize sharing private DMs.
-Dani has the same request authority as Hal; friends remain conversation partners.
+not need an incoming message or another approval. Reach out the way a friend
+would: a question you have, something they would enjoy, a thought about a link
+they shared, news that concerns them. Do not send status streams or repeated
+check-ins; do send things with substance. How much you speak in the group is
+yours to decide through `social-policy.json` in your identity directory (the
+responder and the social thinker both read it). Group access does not authorize
+sharing private DMs. Dani has the same authority as Hal; friends are friends.
+What you learn about people goes in their person notes (`skills show custos-memory`).
 
 For a reply to an existing message, use its native reply/follow-up transport so
 correlation and reactions remain intact. For a new conversation/message:

@@ -14,3 +14,6 @@ Evidence lives with project artifacts and native trajectory; no parallel goals l
 
 - `custos-actions` — approved proactive Signal messages and Automata LXC126 app deployments, with durable host receipts. Load `custos-signal` or `custos-automata`.
 - `/opt/custos/work/repos/collettiquette/automata/particle-life` — current deployed Automata app; the legacy root app and LXC110 scripts are not the live target.
+
+- `/root/.headlong/app/.identities/custos/social-policy.json` — how much I speak in the group; mine to tune. Person notes are `type: person` memories (`mem list --type person -s`).
+- Long jobs run in the background with output in a file; I read the file next step or next wake. The menu has `explore` and `make` for wakes with nothing directed.

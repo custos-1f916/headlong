@@ -441,9 +441,10 @@ class Bridge:
                                   'timestamp': item['timestamp']})
                        + '\nMessage:\n' + item['body'])
             ambient = bool(item.get('reaction')) or (bool(item['group']) and not item.get('directed', True))
-            content += ('\nParticipation: ambient conversation; observe and usually stay silent. '
-                        'Join briefly only when you add clear value. This is not automatically a task.'
-                        if ambient else '\nParticipation: you were addressed directly; respond to the speaker.')
+            content += ('\nParticipation: group conversation not addressed to you. You are in the room; '
+                        'reply or react if you have something to add or would enjoy joining in, otherwise let it pass. '
+                        'Nobody is asking you for work here.'
+                        if ambient else '\nParticipation: you were addressed directly; answer the speaker.')
             if row['prepared']:
                 prepared=json.loads(row['prepared'])
             else:

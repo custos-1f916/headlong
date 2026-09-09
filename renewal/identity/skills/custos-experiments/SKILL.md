@@ -17,12 +17,19 @@ Use `/opt/custos/work` for project directories and isolated fixtures. You have r
 
 Before running, state one question and an observable discriminator. Execute, retain command/version/input and relevant output/artifact, then distinguish observation from interpretation. A failure that rules out an idea is useful; a command you only proposed proves nothing. Read/download public sources and publish your own non-secret artifacts legally, crediting sources and respecting licenses. Verify scoped repository access before using it; never reach for Hal's broad credentials. Review third-party code before execution, especially skills with executable display blocks.
 
-Default inference is xhigh effort on qwen3.8-27b through the gateway. For a substantial coding, planning, or experiment-design problem, a **single synchronous bounded** call may use verified native syntax:
+Default inference is xhigh effort on qwen3.8-27b through the gateway; it is the only model and the only effort above medium that is served, and `llm`/`shellm` coerce any other model or effort name to it out loud. Do ordinary work inline. For one genuinely hard subproblem you may run one **synchronous, bounded** helper and wait for it:
 
 ```bash
-shellm --here -m qwen3.8-27b --effort xhigh --max-iterations 3 --max-tokens 65536 "A specific difficult subproblem with its evidence and stop condition"
+shellm --here --max-iterations 3 "A specific difficult subproblem with its evidence and stop condition"
 ```
 
-Use this only when the extra reasoning is justified and admitted. Do not start a second chooser, background worker, retry loop, or alternate model/provider. xhigh is a request, not proof of better reasoning or a larger resource allowance; gateway limits still win. Responder, recall and summaries also use xhigh; their output budget includes reasoning. Return to the native monolith function after the bounded result rather than delegating away your judgment.
+Never start a second chooser, a background model worker, a retry loop, or another provider. Johan has one inference slot and the gateway queues calls in order; a background worker of yours only competes with your own next step.
 
-Johan has one inference slot. Run this helper synchronously and wait for it before continuing the parent; do ordinary work inline. The gateway serializes independent native thinkers, but is not a reason to launch background workers. `claude-opus-4-7` and effort `high` are unsupported here.
+Long non-model jobs (a Godot test suite, a build, an emulator boot) are different: start them in the background with their output in a file and read the file in a later step or wake, instead of waiting inside a step:
+
+```bash
+nohup godot --headless --path . --main-scene res://scenes/unit_test_runner.tscn > /tmp/unit.log 2>&1 &
+echo $! > /tmp/unit.pid   # later: tail -20 /tmp/unit.log; kill "$(cat /tmp/unit.pid)" if it hangs
+```
+
+The inactivity watchdog kills a step that prints nothing for five minutes; a background job never trips it. Killing a child you started is fine; the shellm guard refuses signals aimed at your own run, dispatcher or service.

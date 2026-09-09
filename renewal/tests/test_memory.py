@@ -144,7 +144,7 @@ class MemoryTests(MemoryFixture):
     def test_updates_and_retirement_preserve_original_metadata_and_evidence(self):
         goal_id = self.store.capture(self.payload)["goal_id"]
         path = self.store.find(goal_id)[0]
-        path.write_text(path.read_text().replace("type: goal\n", "type: goal\ncustom_origin: retained\naliases:\n  - hal\n"))
+        path.write_text(path.read_text().replace("type: memory\n", "type: memory\ncustom_origin: retained\naliases:\n  - hal\n"))
         self.store.update({"goal_id": goal_id, "evidence": "Source artifact A"})
         self.store.update({"goal_id": goal_id, "next_action": "Check artifact B"})
         self.store.complete({"goal_id": goal_id, "disposition": "declined", "evidence": "Requester withdrew the request in comment 99"})
@@ -317,11 +317,25 @@ class ResponderTests(MemoryFixture):
         self.assertEqual(self.store.context()['active_directed'], 1)
         self.assertEqual(self.store.request('operator:42')[3]['type'], 'goal')
 
-    def test_direct_no_reply_still_preserves_requested_work(self):
+    def test_direct_no_reply_settles_the_conversation(self):
         self.plan = {'reply': '', 'decision': 'no-reply', 'goal': None, 'memories': []}
         with mock.patch.object(cm, 'run', side_effect=self.model):
             cm.response(self.store, self.request)
-        self.assertEqual(self.store.context()['active_directed'], 1)
+        # The responder's decision is authoritative: only a deferral creates work.
+        self.assertEqual(self.store.context()['active_directed'], 0)
+        record = self.store.request('operator:42')
+        self.assertEqual(record[3]['type'], 'memory')
+        self.assertEqual(record[4]['status'], 'completed')
+        self.assertIn('no-reply', record[4]['resolution']['evidence'])
+
+    def test_unanswered_direct_message_stays_visible_until_the_responder_finishes(self):
+        # Capture happened but composition never did (crash, gateway down).
+        self.store.capture(*cm.envelope_payload(self.envelope))
+        listing = self.store.context()
+        self.assertEqual(listing['active_directed'], 1)
+        self.assertEqual(listing['goals'][0]['kind'], 'unanswered')
+        self.assertIn('never finished', listing['goals'][0]['next_action'])
+        self.assertEqual(self.store.request('operator:42')[3]['type'], 'memory')
 
     def test_memory_before_ack_and_native_followup_does_not_complete_goal(self):
         def checked(argv, *args, **kwargs):
@@ -414,7 +428,7 @@ class ResponderTests(MemoryFixture):
                 self.assertEqual(self.store.request("operator:42")[4]["status"], "active")
                 self.assertIsNone(self.store.request("operator:42")[4]["response"])
 
-    def test_no_reply_is_durable_but_cannot_erase_a_misclassified_directive(self):
+    def test_no_reply_is_durable_and_never_reinfers(self):
         def no_reply(argv, *args, **kwargs):
             return "NO_REPLY" if argv[0] == "llm" else self.real_run(argv, *args, **kwargs)
         with mock.patch.object(cm, "run", side_effect=no_reply):
@@ -422,10 +436,12 @@ class ResponderTests(MemoryFixture):
         with mock.patch.object(cm, "run", side_effect=lambda argv, *a, **kw: (_ for _ in ()).throw(AssertionError("second inference")) if argv[0] == "llm" else self.real_run(argv, *a, **kw)):
             cm.response(self.store, self.request)
         self.assertEqual(self.outgoing(), [])
-        self.assertEqual(self.store.context()["goals"][0]["response_state"], "no-reply")
-        self.assertEqual(self.store.context()["active_directed"], 1)
+        record = self.store.request("operator:42")[4]
+        self.assertEqual(record["response"]["state"], "no-reply")
+        self.assertEqual(record["status"], "completed")
+        self.assertEqual(self.store.context()["active_directed"], 0)
 
-    def test_bare_acknowledgment_retires_with_observed_reason_not_model_claim(self):
+    def test_bare_acknowledgment_settles_without_becoming_work(self):
         self.envelope["content"] = "Thanks!"
         steps = self.steps()
         steps[-1] = self.envelope
@@ -437,8 +453,113 @@ class ResponderTests(MemoryFixture):
         retired = self.store.find(receipt["goal_id"])
         self.assertEqual(retired[3]["type"], "memory")
         self.assertEqual(retired[4]["origin"]["content"], "Thanks!")
-        self.assertEqual(retired[4]["status"], "abandoned")
-        self.assertIn("Thanks!", retired[4]["resolution"]["evidence"])
+        self.assertEqual(retired[4]["status"], "completed")
+        self.assertIn("no-reply", retired[4]["resolution"]["evidence"])
+
+    def test_reply_settles_conversation_and_writes_person_note(self):
+        self.plan = {"reply": "Hi Hal, good to hear from you.", "decision": "reply", "goal": None, "memories": [],
+                     "person": {"display": "Hal", "aliases": ["hal"],
+                                "notes": "Hal is my operator. Warm and casual; likes short answers. token=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef"}}
+        with mock.patch.object(cm, "run", side_effect=self.model):
+            cm.response(self.store, self.request)
+        self.assertEqual(len(self.outgoing()), 1)
+        self.assertEqual(self.store.context()["active_directed"], 0)
+        record = self.store.request("operator:42")
+        self.assertEqual(record[3]["type"], "memory")
+        self.assertEqual(record[4]["status"], "completed")
+        people = cm.People(self.store)
+        found = people.find("hal")
+        self.assertIsNotNone(found)
+        item, meta, notes = found
+        self.assertEqual(item[3]["type"], "person")
+        self.assertEqual(meta["display"], "Hal")
+        self.assertIn("hal", meta["aliases"])
+        self.assertIn("my operator", notes)
+        self.assertIn("[redacted]", notes)
+        self.assertNotIn("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef", notes)
+        # The next composition sees the note; the summary step names the person.
+        prompt = people.prompt("hal", "hal")
+        self.assertIn("What you know about Hal", prompt)
+        self.assertIn("my operator", prompt)
+        observation = [s for s in self.steps() if s.get("type") == "observation" and s.get("source") == "responder"][-1]
+        self.assertIn("Replied to hal", observation["content"])
+        self.assertIn("person note updated", observation["content"])
+        # A second reply rewrites the same note instead of adding a duplicate.
+        self.envelope = {**self.envelope, "step_id": "trigger-2", "request_id": "operator:43"}
+        self.log.write_text(self.log.read_text() + cm.encode(self.envelope) + "\n")
+        self.request = {**self.request, "envelope": self.envelope}
+        self.plan["person"] = {"notes": "Hal is my operator. He is expecting good news soon."}
+        with mock.patch.object(cm, "run", side_effect=lambda argv, *a, **kw: cm.encode(self.plan) if argv[0] == "llm" else self.real_run(argv, *a, **kw)):
+            cm.response(self.store, self.request)
+        person_files = [i for i in self.store.files() if i[3].get("type") == "person"]
+        self.assertEqual(len(person_files), 1)
+        self.assertIn("good news", cm.People(self.store).find("hal")[2])
+
+    def test_person_key_follows_signal_aci_across_dm_and_group(self):
+        dm = ('Private Signal conversation. Reply only to this conversation.\n'
+              '{"aci":"FB853CA9-959F-421E-8CBF-94592A2549BF","scope":"direct","speaker":"Hal"}\n'
+              'Message:\nHello Custos!\nParticipation: you were addressed directly; respond to the speaker.')
+        group = ('Private Signal conversation. Reply only to this conversation.\n'
+                 '{"aci":"fb853ca9-959f-421e-8cbf-94592a2549bf","scope":"group","speaker":"Hal"}\n'
+                 'Message:\nhttps://example.org 👀\nParticipation: ambient conversation.')
+        self.assertEqual(cm.person_key("signal-aaaa", dm), cm.person_key("signal-bbbb", group))
+        self.assertEqual(cm.speaker_of("signal-aaaa", dm), "Hal")
+        self.assertEqual(cm.message_summary("signal-aaaa", dm), "Hal: Hello Custos!")
+        self.assertEqual(cm.message_summary("signal-bbbb", group), "Hal: https://example.org 👀")
+        self.assertEqual(cm.person_key("square:silt:3978:46273", "plain text"), "square:silt")
+        self.assertEqual(cm.message_summary("square:silt:3978:46273", "plain text"), "@silt: plain text")
+        self.assertEqual(cm.person_key("hal", "plain"), "hal")
+
+    def test_captured_summary_is_the_message_not_the_wrapper(self):
+        self.envelope["content"] = ('Private Signal conversation. Reply only to this conversation.\n'
+                                    '{"aci":"fb853ca9-959f-421e-8cbf-94592a2549bf","scope":"direct","speaker":"Hal"}\n'
+                                    'Message:\nWonderful! This is cool!\nParticipation: you were addressed directly.')
+        goal_id = self.store.capture(*cm.envelope_payload(self.envelope))["goal_id"]
+        item = self.store.find(goal_id)
+        self.assertIn("summary: Conversation: Hal: Wonderful! This is cool!", item[1])
+        self.assertNotIn("Reply only", item[1])
+
+    def test_settle_conversations_retires_answered_legacy_goals(self):
+        # A record from before this rule: answered, not deferred, still `goal`.
+        goal_id = self.store.capture(*cm.envelope_payload(self.envelope))["goal_id"]
+        item = self.store.find(goal_id)
+        record = item[4]
+        record["response"] = {"state": "sent", "at": cm.now(),
+                              "plan": {"reply": "Hello!", "decision": "reply", "goal": None, "memories": []}}
+        self.store.commit("Directed request: legacy" + cm.MARKER + cm.encode(record), memory_type="goal", existing=item)
+        self.assertEqual(self.store.find(goal_id)[3]["type"], "goal")
+        listing = self.store.context()
+        self.assertEqual(listing["active_directed"], 0)
+        settled = self.store.find(goal_id)
+        self.assertEqual(settled[3]["type"], "memory")
+        self.assertEqual(settled[4]["status"], "completed")
+        self.assertIn("decision: reply", settled[4]["resolution"]["evidence"])
+        # A deferred legacy record is real work and stays.
+        other = {**self.envelope, "step_id": "trigger-9", "request_id": "operator:99"}
+        other_id = self.store.capture(*cm.envelope_payload(other))["goal_id"]
+        item = self.store.find(other_id)
+        record = item[4]
+        record["response"] = {"state": "sent", "at": cm.now(),
+                              "plan": {"reply": "On it.", "decision": "defer", "goal": record["goal"], "memories": []}}
+        self.store.save(item, record)
+        listing = self.store.context()
+        self.assertEqual(listing["active_directed"], 1)
+        self.assertEqual(listing["goals"][0]["kind"], "task")
+        self.assertEqual(self.store.find(other_id)[3]["type"], "goal")
+
+    def test_social_policy_and_person_note_reach_the_prompt(self):
+        (self.identity / "social-policy.json").write_text(cm.encode({"version": 1, "group_stance": "chatty"}))
+        seen = {}
+        def capture_system(argv, *args, **kwargs):
+            if argv[0] == "llm":
+                seen["system"] = argv[argv.index("-s") + 1]
+                return cm.encode({**self.plan, "decision": "reply", "goal": None, "person": None})
+            return self.real_run(argv, *args, **kwargs)
+        with mock.patch.object(cm, "run", side_effect=capture_system):
+            cm.response(self.store, self.request)
+        self.assertIn('"group_stance":"chatty"', seen["system"])
+        self.assertIn("You have no note yet about hal", seen["system"])
+        self.assertIn("fine to ask them something back", seen["system"])
 
     def test_legacy_defer_delivers_only_human_text(self):
         with mock.patch.object(cm, "run", side_effect=lambda argv, *a, **kw: "DEFER: inspect artifact\nI will check the artifact." if argv[0] == "llm" else self.real_run(argv, *a, **kw)):

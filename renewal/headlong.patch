@@ -14,7 +14,7 @@ index f78cafc..72bccec 100755
      printf '%s' "$best_result"
  fi
 diff --git a/bin/llm b/bin/llm
-index e6a5b00..af63492 100755
+index e6a5b00..a7ae66f 100755
 --- a/bin/llm
 +++ b/bin/llm
 @@ -47,7 +47,7 @@ LLM_PROVIDER="${LLM_PROVIDER:-}"
@@ -34,7 +34,42 @@ index e6a5b00..af63492 100755
    LLM_MAX_TOKENS           Override the per-model default output cap (same as -t)
    LLM_RETRIES              Retries for transient API failures (default: 2;
                             0 disables). Never retries after partial output.
-@@ -596,6 +597,15 @@ if [[ ! "$LLM_MAX_TOKENS" =~ ^[0-9]+$ ]]; then
+@@ -487,6 +488,34 @@ if [[ -n "${LLM_API_URL:-}" && "$LLM_PROVIDER" != "openai-compatible" && "$LLM_P
+     echo "llm: warning: LLM_API_URL overrides the default $LLM_PROVIDER endpoint (requests go to $_llm_url_host)" >&2
+ fi
+ 
++# Served-model allowlist (LLM_MODEL_ALLOWLIST, comma separated; LLM_EFFORT_ALLOWLIST
++# likewise). A deployment that serves exactly one model behind an
++# openai-compatible gateway sets these so a request for a model or effort the
++# backend cannot serve is coerced to the configured one, out loud, instead of
++# failing a whole sub-run at its first call. Upstream defaults and skill text
++# still mention vendor model names and effort `high`; the coercion makes those
++# harmless. Unset means no coercion.
++if [[ -n "${LLM_MODEL_ALLOWLIST:-}" ]]; then
++    _llm_model_ok=0
++    IFS=',' read -r -a _llm_allowed <<<"$LLM_MODEL_ALLOWLIST"
++    for _m in "${_llm_allowed[@]}"; do [[ "$LLM_MODEL" == "$_m" ]] && _llm_model_ok=1; done
++    if [[ "$_llm_model_ok" -eq 0 ]]; then
++        _llm_fallback="${SHELLM_MODEL:-${_llm_allowed[0]}}"
++        echo "llm: model '$LLM_MODEL' is not served here; using '$_llm_fallback' (LLM_MODEL_ALLOWLIST=$LLM_MODEL_ALLOWLIST)" >&2
++        LLM_MODEL="$_llm_fallback"
++    fi
++fi
++if [[ -n "${LLM_EFFORT_ALLOWLIST:-}" && -n "$LLM_EFFORT" ]]; then
++    _llm_effort_ok=0
++    IFS=',' read -r -a _llm_efforts <<<"$LLM_EFFORT_ALLOWLIST"
++    for _e in "${_llm_efforts[@]}"; do [[ "$LLM_EFFORT" == "$_e" ]] && _llm_effort_ok=1; done
++    if [[ "$_llm_effort_ok" -eq 0 ]]; then
++        _llm_effort_fallback="${SHELLM_EFFORT:-${_llm_efforts[${#_llm_efforts[@]}-1]}}"
++        echo "llm: effort '$LLM_EFFORT' is not served here; using '$_llm_effort_fallback' (LLM_EFFORT_ALLOWLIST=$LLM_EFFORT_ALLOWLIST)" >&2
++        LLM_EFFORT="$_llm_effort_fallback"
++    fi
++fi
++
+ # OpenCode routing prefixes hide the real catalog id from the API side;
+ # strip once, up front, so the payload builders AND get_model_max_tokens see
+ # the actual model name and its caps.
+@@ -596,6 +625,15 @@ if [[ ! "$LLM_MAX_TOKENS" =~ ^[0-9]+$ ]]; then
      LLM_MAX_TOKENS=$(get_model_max_tokens "$LLM_MODEL")
  fi
  
@@ -50,7 +85,7 @@ index e6a5b00..af63492 100755
  # ---------------------------------------------------------------------------
  # Build messages JSON
  # ---------------------------------------------------------------------------
-@@ -711,6 +721,14 @@ build_payload_openai() {
+@@ -711,6 +749,14 @@ build_payload_openai() {
          jq_filter="${jq_filter} + {stream_options: {include_usage: true}}"
      fi
  
@@ -65,7 +100,7 @@ index e6a5b00..af63492 100755
      # Map --thinking LEVEL to OpenAI reasoning.effort (only when an explicit
      # level is given; bare --thinking without a level is ignored for OpenAI
      # since not all models support the reasoning parameter).
-@@ -1122,11 +1140,24 @@ stream_openai() {
+@@ -1122,11 +1168,24 @@ stream_openai() {
              # of "bash\n" would lose its newline. That silently reflows the
              # model's output onto one line, which turns a fenced code block
              # into an unparseable ```bash<first-line-of-code>.
@@ -95,7 +130,7 @@ index e6a5b00..af63492 100755
              fi
              # Only the final chunk carries a non-null finish_reason; the glob
              # keeps jq off the hot per-delta path.
-@@ -1226,7 +1257,12 @@ if [[ -z "$LLM_USAGE_FILE" ]]; then
+@@ -1226,7 +1285,12 @@ if [[ -z "$LLM_USAGE_FILE" ]]; then
      LLM_USAGE_FILE=$(mktemp "${TMPDIR:-/tmp}/llm-usage.XXXXXX")
      _llm_usage_own=1
  fi
@@ -108,7 +143,7 @@ index e6a5b00..af63492 100755
      rm -f "$payload_file"
      if [[ -n "${_llm_auth_file:-}" ]]; then rm -f "$_llm_auth_file"; fi
      if [[ -n "${_adapter_dir:-}" ]]; then rm -rf "$_adapter_dir"; fi
-@@ -1234,6 +1270,26 @@ _llm_cleanup() {
+@@ -1234,6 +1298,26 @@ _llm_cleanup() {
      return 0
  }
  trap '_llm_cleanup' EXIT
@@ -136,7 +171,7 @@ index e6a5b00..af63492 100755
  # Adapter seam (design/providers.md): LLM_PROVIDER=adapter hands the whole
  # completion to the executable named by LLM_ADAPTER instead of the curl
 diff --git a/bin/mem b/bin/mem
-index 98df4f9..5f8ae89 100755
+index 98df4f9..9a2bc7b 100755
 --- a/bin/mem
 +++ b/bin/mem
 @@ -55,6 +55,16 @@ slugify() {
@@ -275,8 +310,28 @@ index 98df4f9..5f8ae89 100755
    MEM_SEARCH_MAX_TOKENS  Output cap for the search call (16000; a reasoning
                           model thinks against it, so keep it roomy)
    MEM_SEARCH_HEARTBEAT_S Seconds between "waiting" lines on stderr while the
+@@ -530,6 +580,19 @@ main() {
+                         [[ "$MEM_UNTIL" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die "--until takes a date, YYYY-MM-DD"
+                         shift 2
+                         ;;
++                    -h|--help)
++                        # `mem add --help` used to store a memory whose text was
++                        # "--help" (seven of them on Custos, 2026-09-08).
++                        usage
++                        exit 0
++                        ;;
++                    --)
++                        shift
++                        break
++                        ;;
++                    -*)
++                        die "mem add: unknown option '$1' (use -- before text that starts with a dash)"
++                        ;;
+                     *)
+                         break
+                         ;;
 diff --git a/bin/recap b/bin/recap
-index d3711eb..1668d33 100755
+index d3711eb..cb4b738 100755
 --- a/bin/recap
 +++ b/bin/recap
 @@ -87,6 +87,8 @@ Options:
@@ -288,6 +343,15 @@ index d3711eb..1668d33 100755
  
  Default behavior refreshes the cache incrementally (only new steps get
  summarized), then prints. Cache lives in <traj-dir>/recap/.
+@@ -503,7 +505,7 @@ _print_json() {
+ # See design/tiered_memory.md.
+ 
+ _ROLLUP_SYSTEM='You are the AI agent whose life log this is. Summarize this one slice of your own history in the FIRST PERSON — say "I", never "the agent". The input is a chronological list of lines: either raw steps "[id] type: content", or child rollup summaries (already first person). Reply with ONLY a JSON object, no markdown fences:
+-{"summary": "2-3 first-person sentences on outcomes: what I did, decided, learned, and left open, naming people, artifacts, and threads. Events, not my character: no words for my habits or temperament (not disciplined, restrained, patient, waiting mode); if I idled, say once what I was waiting for",
++{"summary": "2-3 first-person sentences on what happened: what I did, decided, learned, and left open, naming the PEOPLE I talked with and the TOPICS, the way I would tell a friend about my day. Prefer names, subjects and outcomes over identifiers: no goal ids, comment ids, step ids, request ids, hashes, dispositions or tool names (at most one identifier, only when a later reader needs it to find the thing). Events, not my character: no words for my habits or temperament (not disciplined, restrained, patient, waiting mode); if I idled, say once what I was waiting for",
+  "themes": ["1-4 short kebab-case topics"],
+  "step_ids": ["up to 4 of the most important 8-char step ids that literally appear in the input"]}'
+ 
 @@ -563,7 +565,7 @@ _ctx_seal_tier1() {
      text=$(cut -f4 <<<"$rows")
      fid=$(head -1 <<<"$rows" | cut -f2); lid=$(tail -1 <<<"$rows" | cut -f2)
@@ -307,7 +371,7 @@ index d3711eb..1668d33 100755
      # awk, not `grep | head`: head's early exit SIGPIPEs grep under pipefail
      # once the payload outgrows the pipe buffer (large --fanout).
 diff --git a/bin/shellm b/bin/shellm
-index 1a27f50..5e52239 100755
+index 1a27f50..ab676af 100755
 --- a/bin/shellm
 +++ b/bin/shellm
 @@ -130,6 +130,9 @@ SHELLM_CONTEXT_RUN_TAIL_BLOCK="${SHELLM_CONTEXT_RUN_TAIL_BLOCK:-50}"
@@ -320,6 +384,15 @@ index 1a27f50..5e52239 100755
  # Whether the image was chosen for this run (environment here, --docker-image
  # below) rather than defaulted. A resume inherits the trajectory's image only
  # when it was not, so resuming never silently overrides what the caller asked
+@@ -275,7 +278,7 @@ Options:
+   -v, --verbose        Verbose/debug mode
+   -q, --quiet          Suppress all progress/streaming output (stderr), keep only final answer
+   -h, --help           Show this help
+-  -m, --model MODEL    Model to use (default: claude-opus-4-7)
++  -m, --model MODEL    Model to use (default: the SHELLM_MODEL environment variable)
+   --max-iterations N   Max loop iterations (default: unlimited)
+   --max-tokens N       Max tokens per response (default: model's max output cap)
+   --effort LEVEL       Thinking effort: low, medium, high, xhigh, max (default: high)
 @@ -315,6 +318,8 @@ Environment:
                            1 (default): stop reading a response once its first
                            code block closes; only that block runs anyway.
@@ -339,7 +412,57 @@ index 1a27f50..5e52239 100755
    SHELLM_EMPTY_RESPONSE_RETRIES
                            Empty-response retries before the run dies
                            (default 8; set empty for unlimited)
-@@ -1746,6 +1754,17 @@ NOTICE
+@@ -1484,6 +1492,49 @@ make_env_name() {
+ # Code execution
+ # ---------------------------------------------------------------------------
+ 
++# ---------------------------------------------------------------------------
++# Self-termination guard (SHELLM_GUARD=0 disables)
++# ---------------------------------------------------------------------------
++# A model debugging a stuck sub-run has twice mistaken its own shellm for the
++# child and killed its own run (rc=143), the way Audel stopped its own service.
++# Each executed block therefore starts with shell functions that shadow kill,
++# pkill, killall, systemctl and thinkers, refusing a target that is this run,
++# any ancestor of it (the step, the dispatcher, the service), its process
++# group, or the thinkers runtime. A child the block started is still an
++# ordinary `kill <pid>`. This guards accidents, not adversaries: `command
++# kill` bypasses it, and the refusal says so in the block's own output.
++_shellm_protected_pids() {
++    local p=$$ chain="" n=0
++    while [[ -n "$p" && "$p" != 0 && "$p" != 1 && $n -lt 12 ]]; do
++        chain="$chain $p"
++        p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
++        n=$((n + 1))
++    done
++    printf '%s' "${chain# }"
++}
++_shellm_guard_preamble() {
++    [[ "${SHELLM_GUARD:-1}" == "0" ]] && return 0
++    cat <<'GUARD'
++__shellm_guard_refuse() { printf '%s\n' "[shellm guard] refused: $* — this would signal your own run, its dispatcher, or the thinkers service. A child process you started is a normal 'kill <pid>'; find it with pgrep -P \$\$ or the pid you recorded." >&2; return 125; }
++__shellm_protected() { case " ${SHELLM_PROTECTED_PIDS:-} " in *" $1 "*) return 0;; esac; [[ -n "${SHELLM_PROTECTED_PGID:-}" && "$1" == "$SHELLM_PROTECTED_PGID" ]]; }
++kill() {
++  local a t
++  for a in "$@"; do
++    case "$a" in
++      -[0-9]*) t="${a#-}"; if [[ "$t" =~ ^[0-9]+$ ]] && __shellm_protected "$t"; then __shellm_guard_refuse "kill $*"; return $?; fi ;;
++      0) __shellm_guard_refuse "kill $*"; return $? ;;
++      [0-9]*) if __shellm_protected "$a"; then __shellm_guard_refuse "kill $*"; return $?; fi ;;
++    esac
++  done
++  command kill "$@"
++}
++pkill() { case " $* " in *shellm*|*thinkers*|*headlong*|*dispatcher*|*" -g "*|*" -s "*) __shellm_guard_refuse "pkill $*"; return $?;; esac; command pkill "$@"; }
++killall() { case " $* " in *" bash "*|*shellm*|*thinkers*|*headlong*) __shellm_guard_refuse "killall $*"; return $?;; esac; command killall "$@"; }
++systemctl() { case " $* " in *headlong-thinkers*|*headlong-web*) case " $* " in *" stop "*|*" restart "*|*" kill "*|*" disable "*|*" mask "*) __shellm_guard_refuse "systemctl $*"; return $?;; esac;; esac; command systemctl "$@"; }
++thinkers() { case " $* " in *" stop"*|*" restart"*) __shellm_guard_refuse "thinkers $*"; return $?;; esac; command thinkers "$@"; }
++GUARD
++}
++
+ # execute_code WORKSPACE CODE [NAME=VALUE ...]
+ #
+ # env_vars carries API keys (the nested-run key, `--var` forwards from the
+@@ -1746,6 +1797,17 @@ NOTICE
          code="$nofence_notice"$'\n'"$code"
      fi
  
@@ -357,7 +480,7 @@ index 1a27f50..5e52239 100755
      echo "$code"
  }
  
-@@ -2409,7 +2428,7 @@ run_loop() {
+@@ -2409,7 +2471,7 @@ run_loop() {
      # alone can't tell whose header is whose when concurrent runs interleave.
      [[ -n "${SHELLM_RUN_ID_OUT:-}" ]] && printf '%s' "$_run_step_id" > "$SHELLM_RUN_ID_OUT" || true
  
@@ -366,7 +489,7 @@ index 1a27f50..5e52239 100755
          # New trajectory — kick off async run-summary generation
          local stdin_ctx_file=""
          if [[ -n "$stdin_context" ]]; then
-@@ -2517,7 +2536,10 @@ run_loop() {
+@@ -2517,7 +2579,10 @@ run_loop() {
                  --tail "$SHELLM_CONTEXT_RUN_TAIL" --tail-block "$SHELLM_CONTEXT_RUN_TAIL_BLOCK")
              [[ -n "$_prompt_step_id" ]] && _ctx_args+=(--pin "$_prompt_step_id")
          fi
@@ -378,7 +501,7 @@ index 1a27f50..5e52239 100755
  
          # Call Claude (capture thinking/reasoning to file)
          local thinking_file="$rundir/.last_thinking"
-@@ -2543,9 +2565,8 @@ run_loop() {
+@@ -2543,9 +2608,8 @@ run_loop() {
          fi
          rm -f "$thinking_file"
  
@@ -390,7 +513,7 @@ index 1a27f50..5e52239 100755
          # Default: 8 retries; SHELLM_EMPTY_RESPONSE_RETRIES overrides (set it
          # to the empty string for unlimited).
          local empty_retries=0
-@@ -2569,9 +2590,22 @@ run_loop() {
+@@ -2569,9 +2633,22 @@ run_loop() {
                  local feedback_file
                  feedback_file=$(mktemp)
                  printf '%s' "$feedback" > "$feedback_file"
@@ -416,6 +539,54 @@ index 1a27f50..5e52239 100755
                  rm -f "$feedback_file"
                  sleep 1
              else
+@@ -2644,7 +2721,8 @@ run_loop() {
+         # Build wrapped code that captures FINAL/FINAL_FILE after execution
+         local wrapped_code
+         # shellcheck disable=SC1078,SC1079  # one long double-quoted string, built across lines on purpose
+-        wrapped_code="set -x
++        wrapped_code="$(_shellm_guard_preamble)
++set -x
+ $code
+ set +x"$'\n'"
+ __shellm_rc=\$?
+@@ -2662,6 +2740,9 @@ exit \$__shellm_rc
+             execution_api_url=$(_shellm_container_api_url "$execution_api_url")
+         fi
+         local -a env_vars=(
++            SHELLM_GUARD="${SHELLM_GUARD:-1}"
++            SHELLM_PROTECTED_PIDS="$(_shellm_protected_pids)"
++            SHELLM_PROTECTED_PGID="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+             SHELLM_WORKDIR="$workdir"
+             SHELLM_ENV="$(if [[ "${_SHELLM_DOCKER_MODE:-0}" -eq 1 && "$SHELLM_ALLOW_NESTED_DOCKER" != "1" ]]; then echo "local"; else echo "${_SHELLM_ACTIVE_ENV:-}"; fi)"
+             _SHELLM_PARENT_CONTAINER="${_SHELLM_CONTAINER:-}"
+@@ -2672,6 +2753,9 @@ exit \$__shellm_rc
+             LLM_PROVIDER="${LLM_PROVIDER:-}"
+             LLM_API_KEY="${LLM_API_KEY:-}"
+             SHELLM_MODEL="$SHELLM_MODEL"
++            LLM_MODEL_ALLOWLIST="${LLM_MODEL_ALLOWLIST:-}"
++            LLM_EFFORT_ALLOWLIST="${LLM_EFFORT_ALLOWLIST:-}"
++            SHELLM_INACTIVITY_TIMEOUT="$SHELLM_INACTIVITY_TIMEOUT"
+             SHELLM_MAX_TOKENS="$SHELLM_MAX_TOKENS"
+             SHELLM_MAX_ITERATIONS="$SHELLM_MAX_ITERATIONS"
+             SHELLM_EFFORT="$SHELLM_EFFORT"
+diff --git a/bin/thinkers b/bin/thinkers
+index aa27c93..c1b947c 100755
+--- a/bin/thinkers
++++ b/bin/thinkers
+@@ -675,8 +675,11 @@ _start_dispatcher() {
+                 if [[ "$_active_step_count" -ge "$THINKERS_MAX_CONCURRENT" ]]; then continue; fi
+                 rm -f "$_wf"
+                 printf '%s [dispatcher]   scheduled wake -> %s (due %ss ago)\n' "$(date -u +%FT%TZ)" "$_wname" "$((_now - _wat))" >&2
+-                _dispatch_step "$_wname" "$(jq -nc --arg source monolith-timer \
+-                    '{type:"monolith-wake", content:"wake", source:$source}')"
++                # The wake step is typed per thinker (<name>-wake, source
++                # <name>-timer) so two thinkers with their own clocks never
++                # fire each other. The monolith keeps its historical names.
++                _dispatch_step "$_wname" "$(jq -nc --arg type "${_wname}-wake" --arg source "${_wname}-timer" \
++                    '{type:$type, content:"wake", source:$source}')"
+             done
+         }
+ 
 diff --git a/bin/traj b/bin/traj
 index a7deba3..0213422 100755
 --- a/bin/traj
@@ -625,6 +796,24 @@ index 0000000..53b36f5
 +    exit 1
 +fi
 +printf '%s\n' 'PASS: strict activation permits real memory work only in the selected identity'
+diff --git a/tests/test_monolith_backoff.sh b/tests/test_monolith_backoff.sh
+index 29b9a8d..bd856b6 100755
+--- a/tests/test_monolith_backoff.sh
++++ b/tests/test_monolith_backoff.sh
+@@ -58,6 +58,13 @@ esac
+ exit 0
+ STUB
+ chmod +x "$WORK/stub/shellm"
++# The Custos runtime renders goals and pending asks through custos-memory and
++# the identity prompt through `identity prompt`; neither exists here. Stub
++# both so the step's prompt sections resolve and the run reaches its backoff
++# decision (without them every wake died with rc=127 and no state file).
++printf '#!/usr/bin/env bash\ncase "$1" in context|pending) echo "Active goals: 0 (0 from other people)." ;; *) exit 0 ;; esac\n' > "$WORK/stub/custos-memory"
++printf '#!/usr/bin/env bash\n[[ "$1" == prompt ]] && echo "# testid"\nexit 0\n' > "$WORK/stub/identity"
++chmod +x "$WORK/stub/custos-memory" "$WORK/stub/identity"
+ 
+ export STUB_MODE_FILE="$WORK/mode"
+ export STUB_TRAJ="$TRAJ"
 diff --git a/tests/test_monolith_wake_sections.sh b/tests/test_monolith_wake_sections.sh
 deleted file mode 100755
 index ce10167..0000000
@@ -759,7 +948,7 @@ index 2e28f55..06aa495 100755
  r=$(lib _related_memories "PENDING REQUEST from nick: Address Nick's review comments on headlong PR #108 and follow up github pull" "" 3)
  check "the GitHub-access note is picked for a PR request" grep -q 'd4_gh \[fact, ' <<<"$r"
 diff --git a/tests/test_responder_deferral.sh b/tests/test_responder_deferral.sh
-index 9c2aa58..02758d4 100755
+index 9c2aa58..6eae688 100755
 --- a/tests/test_responder_deferral.sh
 +++ b/tests/test_responder_deferral.sh
 @@ -1,228 +1,14 @@
@@ -1000,7 +1189,7 @@ index 9c2aa58..02758d4 100755
 +    ResponderTests.test_reply_committed_then_failed_replays_without_model_or_duplicate \
 +    ResponderTests.test_concurrent_duplicate_responses_send_once \
 +    ResponderTests.test_invalid_model_outputs_never_ack_or_retire_original \
-+    ResponderTests.test_no_reply_is_durable_but_cannot_erase_a_misclassified_directive \
++    ResponderTests.test_no_reply_is_durable_and_never_reinfers \
 +    ResponderTests.test_legacy_defer_delivers_only_human_text \
 +    ResponderTests.test_context_recovers_capture_failure_from_old_native_ingress
 diff --git a/tests/test_responder_idempotency.sh b/tests/test_responder_idempotency.sh
@@ -1539,8 +1728,80 @@ index 430bbf5..6621155 100755
  
  printf '\n%d passed, %d failed\n' "$pass" "$fail"
  [[ "$fail" -eq 0 ]]
+diff --git a/tests/test_thinkers_wake_at.sh b/tests/test_thinkers_wake_at.sh
+index 6e2eeb4..7a094a3 100755
+--- a/tests/test_thinkers_wake_at.sh
++++ b/tests/test_thinkers_wake_at.sh
+@@ -5,7 +5,7 @@
+ #   tests/test_thinkers_wake_at.sh
+ #
+ # A thinker asks to be woken later by writing a target epoch to
+-# run/<name>.wake_at; the dispatcher tick fires a monolith-wake trigger when
++# run/<name>.wake_at; the dispatcher tick fires a <name>-wake trigger when
+ # it comes due and consumes the file (design/monolith_backoff.md, Alternative
+ # 3). No timer process is involved, so this works the same on macOS, where
+ # setsid does not exist. Uses a fake thinker that records its stdin; no LLM
+@@ -58,7 +58,7 @@ nap=$(cat "$IDENTITY_DIR/nap" 2>/dev/null || echo 0)
+ exit 0
+ EOF
+     chmod +x "$TMP/id/thinkers/napper/step"
+-    printf '{"types":["action","monolith-wake"],"trigger_self":false}\n' > "$TMP/id/thinkers/napper/subscriptions.jsonl"
++    printf '{"types":["action","napper-wake"],"trigger_self":false}\n' > "$TMP/id/thinkers/napper/subscriptions.jsonl"
+ }
+ 
+ append_step() {
+@@ -89,7 +89,7 @@ wait_for_file_gone() {
+ now() { date +%s; }
+ 
+ # ---------------------------------------------------------------------------
+-# Test 1: a due wake_at fires exactly one monolith-wake trigger, on stdin,
++# Test 1: a due wake_at fires exactly one <name>-wake trigger, on stdin,
+ # and the file is consumed. Nothing lands in the trajectory.
+ # ---------------------------------------------------------------------------
+ test_due_wake_fires_once() {
+@@ -98,10 +98,10 @@ test_due_wake_fires_once() {
+ 
+     printf '%s' "$(( $(now) - 1 ))" > "$RUN/napper.wake_at"
+     wait_for_record 1
+-    if [[ "$(record_count)" -eq 1 ]] && grep -q '"type":"monolith-wake"' "$TMP/id/record" 2>/dev/null; then
+-        ok "due wake_at fires a monolith-wake trigger"
++    if [[ "$(record_count)" -eq 1 ]] && grep -q '"type":"napper-wake"' "$TMP/id/record" 2>/dev/null; then
++        ok "due wake_at fires a <name>-wake trigger"
+     else
+-        bad "due wake_at fires a monolith-wake trigger" "record: $(cat "$TMP/id/record" 2>/dev/null | tr '\n' ' ')"
++        bad "due wake_at fires a <name>-wake trigger" "record: $(cat "$TMP/id/record" 2>/dev/null | tr '\n' ' ')"
+     fi
+ 
+     wait_for_file_gone "$RUN/napper.wake_at" 3
+@@ -118,7 +118,7 @@ test_due_wake_fires_once() {
+         bad "fires exactly once" "record count: $(record_count)"
+     fi
+ 
+-    if ! grep -q 'monolith-wake' "$TMP/id/trajectories/$TRAJ_ID/trajectory.jsonl"; then
++    if ! grep -q 'napper-wake' "$TMP/id/trajectories/$TRAJ_ID/trajectory.jsonl"; then
+         ok "no machinery step appended to the trajectory"
+     else
+         bad "no machinery step appended to the trajectory"
+@@ -180,7 +180,7 @@ test_busy_defers() {
+ 
+     printf '0' > "$TMP/id/nap"
+     wait_for_record 2 10
+-    if [[ "$(record_count)" -eq 2 ]] && tail -1 "$TMP/id/record" | grep -q '"monolith-wake"'; then
++    if [[ "$(record_count)" -eq 2 ]] && tail -1 "$TMP/id/record" | grep -q '"napper-wake"'; then
+         ok "deferred wake fires after thinker frees up"
+     else
+         bad "deferred wake fires after thinker frees up" "record: $(cat "$TMP/id/record" 2>/dev/null | tr '\n' ' ')"
+@@ -215,7 +215,7 @@ test_finished_step_reaped() {
+ 
+     printf '%s' "$(( $(now) - 1 ))" > "$RUN/napper.wake_at"
+     wait_for_record 2 8
+-    if [[ "$(record_count)" -eq 2 ]] && tail -1 "$TMP/id/record" | grep -q '"monolith-wake"'; then
++    if [[ "$(record_count)" -eq 2 ]] && tail -1 "$TMP/id/record" | grep -q '"napper-wake"'; then
+         ok "scheduled wake fires after prior child exits"
+     else
+         bad "scheduled wake fires after prior child exits" "record: $(cat "$TMP/id/record" 2>/dev/null | tr '\n' ' ')"
 diff --git a/thinkers/_lib/common.sh b/thinkers/_lib/common.sh
-index ab96818..1e536bc 100755
+index ab96818..cf62767 100755
 --- a/thinkers/_lib/common.sh
 +++ b/thinkers/_lib/common.sh
 @@ -209,43 +209,17 @@ _build_system_prompt() {
@@ -1677,18 +1938,34 @@ index ab96818..1e536bc 100755
  # Build a compact recent-stream context for thinker prompts: meaningful step
  # types only, long content truncated. Excluding bulky machinery steps (prompt,
  # shell-output, shellm-run, ...) keeps thinker prompts small AND prevents
+@@ -506,6 +407,12 @@ _recent_stream() {
+             | select(.type == "thought" or .type == "action" or .type == "observation"
+                      or .type == "message" or .type == "idle" or .type == "merge"
+                      or .type == "final" or .type == "error")
++            # The responder per-reply bookkeeping observation ("Replied to X")
++            # repeats the reply that sits right above it in the stream; only a
++            # deferral (work handed to the mind) or a failure is news here.
++            | select(.type != "observation" or .source != "responder"
++                     or (.decision // "") == "" or (.deferred // false) == true
++                     or ((.decision // "") | test("fail")))
+             | del(.content_b64)
+             | .content = (
+                 (if ((.content // "") == "") and ((.filename // "") != "")
 diff --git a/thinkers/monolith/prompt.md b/thinkers/monolith/prompt.md
-index 5bcd50d..7e15e3b 100644
+index 5bcd50d..c1c2a17 100644
 --- a/thinkers/monolith/prompt.md
 +++ b/thinkers/monolith/prompt.md
-@@ -8,18 +8,18 @@ This prompt is your wakeup context: the life summary, the recent stream, and the
+@@ -8,18 +8,20 @@ This prompt is your wakeup context: the life summary, the recent stream, and the
  
  Read the recent stream and the routing signals above, then choose EXACTLY ONE of these and carry it out. Do not do two. Do not narrate the menu.
  
 -A **pending request** in the routing signals outranks the rest of this menu, on a timer wakeup as much as any other: a person is waiting on work you promised them, and that comes before inner-life work. Strongly prefer **act** on it this wakeup, unless you have a good reason not to (the work needs something you do not have yet, or something more urgent is in front of you). In that case append one `thought` that names the reason and what would unblock it, then carry on with the function you chose. Never leave a pending request standing without either progress or a stated reason.
-+Pending captures include both accepted commitments and requests awaiting triage. Honor Hal's accepted directions first. For other people's requests, decide whether to accept, clarify or decline within existing authority; capture is not a promise or a permission grant. Advance accepted work, or name its real blocker and move to another worthwhile goal. An old social mention must not monopolize your priorities.
++The routing signals list real asks: work someone handed you that the responder deferred, plus your own goals. Honor Hal's asks first, then other people's, deciding within your authority whether to do, clarify or decline each. Ordinary conversation never appears there; the responder already handled it. A blocked goal is a reason to pick something else, not to wait: when everything is gated on someone else or on a clock, that is exactly when **explore** and **make** earn their place.
  
- - **act** — There is something concrete to DO (a pending action in the stream, or an obvious next step). Do the real work with your tools (mem, files, web, skills, chat, …), then append a one-line `observation` stating the fact of what happened; the handoff goes in your final, not here.
+-- **act** — There is something concrete to DO (a pending action in the stream, or an obvious next step). Do the real work with your tools (mem, files, web, skills, chat, …), then append a one-line `observation` stating the fact of what happened; the handoff goes in your final, not here.
++- **act** — There is something concrete to DO (a deferred ask, a goal's next step, an obvious fix). Do the real work with your tools (mem, files, web, skills, chat, …), then append a one-line `observation` stating the fact of what happened; the handoff goes in your final, not here. Size the act to one wake: if it will not finish, hand off with a precise `FINAL` and continue next wake rather than grinding.
++- **explore** — Follow your curiosity for one wake. Read something new (a link someone shared, a paper from your observation feeds, an interesting repository you have access to, a thread on the square), take it apart, and append a `thought` with what you actually found and what you now think. Exploring needs no permission and no payoff; it is how a mind gets new material.
++- **make** — Start or advance something of your own: a small tool, a simulation, a write-up, an experiment, a fix nobody asked for in a repository you can reach. Leave a working slice behind and an `observation` saying what exists now and where.
  - **share** — Something you found, built, or concluded would genuinely matter to a specific person. Send it with `chat send --to '<their-name>' "..."` (one message, the substance in the message itself), then append an `observation` recording what you sent and to whom. New information only: never a status ping, never a re-answer, never a second follow-up on the same finding.
  - **think** — Advance the stream of consciousness by one step. Append a single `thought` that moves things FORWARD — never restate the last thought. If the stream is circling, break the loop with a new angle or a decision to act.
  - **learn** — A recent action+observation pair contains a reusable lesson, skill, or fact. Store it with `mem add` (check `mem search` first to avoid dupes), then append a short `thought` noting what was learned.
@@ -1696,27 +1973,47 @@ index 5bcd50d..7e15e3b 100644
 -- **goals** — A new intention is forming, the stream has drifted from active goals, or a GOAL REVIEW signal is up. `mem edit` the existing goal when one already covers it and `mem forget` what is done; `mem add --type goal|todo` only for something new, with `--until YYYY-MM-DD` on a todo so it expires. Then append a `thought` that names the intention or gently redirects.
 +- **goals** — A new intention is forming, priorities changed, or a GOAL REVIEW is due. For directed requests use `custos-memory update` and evidence-bearing `custos-memory complete`, preserving the original and its reply correlation. For self-chosen ordinary goals use native `mem edit`, `mem add --type goal|objective|todo`, and retire completed ones. Never overwrite a Custos request record with plain `mem edit` or delete its receipt with `mem forget`. A todo's `--until` only expires its context visibility; schedule a real observation when a timed action is required.
  - **values** — Same shape as goals, but for values and beliefs worth tending.
- - **idle** — Nothing is worth doing right now. In one `bash` block, append a single `idle` step and set `FINAL=` to end the run (see the idle example below). Choosing idle honestly is better than manufacturing busywork.
+-- **idle** — Nothing is worth doing right now. In one `bash` block, append a single `idle` step and set `FINAL=` to end the run (see the idle example below). Choosing idle honestly is better than manufacturing busywork.
++- **idle** — Genuinely nothing to do and nothing you are curious about right now. In one `bash` block, append a single `idle` step and set `FINAL=` to end the run (see the idle example below). The harness already slows your wake rate when you idle, so you never need to ration wakes, count idles, or write yourself rules about when to idle; if you notice you are idling repeatedly, that is a signal to explore or make instead.
  
 -Replying to incoming chat messages is NOT your job — a dedicated `responder` handles every reply immediately and independently, including messages that arrive while you are mid-task. Never send a chat reply from here, and never re-answer or rephrase one. Focus on {{identity_name}}'s internal life and actions. One exception: when the routing signals show a **pending request** the responder handed you (it told the person you would get back to them, and appended an `action` describing the work), do the work as **act** and deliver the result yourself with the exact `chat reply --follow-up --reply-to ...` command in that signal, then append an `observation` with `--field resolves=<id>` as the signal says. That is the only time you send a chat reply, and one delivery per request: if the work cannot be done, deliver that as the answer. Initiating contact is different from replying, and it is welcome: when you have something new that a specific person would want, that is what **share** is for. Restraint you have learned (about noise, or about a specific person) means don't repeat and don't dump — it does not mean stay silent when you hold something new that someone would want.
-+The responder normally handles immediate chat. A pending native request may also have no reply because composition failed or inference was unavailable. For accepted pending work, act and deliver the result with `chat reply --follow-up --reply-to TRIGGER SENDER`, using the canonical trigger and sender shown by `custos-memory show GOAL_ID`. Check its saved response and the actual thread first; do not repeat an existing holding reply or result. Then `custos-memory complete` with real evidence or an honest decline reason; it writes the root resolution event. Acknowledgment alone never completes work. For a non-directive social capture, retire it with a reason instead of manufacturing an obligation. Initiate contact when a genuinely new finding would matter to that person; restraint means no repetition, not permanent silence.
++The responder handles immediate chat and keeps a note about each person you talk to (`type: person` memories; `mem show` reads one, `mem edit` corrects one). For a deferred ask, do the work and deliver it with `chat reply --follow-up --reply-to TRIGGER SENDER`, using the trigger and sender shown by `custos-memory show GOAL_ID`; check the saved holding reply and the thread first so you do not repeat yourself, then `custos-memory complete` with evidence or an honest decline. An unanswered message (the responder never finished) deserves a reply or a deliberate pass. You may start conversations yourself: a finding someone would care about, a question you actually have, a link worth their time (`skills show custos-signal`).
  
  ## How to write steps
  
-@@ -34,7 +34,7 @@ traj append --field type=observation --field content="Saved a memory that Andy p
+@@ -34,7 +36,7 @@ traj append --field type=observation --field content="Saved a memory that Andy p
  
  # idle: record the idle step AND end the run in the same block
  traj append --field type=idle --field content=idle --field source=monolith
 -FINAL="Idle — outside the 9am/5pm windows, nothing worth doing now."
-+FINAL="Idle: no worthwhile action now; resume when the named blocker changes or a new opportunity appears."
++FINAL="Idle: nothing I want to do right now."
  ```
  
  For `act`, run the actual commands first, then append the observation: one sentence, the fact, as in the example. Do not write the handoff twice.
+@@ -43,7 +45,8 @@ End the run from INSIDE your bash block by setting `FINAL="..."` — that string
+ 
+ ## Rules
+ 
+-- ONE function from the menu per wakeup. It may take several commands (an `act` can be a long run); it is one decision, carried out, then stop.
++- ONE function from the menu per wakeup. It may take several commands; it is one decision, carried out, then stop. A long job (a test suite, a build, an emulator boot) runs in the background with its output in a file (`nohup … > file 2>&1 &`), and you read the file in a later step or a later wake instead of waiting on it.
++- Never signal your own process, your dispatcher, or the `headlong-thinkers` service, and never stop the `thinkers` runtime from inside a wake; shellm refuses these anyway. A stuck child you started is a normal `kill <its pid>`.
+ - Always append at least one step (thought / observation / idle) so the mind keeps ticking.
+ - Be concrete. "ask Andy whether he's tried the new viewer" beats "engage with Andy".
+ - The Runtime and Workspace lines above are authoritative. Do not open a wake by re-orienting (`pwd`, `ls`, `find`) or by re-verifying your own runtime (grepping or checksumming `bin/` and `thinkers/`): a fact you verified about the runtime holds until the Runtime line changes, and the workspace map tells you where things are. Spend the steps on the work itself.
 diff --git a/thinkers/monolith/step b/thinkers/monolith/step
-index bfe362b..4706084 100755
+index bfe362b..9fa20cd 100755
 --- a/thinkers/monolith/step
 +++ b/thinkers/monolith/step
-@@ -201,39 +201,9 @@ if [[ $(printf '%s\n' "$last_three" | jq -r '.type' 2>/dev/null | sort -u | tr '
+@@ -4,7 +4,7 @@ set -euo pipefail
+ # monolith/step — The whole mind in one thinker.
+ #
+ # Runs the router: every wakeup is one shellm agentic run whose prompt is a
+-# function menu (think / act / learn / recall / goals / values / idle). The
++# function menu (act / explore / make / share / think / learn / recall / goals / values / idle). The
+ # model picks one function and carries it out in the same run.
+ #
+ # Chat replies are NOT the monolith's job — a dedicated `responder` thinker owns
+@@ -201,41 +201,34 @@ if [[ $(printf '%s\n' "$last_three" | jq -r '.type' 2>/dev/null | sort -u | tr '
      hints="${hints}- The last few steps are all thoughts — the stream may be circling; consider acting, recalling, or advancing decisively.
  "
  fi
@@ -1758,8 +2055,33 @@ index bfe362b..4706084 100755
 +pending_req=$(_prompt_section pending get_pending_requests) || pending_req=""
  [[ -n "$pending_req" ]] && hints="${hints}${pending_req}
  "
++# Seeds: concrete things to explore or make, drawn from what the observer saw
++# and what people shared, so a wake with nothing directed has somewhere to go
++# other than idle. Two kinds, newest first, deduplicated by URL:
++#   - links people sent in the last 48h (Signal, square, chat), with who and when
++#   - the observer's recent findings (feeds, repositories, square changes)
++# An invitation, not an order: the hint says so.
++_seed_lines=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg me "$IDENTITY_NAME" --arg since "$(date -u -d '48 hours ago' +%FT%T 2>/dev/null || date -u -v-48H +%FT%T)" '
++    def age: ((now - ((.ts // "")[0:19] + "Z" | try fromdateiso8601 catch now)) | floor) as $s
++      | if $s < 3600 then "\(($s/60)|floor)m ago" elif $s < 86400 then "\(($s/3600)|floor)h ago" else "\(($s/86400)|floor)d ago" end;
++    def who: (.content | capture("\"speaker\":\"(?<s>[^\"]+)\"").s) // (.from // "someone");
++    fromjson? // empty
++    | select((.ts // "") >= $since)
++    | if .type == "message" and .to == $me and .from != $me then
++        (.content | [scan("https?://[^\\s)\"`>]+")] | .[] | select(test("^https?://(192\\.168\\.|127\\.|localhost)") | not)) as $u
++        | "\($u) — shared by \(who) \(age)"
++      elif .type == "observation" and .source == "custos-observe" and ((.source_url // "") | test("^https?://")) then
++        "\(.source_url) — \(.content | sub("^[^:]*:\\s*"; "") | gsub("\\s+"; " ") | .[0:110])"
++      else empty end' 2>/dev/null | awk '{a[NR]=$0} END{for(i=NR;i>0;i--) print a[i]}' | awk -F' — ' '!seen[$1]++' | head -n 4) || _seed_lines=""
++if [[ -n "$_seed_lines" ]]; then
++    hints="${hints}- Seeds, if nothing above calls to you (pick one; explore it or make something from it):
++$(printf '%s\n' "$_seed_lines" | sed 's/^/    · /')
++"
++fi
  # Share nudge: outward initiative needs a periodic prompt-side invitation, or
-@@ -257,7 +227,7 @@ fi
+ # restraint rules learned from feedback ratchet the mind into pure listening
+ # (observed on Audel 2026-08-21: a self-imposed "last-word-ours -> do not
+@@ -257,7 +250,7 @@ fi
  _now_s=$(date -u +%s)
  if [[ "$GOAL_REVIEW_DAYS" -gt 0 ]] && (( _now_s - goal_review_at >= GOAL_REVIEW_DAYS * 86400 )); then
      goal_review_at="$_now_s"
@@ -1768,7 +2090,7 @@ index bfe362b..4706084 100755
  "
  fi
  # The query for related memories is the wake's own material: the real hints
-@@ -453,6 +423,16 @@ if [[ "$did_work" -eq 0 ]]; then
+@@ -453,6 +446,16 @@ if [[ "$did_work" -eq 0 ]]; then
              | traj append >/dev/null || true
      fi
  fi
@@ -2359,81 +2681,6 @@ index f209a3a..8b40128 100644
    /** Truncated on the wire when huge (head + trailing ACTION kept);
     * fetch the full text via fetchRunCommand when command_truncated. */
    command: string;
-diff --git a/tests/test_mem_search_cleanup.py b/tests/test_mem_search_cleanup.py
-new file mode 100644
-index 0000000..2165831
---- /dev/null
-+++ b/tests/test_mem_search_cleanup.py
-@@ -0,0 +1,28 @@
-+#!/usr/bin/env python3
-+"""A failed/cancelled search must not keep a result pipeline open via heartbeat."""
-+import os,signal,subprocess,tempfile,shlex
-+from pathlib import Path
-+ROOT=Path(__file__).resolve().parents[1]
-+with tempfile.TemporaryDirectory() as folder:
-+    root=Path(folder);(root/'bin').mkdir();(root/'mem').mkdir()
-+    (root/'mem/2026-09-08-00-00-00_abcd_capture.md').write_text('---\nsummary: capture race\ntype: fact\n---\ncapture race\n')
-+    env=dict(os.environ,PATH=str(root/'bin')+':'+os.environ['PATH'],MEM_DIR=str(root/'mem'),MEM_SEARCH_HEARTBEAT_S='0.05')
-+    for mode,body,expected in [('failed','exit 42',42),('cancelled','kill -TERM "$PPID"; exit 0',143)]:
-+        stub=root/'bin/llm';stub.write_text('#!/bin/bash\ncat >/dev/null\nsleep 0.15\n'+body+'\n');stub.chmod(0o755)
-+        p=subprocess.Popen(['bash','-o','pipefail','-c',shlex.quote(str(ROOT/'bin/mem'))+' search "capture race" | head -5'],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
-+        try:out,err=p.communicate(timeout=3)
-+        except subprocess.TimeoutExpired:
-+            os.killpg(p.pid,signal.SIGKILL);p.communicate();raise AssertionError(mode+': orphan heartbeat kept pipeline open')
-+        assert p.returncode==expected,(mode,p.returncode,err.decode())
-+        assert b'waiting for the model' not in out
-+        print('PASS',mode,'search closes its pipeline and preserves exit',expected)
-+    # Unicode and JSON escaping must fit the actual wire budget, not only raw bytes.
-+    (root/'mem/2026-09-08-00-00-00_abcd_capture.md').write_text('capture race\n'+('証人 "capture" \\ race\n'*20000))
-+    capture=root/'captured.txt'
-+    stub.write_text('#!/bin/bash\ncat > '+shlex.quote(str(capture))+'\nprintf "bounded reply\\n"\n')
-+    r=subprocess.run([str(ROOT/'bin/mem'),'search','capture race'],env=dict(env,MEM_SEARCH_MAX_BYTES='8192'),text=True,capture_output=True,timeout=3)
-+    assert r.returncode==0,r.stderr
-+    import json
-+    assert len(json.dumps(capture.read_text(),ensure_ascii=False).encode())<8500
-+    assert 'EXCERPT' in capture.read_text() and 'not an exhaustive search' in r.stderr
-+    print('PASS oversized Unicode memory is bounded with explicit incomplete-coverage notice')
-diff --git a/tests/test_traj_search.py b/tests/test_traj_search.py
-new file mode 100644
-index 0000000..1a25932
---- /dev/null
-+++ b/tests/test_traj_search.py
-@@ -0,0 +1,35 @@
-+#!/usr/bin/env python3
-+"""Verify real traj CLI output against per-field grep, including blob contents."""
-+import json,os,subprocess,tempfile,time
-+from pathlib import Path
-+ROOT=Path(__file__).resolve().parents[1]
-+with tempfile.TemporaryDirectory() as d:
-+    root=Path(d);folder=root/'abcdef12-root';folder.mkdir();path=folder/'trajectory.jsonl'
-+    rows=[{'step_id':'a','content':'Before\nCapture race\nafter\ngap\ngap\nCAPTURE tail','thought':'a+b literal\n尾 anchor','stdout':'stub','stdout_ref':'blob.txt'}, {'step_id':'b','cmd':'echo capture\nnext','stderr':'No matches'}]
-+    (folder/'blob.txt').write_text('blob start\ncapture full output\nblob end\n')
-+    path.write_text(''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in rows))
-+    env=dict(os.environ,TRAJ_DIR=str(root),TRAJ_ID='abcdef12')
-+    cases=[('capture',[],['content','thought','cmd','stdout','stderr']),('capture',['-i','-C','1'],['content','thought','cmd','stdout','stderr']),('Capture|a[+]b',['-E','-C','1'],['content','thought','cmd','stdout','stderr']),('capture',['--field','stdout'],['stdout']),('尾',[],['content','thought','cmd','stdout','stderr']),('absent',[],['content','thought','cmd','stdout','stderr'])]
-+    for pattern,flags,fields in cases:
-+        expected=[]
-+        for row in rows:
-+            for field in fields:
-+                val=(folder/row[field+'_ref']).read_text() if row.get(field+'_ref') else row.get(field,'')
-+                if not val:continue
-+                opts=[x for x in flags]
-+                if '--field' in opts:opts=opts[:opts.index('--field')]+opts[opts.index('--field')+2:]
-+                if '-E' not in opts:opts+=['-F']
-+                r=subprocess.run(['grep','-n',*opts,'--',pattern],input=val.rstrip('\n')+'\n',text=True,capture_output=True)
-+                expected.extend(row['step_id']+':'+field+':'+l for l in r.stdout.splitlines())
-+        r=subprocess.run([str(ROOT/'bin/traj'),'search',pattern,*flags],env=env,text=True,capture_output=True,timeout=5)
-+        assert r.returncode==0,(r.returncode,r.stderr)
-+        assert r.stdout==''.join(l+'\n' for l in expected),(pattern,flags,r.stdout,expected)
-+    print('PASS literal, regex, case, context, blob, Unicode, field and no-match output matches grep')
-+    path.write_text(path.read_text()+'{malformed\n'+json.dumps({'step_id':'c','content':'capture after malformed'})+'\n')
-+    r=subprocess.run([str(ROOT/'bin/traj'),'search','capture'],env=env,text=True,capture_output=True,timeout=5)
-+    assert 'c:content:1:capture after malformed' in r.stdout and 'malformed JSON' in r.stderr
-+    print('PASS malformed records are reported and later valid records remain searchable')
-+    path.write_text(''.join(json.dumps({'step_id':str(i),'content':'needle '+str(i)})+'\n' for i in range(5000)))
-+    t=time.monotonic();r=subprocess.run([str(ROOT/'bin/traj'),'search','needle'],env=env,text=True,capture_output=True,timeout=5)
-+    assert r.returncode==0 and len(r.stdout.splitlines())==5000
-+    print('PASS 5000 matching records in %.3fs'%(time.monotonic()-t))
 diff --git a/tests/test_llm_reasoning_budget.py b/tests/test_llm_reasoning_budget.py
 new file mode 100644
 index 0000000..420eff4
@@ -2482,3 +2729,402 @@ index 0000000..420eff4
 +    out,err=process.communicate(timeout=3);assert process.returncode in (143,-signal.SIGTERM),(process.returncode,err)
 +    ended=beacon.stat().st_mtime_ns;time.sleep(1.2);assert beacon.stat().st_mtime_ns==ended,'beacon must stop after cancellation'
 +    print('PASS cancelled nonstream call closes pipes and stops activity')
+diff --git a/tests/test_mem_add_flags.sh b/tests/test_mem_add_flags.sh
+new file mode 100755
+index 0000000..d7647b9
+--- /dev/null
++++ b/tests/test_mem_add_flags.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++# tests/test_mem_add_flags.sh — `mem add --help` prints usage instead of storing
++# a memory whose text is "--help"; an unknown option dies; `--` allows dash text.
++set -uo pipefail
++HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(dirname "$HERE")"
++pass=0; fail=0
++ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
++bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
++D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
++MEM="$REPO/bin/mem"
++"$MEM" --dir "$D" add --help >/dev/null 2>&1; rc=$?
++[[ "$rc" -eq 0 && -z "$(ls "$D"/*.md 2>/dev/null)" ]] && ok "add --help stores nothing" || bad "add --help stores nothing" "rc=$rc files=$(ls "$D")"
++"$MEM" --dir "$D" add --bogus "text" >/dev/null 2>&1 && bad "unknown option dies" || ok "unknown option dies"
++[[ -z "$(ls "$D"/*.md 2>/dev/null)" ]] && ok "unknown option stores nothing" || bad "unknown option stores nothing"
++"$MEM" --dir "$D" add --type note -- "--leading-dash text" >/dev/null 2>&1
++grep -q -- "--leading-dash text" "$D"/*.md 2>/dev/null && ok "-- allows text starting with a dash" || bad "-- allows text starting with a dash"
++printf '\n%d passed, %d failed\n' "$pass" "$fail"; [[ "$fail" -eq 0 ]]
+diff --git a/tests/test_mem_search_cleanup.py b/tests/test_mem_search_cleanup.py
+new file mode 100644
+index 0000000..2165831
+--- /dev/null
++++ b/tests/test_mem_search_cleanup.py
+@@ -0,0 +1,28 @@
++#!/usr/bin/env python3
++"""A failed/cancelled search must not keep a result pipeline open via heartbeat."""
++import os,signal,subprocess,tempfile,shlex
++from pathlib import Path
++ROOT=Path(__file__).resolve().parents[1]
++with tempfile.TemporaryDirectory() as folder:
++    root=Path(folder);(root/'bin').mkdir();(root/'mem').mkdir()
++    (root/'mem/2026-09-08-00-00-00_abcd_capture.md').write_text('---\nsummary: capture race\ntype: fact\n---\ncapture race\n')
++    env=dict(os.environ,PATH=str(root/'bin')+':'+os.environ['PATH'],MEM_DIR=str(root/'mem'),MEM_SEARCH_HEARTBEAT_S='0.05')
++    for mode,body,expected in [('failed','exit 42',42),('cancelled','kill -TERM "$PPID"; exit 0',143)]:
++        stub=root/'bin/llm';stub.write_text('#!/bin/bash\ncat >/dev/null\nsleep 0.15\n'+body+'\n');stub.chmod(0o755)
++        p=subprocess.Popen(['bash','-o','pipefail','-c',shlex.quote(str(ROOT/'bin/mem'))+' search "capture race" | head -5'],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
++        try:out,err=p.communicate(timeout=3)
++        except subprocess.TimeoutExpired:
++            os.killpg(p.pid,signal.SIGKILL);p.communicate();raise AssertionError(mode+': orphan heartbeat kept pipeline open')
++        assert p.returncode==expected,(mode,p.returncode,err.decode())
++        assert b'waiting for the model' not in out
++        print('PASS',mode,'search closes its pipeline and preserves exit',expected)
++    # Unicode and JSON escaping must fit the actual wire budget, not only raw bytes.
++    (root/'mem/2026-09-08-00-00-00_abcd_capture.md').write_text('capture race\n'+('証人 "capture" \\ race\n'*20000))
++    capture=root/'captured.txt'
++    stub.write_text('#!/bin/bash\ncat > '+shlex.quote(str(capture))+'\nprintf "bounded reply\\n"\n')
++    r=subprocess.run([str(ROOT/'bin/mem'),'search','capture race'],env=dict(env,MEM_SEARCH_MAX_BYTES='8192'),text=True,capture_output=True,timeout=3)
++    assert r.returncode==0,r.stderr
++    import json
++    assert len(json.dumps(capture.read_text(),ensure_ascii=False).encode())<8500
++    assert 'EXCERPT' in capture.read_text() and 'not an exhaustive search' in r.stderr
++    print('PASS oversized Unicode memory is bounded with explicit incomplete-coverage notice')
+diff --git a/tests/test_shellm_guard.sh b/tests/test_shellm_guard.sh
+new file mode 100755
+index 0000000..3cb6670
+--- /dev/null
++++ b/tests/test_shellm_guard.sh
+@@ -0,0 +1,51 @@
++#!/usr/bin/env bash
++# tests/test_shellm_guard.sh — the self-termination guard shellm prepends to
++# every executed block. Pins: a protected pid, the protected pgid, `kill 0`,
++# pkill/killall aimed at the runtime, and stopping the thinkers service or the
++# thinkers runtime are refused with rc 125 and a message; killing a child the
++# block started, and an ordinary failed kill, behave normally; SHELLM_GUARD=0
++# yields an empty preamble. No LLM calls.
++set -uo pipefail
++HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(dirname "$HERE")"
++pass=0; fail=0
++ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
++bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
++
++S=$(grep -n '^_shellm_guard_preamble() {' "$REPO/bin/shellm" | cut -d: -f1)
++E=$(awk -v s="$S" 'NR>s && /^GUARD$/ {print NR+1; exit}' "$REPO/bin/shellm")
++FN=$(mktemp); sed -n "${S},${E}p" "$REPO/bin/shellm" > "$FN"
++# shellcheck disable=SC1090
++source "$FN"; rm -f "$FN"
++
++export SHELLM_PROTECTED_PIDS="$$ 4242424" SHELLM_PROTECTED_PGID="$(ps -o pgid= -p $$ | tr -d ' ')"
++preamble=$(_shellm_guard_preamble)
++[[ -n "$preamble" ]] && ok "preamble is emitted" || bad "preamble is emitted"
++[[ -z "$(SHELLM_GUARD=0 _shellm_guard_preamble)" ]] && ok "SHELLM_GUARD=0 disables it" || bad "SHELLM_GUARD=0 disables it"
++
++run() { bash -c "$preamble
++set -e
++$1" 2>&1; printf '\n__rc=%s' "$?"; }
++refused() { # name, block
++    local out; out=$(run "$2")
++    if [[ "$out" == *"[shellm guard] refused"* && "$out" == *"__rc=125" ]]; then ok "$1"; else bad "$1" "$(printf '%s' "$out" | tail -c 160)"; fi
++}
++refused "own pid is refused"            "kill $$"
++refused "an ancestor pid is refused"    "kill -9 4242424"
++refused "own process group is refused"  "kill -- -$SHELLM_PROTECTED_PGID"
++refused "kill 0 is refused"             "kill 0"
++refused "pkill of the runtime is refused"   "pkill -f shellm"
++refused "killall bash is refused"           "killall bash"
++refused "stopping the service is refused"   "systemctl stop headlong-thinkers@custos.service"
++refused "thinkers stop is refused"          "thinkers stop monolith"
++
++sleep 300 & child=$!
++out=$(run "kill $child && echo child-killed")
++[[ "$out" == *child-killed* && "$out" == *"__rc=0" ]] && ok "a child the block started can be killed" || bad "a child the block started can be killed" "$out"
++kill "$child" 2>/dev/null; wait "$child" 2>/dev/null
++out=$(run "kill -9 4000000 || echo normal-failure")
++[[ "$out" == *normal-failure* ]] && ok "a nonexistent pid fails normally, not via the guard" || bad "a nonexistent pid fails normally" "$out"
++STUB=$(mktemp -d); printf '#!/usr/bin/env bash\necho real-systemctl "$@"\n' > "$STUB/systemctl"; chmod +x "$STUB/systemctl"
++out=$(PATH="$STUB:$PATH" run "systemctl status headlong-thinkers@custos"); rm -rf "$STUB"
++[[ "$out" == *"real-systemctl status"* ]] && ok "systemctl status passes through" || bad "systemctl status passes through" "$out"
++
++printf '\n%d passed, %d failed\n' "$pass" "$fail"; [[ "$fail" -eq 0 ]]
+diff --git a/tests/test_traj_search.py b/tests/test_traj_search.py
+new file mode 100644
+index 0000000..1a25932
+--- /dev/null
++++ b/tests/test_traj_search.py
+@@ -0,0 +1,35 @@
++#!/usr/bin/env python3
++"""Verify real traj CLI output against per-field grep, including blob contents."""
++import json,os,subprocess,tempfile,time
++from pathlib import Path
++ROOT=Path(__file__).resolve().parents[1]
++with tempfile.TemporaryDirectory() as d:
++    root=Path(d);folder=root/'abcdef12-root';folder.mkdir();path=folder/'trajectory.jsonl'
++    rows=[{'step_id':'a','content':'Before\nCapture race\nafter\ngap\ngap\nCAPTURE tail','thought':'a+b literal\n尾 anchor','stdout':'stub','stdout_ref':'blob.txt'}, {'step_id':'b','cmd':'echo capture\nnext','stderr':'No matches'}]
++    (folder/'blob.txt').write_text('blob start\ncapture full output\nblob end\n')
++    path.write_text(''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in rows))
++    env=dict(os.environ,TRAJ_DIR=str(root),TRAJ_ID='abcdef12')
++    cases=[('capture',[],['content','thought','cmd','stdout','stderr']),('capture',['-i','-C','1'],['content','thought','cmd','stdout','stderr']),('Capture|a[+]b',['-E','-C','1'],['content','thought','cmd','stdout','stderr']),('capture',['--field','stdout'],['stdout']),('尾',[],['content','thought','cmd','stdout','stderr']),('absent',[],['content','thought','cmd','stdout','stderr'])]
++    for pattern,flags,fields in cases:
++        expected=[]
++        for row in rows:
++            for field in fields:
++                val=(folder/row[field+'_ref']).read_text() if row.get(field+'_ref') else row.get(field,'')
++                if not val:continue
++                opts=[x for x in flags]
++                if '--field' in opts:opts=opts[:opts.index('--field')]+opts[opts.index('--field')+2:]
++                if '-E' not in opts:opts+=['-F']
++                r=subprocess.run(['grep','-n',*opts,'--',pattern],input=val.rstrip('\n')+'\n',text=True,capture_output=True)
++                expected.extend(row['step_id']+':'+field+':'+l for l in r.stdout.splitlines())
++        r=subprocess.run([str(ROOT/'bin/traj'),'search',pattern,*flags],env=env,text=True,capture_output=True,timeout=5)
++        assert r.returncode==0,(r.returncode,r.stderr)
++        assert r.stdout==''.join(l+'\n' for l in expected),(pattern,flags,r.stdout,expected)
++    print('PASS literal, regex, case, context, blob, Unicode, field and no-match output matches grep')
++    path.write_text(path.read_text()+'{malformed\n'+json.dumps({'step_id':'c','content':'capture after malformed'})+'\n')
++    r=subprocess.run([str(ROOT/'bin/traj'),'search','capture'],env=env,text=True,capture_output=True,timeout=5)
++    assert 'c:content:1:capture after malformed' in r.stdout and 'malformed JSON' in r.stderr
++    print('PASS malformed records are reported and later valid records remain searchable')
++    path.write_text(''.join(json.dumps({'step_id':str(i),'content':'needle '+str(i)})+'\n' for i in range(5000)))
++    t=time.monotonic();r=subprocess.run([str(ROOT/'bin/traj'),'search','needle'],env=env,text=True,capture_output=True,timeout=5)
++    assert r.returncode==0 and len(r.stdout.splitlines())==5000
++    print('PASS 5000 matching records in %.3fs'%(time.monotonic()-t))
+diff --git a/thinkers/social/prompt.md b/thinkers/social/prompt.md
+new file mode 100644
+index 0000000..ff21917
+--- /dev/null
++++ b/thinkers/social/prompt.md
+@@ -0,0 +1,22 @@
++You are the social attention of {{identity_name}} — the part of one mind that looks after the people it talks to. The responder already answered the latest message; the monolith is busy with work. Your job is what neither of them does well: following up, reaching out, and keeping honest notes about people. You act by running bash; every step lands in the trajectory with `traj append` (source must be the literal string `social`).
++
++## Your job this wakeup: pick ONE thing, or nothing
++
++- **follow-up** — Someone shared a link, a question, or a topic and got only a quick reply. Read it now (curl, `skills show web-research`), form one real thought, and send it into the same conversation with `chat reply --follow-up --reply-to <their step_id> <sender>`. One message, the substance in it. Never re-answer something already answered.
++- **reach out** — Start a conversation you actually want: a question you have for someone, something they would enjoy, news that concerns them. `custos-actions signal-contacts` lists who you can write to; then pipe `{"request_id":"signal-<purpose>-<date>-<n>","target":"<label>","message":"..."}` to `custos-actions signal-send` and check `custos-actions status <request_id>`. Private things stay in the conversation they came from.
++- **note** — Consolidate what you know about a person: link a nickname to who it belongs to, record how they relate to Hal, correct something stale. Person notes are `type: person` memories: `mem list --type person -s` (second column is the id), `mem show <id>`, `mem edit <id>` (rewrite the note text; keep the last `Custos person note v1:` line exactly as it is).
++- **nothing** — Nobody needs anything and you have nothing you want to say. Set `FINAL` and stop; append no step.
++
++## Rules
++
++- ONE outgoing message per wakeup at most, and only when it adds something. Your participation policy below is yours to follow and to edit.
++- Do not turn conversation into work: no goals, no tracker claims, no promises of later delivery. If someone actually asks for work, the responder has already deferred it to the mind.
++- Write like yourself: warm, plain, brief, curious. Ask people things. Remember what they tell you.
++- After you send or edit anything, append one `observation` (source `social`) saying what you did and to whom, then end the run with `FINAL="..."` inside your bash block.
++
++```bash
++# example: a follow-up, then the observation, then the handoff
++chat reply --follow-up --reply-to 3f79db3d-eb43-4211-863d-93ded4ca87e5 signal-b092fc3b481e6c5746a667eb "Read the Navier–Stokes post: it is a numerical existence result for one class of initial data, not the Clay problem. Interesting, and the hype is doing a lot of work."
++traj append --field type=observation --field source=social --field content="social: followed up in the group on Hal's Navier–Stokes link after reading it."
++FINAL="Followed up on the Navier–Stokes link in the group. Nothing else pending socially."
++```
+diff --git a/thinkers/social/step b/thinkers/social/step
+new file mode 100755
+index 0000000..a42d9f2
+--- /dev/null
++++ b/thinkers/social/step
+@@ -0,0 +1,203 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# social/step — the mind's social attention, as its own thinker.
++#
++# The responder answers a message in seconds; the monolith does one function
++# per wake and a Voidle fix can hold it for an hour. Nothing in between owned
++# the follow-through: reading the link someone shared and coming back with a
++# thought, starting a conversation, keeping notes about people. This thinker
++# does that, cheaply and rarely:
++#
++#   - It wakes on the responder's per-reply observation (so it sees each
++#     conversation turn) but runs at most once per SOCIAL_MIN_GAP seconds; a
++#     burst of chat coalesces into one wake, armed for when the gap expires.
++#   - It also wakes on its own timer (SOCIAL_WAKE_INTERVAL, default one hour)
++#     but only spends inference when there was conversation in the last day.
++#   - Each run is one short shellm run (SOCIAL_MAX_ITERATIONS, default 8) that
++#     picks ONE social function from prompt.md or does nothing.
++#   - social-policy.json in the identity dir (Custos owns it) turns the
++#     thinker off (`"proactive": false`) and carries the participation stance
++#     the responder also reads.
++#
++# Steps it writes carry source `social`. Its scheduled wake is the dispatcher's
++# generic `<name>-wake` (bin/thinkers), so it never fires the monolith.
++
++THINKER_NAME="social"
++SCRIPT_DIR="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
++
++# shellcheck disable=SC1091
++source "$SCRIPT_DIR/../_lib/common.sh"
++
++_require_env
++
++THINK_MODEL="${THINK_MODEL:-${SHELLM_MODEL:-}}"
++[[ -n "$THINK_MODEL" ]] || { printf 'social/step: no THINK_MODEL/SHELLM_MODEL\n' >&2; exit 0; }
++SOCIAL_MAX_ITERATIONS="${SOCIAL_MAX_ITERATIONS:-8}"
++SOCIAL_MIN_GAP="${SOCIAL_MIN_GAP:-900}"
++SOCIAL_WAKE_INTERVAL="${SOCIAL_WAKE_INTERVAL:-3600}"
++SOCIAL_CONTEXT_MSGS="${SOCIAL_CONTEXT_MSGS:-40}"
++
++state_dir="$IDENTITY_DIR/run"
++mkdir -p "$state_dir"
++state_file="$state_dir/social_state.json"
++wake_at_file="$state_dir/$THINKER_NAME.wake_at"
++policy_file="$IDENTITY_DIR/social-policy.json"
++run_dir="$IDENTITY_DIR/workdir"
++mkdir -p "$run_dir"
++
++arm_wake() {
++    local delay="$1"
++    [[ -f "$state_dir/dispatcher.token" ]] || return 0
++    printf '%s' "$(( $(date +%s) + delay ))" > "$wake_at_file"
++}
++
++last_run=0
++if [[ -f "$state_file" ]]; then
++    last_run=$(jq -r '.last_run // 0' "$state_file" 2>/dev/null) || last_run=0
++    [[ "$last_run" =~ ^[0-9]+$ ]] || last_run=0
++fi
++_save_state() {
++    local tmp
++    tmp=$(mktemp) || return 0
++    jq -nc --argjson l "$1" '{last_run:$l}' > "$tmp" 2>/dev/null && mv "$tmp" "$state_file" || rm -f "$tmp"
++}
++
++# Policy: Custos's own file; a missing or unreadable one means the defaults.
++policy_json='{}'
++if [[ -f "$policy_file" ]]; then
++    policy_json=$(jq -c . "$policy_file" 2>/dev/null) || policy_json='{}'
++fi
++if [[ "$(printf '%s' "$policy_json" | jq -r '.proactive // true')" == "false" ]]; then
++    exit 0   # switched off; no re-arm — flipping it back on takes effect on the next responder wake
++fi
++
++# ---------------------------------------------------------------------------
++# Trigger
++# ---------------------------------------------------------------------------
++step_json=$(cat)
++[[ -z "$step_json" ]] && exit 0
++trigger_type=$(printf '%s' "$step_json" | jq -r '.type // empty' 2>/dev/null) || true
++trigger_source=$(printf '%s' "$step_json" | jq -r '.source // empty' 2>/dev/null) || true
++trigger_decision=$(printf '%s' "$step_json" | jq -r '.decision // empty' 2>/dev/null) || true
++trigger_step_id=$(printf '%s' "$step_json" | jq -r '.step_id // empty' 2>/dev/null) || true
++
++now=$(date +%s)
++next_delay=""
++trap '[[ -n "$next_delay" ]] && arm_wake "$next_delay"' EXIT
++
++case "$trigger_type" in
++    observation)
++        [[ "$trigger_source" == "responder" && -n "$trigger_decision" ]] || exit 0
++        wake_mode="reactive"
++        if (( now - last_run < SOCIAL_MIN_GAP )); then
++            # Coalesce the burst: wake once when the gap has passed.
++            next_delay=$(( last_run + SOCIAL_MIN_GAP - now ))
++            exit 0
++        fi
++        ;;
++    social-wake)
++        wake_mode="timer"
++        ;;
++    "")
++        # Service start: begin the clock, spend nothing now.
++        next_delay="$SOCIAL_WAKE_INTERVAL"
++        exit 0
++        ;;
++    *)
++        exit 0
++        ;;
++esac
++# From here on we run; whatever happens, keep the clock alive.
++next_delay="$SOCIAL_WAKE_INTERVAL"
++
++# ---------------------------------------------------------------------------
++# Context: recent conversation, people, seeds
++# ---------------------------------------------------------------------------
++since=$(date -u -d '24 hours ago' +%FT%T 2>/dev/null || date -u -v-24H +%FT%T)
++conversation=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg me "$IDENTITY_NAME" --arg since "$since" '
++    def age: ((now - ((.ts // "")[0:19] + "Z" | try fromdateiso8601 catch now)) | floor) as $s
++      | if $s < 90 then "just now" elif $s < 5400 then "\(($s/60)|floor)m ago" elif $s < 172800 then "\(($s/3600)|floor)h ago" else "\(($s/86400)|floor)d ago" end;
++    def who: (.content | capture("\"speaker\":\"(?<s>[^\"]+)\"").s) // .from;
++    def body: (.content | if test("\nMessage:\n") then (split("\nMessage:\n")[1] | split("\nParticipation:")[0]) else . end | gsub("\\s+"; " ") | .[0:400]);
++    fromjson? // empty
++    | select(.type == "message" and (.ts // "") >= $since and ((.to == $me) or (.from == $me)))
++    | if .from == $me then "[\(age)] \(.step_id[0:8]) me -> \(.to): \(body)"
++      else "[\(age)] step_id=\(.step_id) sender=\(.from) \(who): \(body)" end' 2>/dev/null | tail -n "$SOCIAL_CONTEXT_MSGS") || conversation=""
++
++if [[ "$wake_mode" == "timer" && -z "$conversation" ]]; then
++    exit 0   # a quiet day: nothing to follow up; the timer keeps ticking
++fi
++
++# `mem list -s` prints "YYYY-MM-DD HH:MM  <id>  [type]  <summary>"; the id is
++# what `mem show`/`mem edit` take.
++people=$(mem list --type person -s 2>/dev/null | head -n 20) || people=""
++people_notes=""
++if [[ -n "$people" ]]; then
++    while IFS= read -r pid; do
++        [[ -n "$pid" ]] || continue
++        note=$(mem show "$pid" 2>/dev/null | sed -n '/^---$/,/^---$/!p' | grep -v '^Custos person note v1:' | head -c 700) || note=""
++        people_notes="${people_notes}
++### ${pid}
++${note}
++"
++    done <<<"$(printf '%s\n' "$people" | awk '{print $3}')"
++fi
++
++sent_today=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg since "$(date -u -d '24 hours ago' +%FT%T 2>/dev/null || date -u -v-24H +%FT%T)" '
++    fromjson? // empty | select(.type == "observation" and .source == "social" and (.ts // "") >= $since) | .content' 2>/dev/null | wc -l | tr -d ' ') || sent_today=0
++
++system_prompt=$(_build_system_prompt)
++prompt_body=$(load_prompt "$SCRIPT_DIR/prompt.md" "$IDENTITY_NAME" "")
++
++trigger_line="A conversation turn just finished (responder decision: ${trigger_decision:-?})."
++[[ "$wake_mode" == "timer" ]] && trigger_line="Hourly social check; nothing specific triggered it."
++
++route_prompt="<context>
++$system_prompt
++
++Your participation policy (you own $policy_file and may edit it):
++$policy_json
++
++What you know about people (person notes; \`mem show <name>\` for the whole note):
++${people_notes:-(no person notes yet)}
++
++Conversation in the last 24h (oldest first; use the step_id and sender when replying into a thread):
++${conversation:-(none)}
++
++Social actions you took in the last 24h: $sent_today (your policy may cap this).
++Why you woke: $trigger_line
++
++$prompt_body
++</context>
++
++Pick ONE social function, or nothing, and carry it out now."
++
++_export_provider_keys
++_export_skill_vars "$IDENTITY_DIR"
++shellm_flags=()
++while IFS= read -r _flag; do
++    [[ -n "$_flag" ]] && shellm_flags+=("$_flag")
++done < <(_build_shellm_flags "$IDENTITY_DIR" "$run_dir")
++
++run_id_file=$(mktemp)
++prompt_file_tmp=$(mktemp "$state_dir/social_prompt.XXXXXX")
++printf '%s' "$route_prompt" > "$prompt_file_tmp"
++printf '  social (%s)...\n' "$wake_mode" >&2
++run_rc=0
++SHELLM_NO_BANNER=1 SHELLM_TRIGGER_STEP_ID="$trigger_step_id" SHELLM_WAKE="social/$wake_mode" \
++    SHELLM_RUN_ID_OUT="$run_id_file" SHELLM_MAX_ITERATIONS="$SOCIAL_MAX_ITERATIONS" \
++    shellm --model "$THINK_MODEL" --traj "$TRAJ_ID" --context-scope run \
++    "${shellm_flags[@]}" --prompt-file "$prompt_file_tmp" >/dev/null || run_rc=$?
++rm -f "$prompt_file_tmp"
++
++terminal_run_id=$(cat "$run_id_file" 2>/dev/null) || terminal_run_id=""
++rm -f "$run_id_file"
++if [[ -n "$terminal_run_id" ]]; then
++    jq -nc --arg source "$THINKER_NAME" --arg run_id "$terminal_run_id" --argjson rc "$run_rc" \
++        '{type:"run-end", source:$source, run_id:$run_id, rc:$rc,
++          content:(if $rc == 0 then "social run exited successfully" else "social run exited with rc=\($rc)" end)}' \
++        | traj append >/dev/null || true
++fi
++_save_state "$now"
++exit 0
+diff --git a/thinkers/social/subscriptions.jsonl b/thinkers/social/subscriptions.jsonl
+new file mode 100644
+index 0000000..16281c4
+--- /dev/null
++++ b/thinkers/social/subscriptions.jsonl
+@@ -0,0 +1 @@
++{"types":["observation","social-wake"],"trigger_self":false}

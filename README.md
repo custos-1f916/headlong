@@ -522,3 +522,60 @@ See [deployment setup](renewal/actions-setup.md),
 [Automata skill](renewal/identity/skills/custos-automata/SKILL.md). Existing correlated
 Signal replies, emoji reactions and incoming images continue through the same bridge.
 The old proposal's replies-only scope is superseded by this authorized capability.
+
+## Conversation, curiosity, and people — 2026-09-09
+
+Changes from the harness retrospective Hal approved on 2026-09-08 (homelab
+`custos-harness-retrospective-2026-09-08.md`). Source and runtime patch in this
+commit; live in LXC 122 the same night.
+
+- **Conversation is not a ticket.** `custos-memory` still captures every message
+  before the responder answers (crash-safe, replayable), but the record is
+  `type: memory` labelled `Conversation:`; it becomes a `goal` only when the
+  responder's plan is `defer`. A reply, a reaction or a deliberate `no-reply`
+  completes it. `reconcile()` (run by every `context`) also settles legacy
+  answered records, which retired the seven greeting "goals" that had queued
+  as operator requests. `context` lists deferred tasks and *unanswered* direct
+  messages (responder never finished), nothing else. Summaries are the speaker
+  and message body (`Hal: Wonderful! This is cool!`), not the bridge wrapper.
+- **Person notes.** One `type: person` memory per person key (Signal ACI from
+  the bridge wrapper, `square:<handle>`, or the routing name). The responder's
+  single JSON composition may return `person: {display, aliases, notes}`; the
+  note is rewritten after the reply is delivered, key-shaped strings redacted,
+  and shown to the responder next time as "What you know about X". `mem list
+  --type person -s`, `mem show/edit ID` for Custos and operators. The last line
+  (`Custos person note v1: {...}`) carries the key and aliases; keep it.
+- **Participation policy.** `IDENTITY_DIR/social-policy.json` (Custos owns it)
+  is injected into the responder prompt and read by the social thinker;
+  `"proactive": false` switches the social thinker off. The bridge's injected
+  `Participation:` line is neutral now; stance lives in the policy file.
+- **Social thinker** (`thinkers/social`): wakes on responder observations,
+  coalesced to one run per `SOCIAL_MIN_GAP` (900 s), plus an hourly timer that
+  spends inference only if there was conversation in the last day; at most
+  `SOCIAL_MAX_ITERATIONS` (8) per run; one function per wake: follow-up, reach
+  out, note, or nothing. Steps carry `source: social`. The dispatcher's
+  scheduled wake is now `<name>-wake` / `<name>-timer` per thinker (the monolith
+  keeps `monolith-wake`). Unit `ExecStart` runs `thinkers start monolith
+  responder social`; `identity sync-thinkers` bootstraps the directory.
+- **Chooser.** `explore` and `make` join the menu; `idle` no longer carries the
+  "better than busywork" sermon and says the harness paces wakes. A "Seeds"
+  routing hint lists links people shared in the last 48 h and the observer's
+  recent findings when a wake has nothing directed. The recent stream drops
+  the responder's per-reply bookkeeping line (deferrals and failures stay).
+  The rollup prompt asks for people and topics, not identifiers.
+- **Survivable acts.** `SHELLM_MAX_ITERATIONS=150`, `SHELLM_INACTIVITY_TIMEOUT=300`;
+  skills document background jobs with output files. `bin/shellm` prepends a
+  guard to every block that refuses `kill`/`pkill`/`killall`/`systemctl`/
+  `thinkers` aimed at the run's own pid chain, process group, or the thinkers
+  service (rc 125 with a message); `SHELLM_GUARD=0` disables it. `bin/llm`
+  coerces models/efforts outside `LLM_MODEL_ALLOWLIST`/`LLM_EFFORT_ALLOWLIST`
+  to the served ones, out loud, so a sub-run asking for `claude-opus-4-7` at
+  effort `high` no longer dies at its first call. `mem add --help` prints
+  usage instead of storing "--help".
+- **Charter** rewritten at a third of the length (`identity/core_identity_prompt.md`):
+  what Custos likes doing, how it works, and eight hard lines, including
+  people (no falsehoods about real people unless they are in on it; pranks
+  need consent; ask Hal when a friend asks for something he might not want).
+- Tests: renewal 157 (memory 36, seven new); upstream 66 files including
+  `test_shellm_guard.sh`, `test_mem_add_flags.sh`; `test_monolith_backoff.sh`
+  now stubs `custos-memory`/`identity` (it had been failing since the renewal).
