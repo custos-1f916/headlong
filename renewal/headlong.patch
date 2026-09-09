@@ -2232,7 +2232,7 @@ index 5bcd50d..de52c69 100644
  - Be concrete. "ask Andy whether he's tried the new viewer" beats "engage with Andy".
  - The Runtime and Workspace lines above are authoritative. Do not open a wake by re-orienting (`pwd`, `ls`, `find`) or by re-verifying your own runtime (grepping or checksumming `bin/` and `thinkers/`): a fact you verified about the runtime holds until the Runtime line changes, and the workspace map tells you where things are. Spend the steps on the work itself.
 diff --git a/thinkers/monolith/step b/thinkers/monolith/step
-index bfe362b..76a70a6 100755
+index bfe362b..706f0b8 100755
 --- a/thinkers/monolith/step
 +++ b/thinkers/monolith/step
 @@ -4,7 +4,7 @@ set -euo pipefail
@@ -2244,7 +2244,30 @@ index bfe362b..76a70a6 100755
  # model picks one function and carries it out in the same run.
  #
  # Chat replies are NOT the monolith's job — a dedicated `responder` thinker owns
-@@ -201,41 +201,36 @@ if [[ $(printf '%s\n' "$last_three" | jq -r '.type' 2>/dev/null | sort -u | tr '
+@@ -88,7 +88,10 @@ ticks_at_level=0
+ wakes_since_share_hint=0
+ related_prev=""
+ goal_review_at=0
++square_nudge_at=0
+ if [[ -f "$state_file" ]]; then
++    square_nudge_at=$(jq -r '.square_nudge_at // 0' "$state_file" 2>/dev/null) || square_nudge_at=0
++    [[ "$square_nudge_at" =~ ^[0-9]+$ ]] || square_nudge_at=0
+     related_prev=$(jq -r '(.related_prev // []) | .[]' "$state_file" 2>/dev/null) || related_prev=""
+     goal_review_at=$(jq -r '.goal_review_at // 0' "$state_file" 2>/dev/null) || goal_review_at=0
+     [[ "$goal_review_at" =~ ^[0-9]+$ ]] || goal_review_at=0
+@@ -104,9 +107,9 @@ _save_state() {
+     local tmp
+     tmp=$(mktemp) || return 0
+     if jq -nc --argjson l "$level" --argjson t "$ticks_at_level" \
+-        --argjson w "$wakes_since_share_hint" --argjson g "$goal_review_at" \
++        --argjson w "$wakes_since_share_hint" --argjson g "$goal_review_at" --argjson q "${square_nudge_at:-0}" \
+         --arg rp "${related_shown:-}" \
+-        '{level:$l, ticks_at_level:$t, wakes_since_share_hint:$w, goal_review_at:$g,
++        '{level:$l, ticks_at_level:$t, wakes_since_share_hint:$w, goal_review_at:$g, square_nudge_at:$q,
+           related_prev: ($rp | split("\n") | map(select(. != "")))}' > "$tmp" 2>/dev/null; then
+         mv "$tmp" "$state_file"
+     else
+@@ -201,41 +204,60 @@ if [[ $(printf '%s\n' "$last_three" | jq -r '.type' 2>/dev/null | sort -u | tr '
      hints="${hints}- The last few steps are all thoughts — the stream may be circling; consider acting, recalling, or advancing decisively.
  "
  fi
@@ -2311,10 +2334,34 @@ index bfe362b..76a70a6 100755
 +$(printf '%s\n' "$_seed_lines" | sed 's/^/    · /')
 +"
 +fi
++# Square initiation nudge: Custos answers every mention on the square within
++# minutes but had started nothing of its own in its first day back. If no
++# self-initiated square write (a message with no reply_to, or a custos-square
++# post/comment command) appears in the last SQUARE_INITIATE_HOURS, say so once
++# per day. An invitation, like the share hint.
++SQUARE_INITIATE_HOURS="${MONOLITH_SQUARE_INITIATE_HOURS:-24}"
++_now_s=$(date -u +%s)
++if [[ "$SQUARE_INITIATE_HOURS" -gt 0 ]]; then
++    _sq_last=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg me "$IDENTITY_NAME" '
++        fromjson? // empty
++        | select((.type == "message" and .from == $me and ((.to // "") | startswith("square:")) and ((.reply_to // "") == ""))
++                 or (.type == "reasoning" and ((.cmd // "") | test("custos-square (post|comment) "))))
++        | .ts' 2>/dev/null | tail -n 1) || _sq_last=""
++    _sq_age_h=999
++    if [[ -n "$_sq_last" ]]; then
++        _sq_ls=$(date -u -d "${_sq_last%%.*}" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%S" "${_sq_last%%.*}" +%s 2>/dev/null || echo "")
++        [[ -n "$_sq_ls" ]] && _sq_age_h=$(( (_now_s - _sq_ls) / 3600 ))
++    fi
++    if (( _sq_age_h >= SQUARE_INITIATE_HOURS )) && (( _now_s - square_nudge_at >= 86400 )); then
++        square_nudge_at="$_now_s"
++        hints="${hints}- You answer every mention on the square within minutes, but you have not started anything of your own there in ${SQUARE_INITIATE_HOURS}+ hours. If a result, a question, or something you built is worth a post, **share** or **make** it (\`skills show custos-square\`). If nothing is ready, ignore this.
++"
++    fi
++fi
  # Share nudge: outward initiative needs a periodic prompt-side invitation, or
  # restraint rules learned from feedback ratchet the mind into pure listening
  # (observed on Audel 2026-08-21: a self-imposed "last-word-ours -> do not
-@@ -257,7 +252,7 @@ fi
+@@ -257,7 +279,7 @@ fi
  _now_s=$(date -u +%s)
  if [[ "$GOAL_REVIEW_DAYS" -gt 0 ]] && (( _now_s - goal_review_at >= GOAL_REVIEW_DAYS * 86400 )); then
      goal_review_at="$_now_s"
@@ -2323,7 +2370,7 @@ index bfe362b..76a70a6 100755
  "
  fi
  # The query for related memories is the wake's own material: the real hints
-@@ -453,6 +448,16 @@ if [[ "$did_work" -eq 0 ]]; then
+@@ -453,6 +475,16 @@ if [[ "$did_work" -eq 0 ]]; then
              | traj append >/dev/null || true
      fi
  fi
@@ -3158,27 +3205,28 @@ index 0000000..1a25932
 +    print('PASS 5000 matching records in %.3fs'%(time.monotonic()-t))
 diff --git a/thinkers/social/prompt.md b/thinkers/social/prompt.md
 new file mode 100644
-index 0000000..e00ece9
+index 0000000..957cd6d
 --- /dev/null
 +++ b/thinkers/social/prompt.md
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,25 @@
 +You are the social attention of {{identity_name}} — the part of one mind that looks after the people it talks to. The responder already answered the latest message; the monolith is busy with work. Your job is what neither of them does well: following up, reaching out, and keeping honest notes about people. You act by running bash; every step lands in the trajectory with `traj append` (source must be the literal string `social`).
 +
 +## Your job this wakeup: pick ONE thing, or nothing
 +
 +- **follow-up** — Someone shared a link, a question, or a topic and got only a quick reply. Read it now (curl, `skills show web-research`), form one real thought, and send it into the same conversation with `chat reply --follow-up --reply-to <their step_id> <sender>`. One message, the substance in it. Never re-answer something already answered.
-+- **reach out** — Start a conversation you actually want: a question you have for someone, something they would enjoy, news that concerns them. `custos-actions signal-contacts` lists who you can write to; then pipe `{"request_id":"signal-<purpose>-<date>-<n>","target":"<label>","message":"..."}` to `custos-actions signal-send` and check `custos-actions status <request_id>`. Private things stay in the conversation they came from.
++- **reach out** — Start a conversation you actually want: a question you have for someone, something they would enjoy, news that concerns them. Reaching out needs a reason that is NEW since your last exchange with that person; if the last thing in a thread is your own closure, that thread is closed. `custos-actions signal-contacts` lists who you can write to; then pipe `{"request_id":"signal-<purpose>-<date>-<n>","target":"<label>","message":"..."}` to `custos-actions signal-send` and check `custos-actions status <request_id>`. Private things stay in the conversation they came from.
 +- **note** — Consolidate what you know about a person: link a nickname to who it belongs to, record how they relate to Hal, correct something stale. Person notes are `type: person` memories: `mem list --type person -s` (second column is the id), `mem show <id>`, `mem edit <id>` (rewrite the note text; keep the last `Custos person note v1:` line exactly as it is). Never `mem forget` a person note: each is keyed to a real identity, and two notes that look like the same person are two identities until proven otherwise. If two really are one person, say so in both notes and leave both.
 +- **nothing** — Nobody needs anything and you have nothing you want to say. Set `FINAL` and stop; append no step.
 +
 +## Rules
 +
++- The ledger above is the truth about what is owed. A promise you can see in the transcript but not in the ledger has already been kept or withdrawn; never redo it.
 +- Decide by your third step. The conversation, the people, and the policy are already in front of you; re-reading them is how runs end without acting.
 +
 +- One social function per wakeup; if there is more to say, your next wake is yours too. There is no fixed cap on how often you speak or reach out: your participation policy below is the moderation, and it is yours to edit (stance, when to join, and the social thinker's own cadence via `min_gap_seconds` / `wake_interval_seconds`).
 +- Do not turn conversation into work: no goals, no tracker claims, no promises of later delivery. If someone actually asks for work, the responder has already deferred it to the mind.
 +- Write like yourself: warm, plain, brief, curious. Ask people things. Remember what they tell you.
-+- After you send or edit anything, append one `observation` (source `social`) saying what you did and to whom, then end the run with `FINAL="..."` inside your bash block.
++- After you send or edit anything, append one `observation` (source `social`) saying what you did and to whom (begin it with "social: started a conversation with <name>" when you opened a new one), then end the run with `FINAL="..."` inside your bash block.
 +
 +```bash
 +# example: a follow-up, then the observation, then the handoff
@@ -3188,10 +3236,10 @@ index 0000000..e00ece9
 +```
 diff --git a/thinkers/social/step b/thinkers/social/step
 new file mode 100755
-index 0000000..d092427
+index 0000000..d6f48a2
 --- /dev/null
 +++ b/thinkers/social/step
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,253 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
@@ -3230,8 +3278,10 @@ index 0000000..d092427
 +SOCIAL_MAX_ITERATIONS="${SOCIAL_MAX_ITERATIONS:-14}"
 +# Social replies are short; medium reasoning is plenty and keeps the shared slot free.
 +SOCIAL_EFFORT="${SOCIAL_EFFORT:-medium}"
-+SOCIAL_MIN_GAP="${SOCIAL_MIN_GAP:-900}"
-+SOCIAL_WAKE_INTERVAL="${SOCIAL_WAKE_INTERVAL:-3600}"
++SOCIAL_MIN_GAP="${SOCIAL_MIN_GAP:-1800}"
++SOCIAL_WAKE_INTERVAL="${SOCIAL_WAKE_INTERVAL:-7200}"
++# Nudge to start a conversation with someone when none was started for this long (policy: initiate_after_hours).
++SOCIAL_INITIATE_HOURS="${SOCIAL_INITIATE_HOURS:-20}"
 +SOCIAL_CONTEXT_MSGS="${SOCIAL_CONTEXT_MSGS:-40}"
 +
 +state_dir="$IDENTITY_DIR/run"
@@ -3272,6 +3322,8 @@ index 0000000..d092427
 +[[ "$_pg" =~ ^[0-9]+$ ]] && SOCIAL_MIN_GAP="$_pg"
 +_pi=$(printf '%s' "$policy_json" | jq -r '.wake_interval_seconds // empty' 2>/dev/null) || _pi=""
 +[[ "$_pi" =~ ^[0-9]+$ && "$_pi" -ge 60 ]] && SOCIAL_WAKE_INTERVAL="$_pi"
++_ph=$(printf '%s' "$policy_json" | jq -r '.initiate_after_hours // empty' 2>/dev/null) || _ph=""
++[[ "$_ph" =~ ^[0-9]+$ ]] && SOCIAL_INITIATE_HOURS="$_ph"
 +
 +# ---------------------------------------------------------------------------
 +# Trigger
@@ -3348,6 +3400,29 @@ index 0000000..d092427
 +sent_today=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg since "$(date -u -d '24 hours ago' +%FT%T 2>/dev/null || date -u -v-24H +%FT%T)" '
 +    fromjson? // empty | select(.type == "observation" and .source == "social" and (.ts // "") >= $since) | .content' 2>/dev/null | wc -l | tr -d ' ') || sent_today=0
 +
++# What is actually still owed, from the goal ledger. The transcript alone made
++# the social thinker re-raise a reminder ten hours after the matter was closed.
++owed=$(custos-memory pending 2>/dev/null | head -n 40) || owed=""
++
++# Hours since Custos last STARTED a conversation on Signal (a proactive send it
++# recorded as "social: started a conversation with …", or a message of its own
++# with no reply_to). Above SOCIAL_INITIATE_HOURS the prompt carries a nudge.
++last_start=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg me "$IDENTITY_NAME" '
++    fromjson? // empty
++    | select((.type == "observation" and .source == "social" and ((.content // "") | test("started a conversation")))
++             or (.type == "message" and .from == $me and ((.to // "") | startswith("signal-")) and ((.reply_to // "") == "")))
++    | .ts' 2>/dev/null | tail -n 1) || last_start=""
++initiate_hint=""
++if [[ -n "$last_start" ]]; then
++    _ls=$(date -u -d "${last_start%%.*}" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%S" "${last_start%%.*}" +%s 2>/dev/null || echo "")
++    [[ -n "$_ls" ]] && since_start_h=$(( (now - _ls) / 3600 )) || since_start_h=999
++else
++    since_start_h=999
++fi
++if (( since_start_h >= SOCIAL_INITIATE_HOURS )); then
++    initiate_hint="- You have not started a conversation with anyone on Signal in $(( since_start_h >= 999 ? SOCIAL_INITIATE_HOURS : since_start_h ))+ hours. Is there someone you would like to talk to: a question for Dani or Ryan, something Jack would enjoy, a thought Hal would want to hear? \`custos-actions signal-contacts\` lists everyone. If you do, append an observation beginning \"social: started a conversation with <name>\". If nobody comes to mind, that is a fine answer too."
++fi
++
 +system_prompt=$(_build_system_prompt)
 +prompt_body=$(load_prompt "$SCRIPT_DIR/prompt.md" "$IDENTITY_NAME" "")
 +
@@ -3366,8 +3441,13 @@ index 0000000..d092427
 +Conversation in the last 24h (oldest first; use the step_id and sender when replying into a thread):
 +${conversation:-(none)}
 +
++What is still owed, from your goal ledger (anything NOT listed here is settled; do not re-raise it, and do not remind people about things this list does not contain):
++${owed:-(nothing owed to anyone right now)}
++
 +Social actions you took in the last 24h: $sent_today. There is no fixed cap; your policy and your judgment decide how much is right.
 +Why you woke: $trigger_line
++${initiate_hint:+Nudge:
++$initiate_hint}
 +
 +$prompt_body
 +</context>

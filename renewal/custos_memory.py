@@ -518,6 +518,36 @@ class Store:
                     goals.append({"goal_id": fields.get("id", path.stem), "summary": body[:240],
                                   "type": fields["type"], "until": fields.get("until"),
                                   "directed": False, "received_at": fields.get("created", "")})
+        # Age and likely-duplicate flags: an ask untouched past STALE_HOURS is a
+        # decision to make (answer, decline, drop), not a permanent row; an ask
+        # whose outcome largely repeats a recently completed goal is probably
+        # that goal again (the "check your access" ask after access was verified).
+        stale_hours = float(os.environ.get("CUSTOS_STALE_HOURS", "12"))
+        now_dt = dt.datetime.now(dt.timezone.utc)
+        completed = []
+        with self.lock():
+            for _, _, _, cfields, crecord in self.files():
+                if crecord and crecord["status"] != "active":
+                    try:
+                        if (now_dt - dt.datetime.fromisoformat(crecord["received_at"])).total_seconds() < 48 * 3600:
+                            completed.append((cfields.get("id"), set(re.findall(r"[a-z0-9]{4,}", crecord["goal"]["outcome"].lower()))))
+                    except ValueError:
+                        continue
+        for row in goals:
+            if not row["directed"] or row.get("kind") != "task":
+                continue
+            try:
+                age = (now_dt - dt.datetime.fromisoformat(row["received_at"])).total_seconds() / 3600
+            except ValueError:
+                continue
+            row["age_hours"] = round(age, 1)
+            if age >= stale_hours:
+                row["stale"] = True
+            words = set(re.findall(r"[a-z0-9]{4,}", row["summary"].lower()))
+            for cid, cwords in completed:
+                if words and cwords and len(words & cwords) / len(words | cwords) >= 0.5:
+                    row["possible_duplicate_of"] = cid
+                    break
         authority_order = {"operator": 0, "agent": 1, "external": 2}
         goals.sort(key=lambda row: (not row["directed"], authority_order.get(row.get("authority"), 3),
                                     row["received_at"], row["goal_id"]))
@@ -607,6 +637,43 @@ def person_key(sender, content):
         if len(parts) > 1 and parts[1]:
             return "square:" + parts[1]
     return sender[:120]
+
+
+REACTION_PREFIX = "Signal reaction (ambient event, not a request):"
+
+
+def is_reaction_event(content):
+    return message_body(content).startswith(REACTION_PREFIX)
+
+
+def recent_steps(store, max_bytes=2 * 1024 * 1024):
+    """The newest steps of the root trajectory (tail read, oldest first)."""
+    path = Path(run(["traj", "path", os.environ.get("ROOT_TRAJ_ID") or os.environ["TRAJ_ID"]]).strip())
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        if size > max_bytes:
+            handle.seek(size - max_bytes)
+            handle.readline()  # drop the partial line
+        for raw in handle:
+            try:
+                yield json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+
+
+def last_own_message(store, sender, me):
+    """(seconds ago, text) of the last message Custos sent to this sender, or None."""
+    last = None
+    for step in recent_steps(store):
+        if step.get("type") == "message" and step.get("from") == me and step.get("to") == sender and step.get("ts"):
+            last = step
+    if not last:
+        return None
+    try:
+        then = dt.datetime.fromisoformat(last["ts"].replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int((dt.datetime.now(dt.timezone.utc) - then).total_seconds()), str(last.get("content", ""))[:160]
 
 
 def redact_secrets(value):
@@ -857,6 +924,29 @@ def response(store, payload):
         people = People(store)
         who_key = person_key(incoming["sender"], incoming["content"])
         who = speaker_of(incoming["sender"], incoming["content"])
+        me = os.environ.get("IDENTITY_NAME", "custos")
+        if not saved and is_reaction_event(incoming["content"]):
+            # An emoji on someone's message is social signal, not a question.
+            # Recording it is enough; a model call to decide "no reply" cost
+            # up to a minute of the shared slot per reaction (8 of them on the
+            # first night). The record stays as ambient conversation memory,
+            # which the social thinker sees in its transcript.
+            with store.lock():
+                item = store.find(goal_id)
+                record = item[4]
+                plan = {"reply": "", "decision": "no-reply", "goal": None, "memories": [], "person": None}
+                record["response"] = {"state": "no-reply", "plan": plan, "at": now(), "inference": False}
+                resolution = {"disposition": "completed", "evidence": "Reaction event noted; no reply needed."}
+                record["status"] = "completed"
+                record["resolution"] = resolution
+                record["events"].append({"at": now(), "resolution": resolution})
+                store.save(item, record)
+            metrics = payload["metrics"] if isinstance(payload["metrics"], dict) else {}
+            metrics["compose_ms"] = int(metrics.get("compose_ms", 0)) + int((time.monotonic() - started) * 1000)
+            append_step({**metrics, "type": "observation", "source": "responder", "trigger_step": trigger,
+                         "goal_id": goal_id, "decision": "no-reply", "deferred": False, "person_key": who_key,
+                         "content": "Noted a reaction from " + who + " (no model call)"})
+            return {"goal_id": goal_id, "decision": "no-reply", "replayed": False}
         if not saved:
             system = text(payload["system"], "system prompt", 98304) + RESPONSE_CONTRACT
             system += "\n" + people.prompt(who_key, who)
@@ -870,6 +960,15 @@ def response(store, payload):
                            "asking you for work.")
             system += ("\nYour group participation policy (you own this file and may edit it"
                        + (" at " + str(policy_path) if policy_path else "") + "): " + encode(policy))
+            try:
+                spoke = last_own_message(store, incoming["sender"], me)
+            except (MemoryError, OSError, KeyError):
+                spoke = None
+            if spoke:
+                system += ("\nYour last message in this conversation was %ds ago: \u201c%s\u201d. If this new message only "
+                           "acknowledges it (thanks, take your time, ok), prefer a reaction or no-reply; never repeat "
+                           "or re-promise what you just said, and remember another part of you may have posted since."
+                           % spoke)
             if incoming.get("allow_reaction"):
                 system += ("\nThis Signal message supports a real emoji reaction. You may also choose "
                            "decision react with reply containing exactly one emoji and goal null. "
@@ -1069,6 +1168,14 @@ def context_text(result):
         lines.append(encode(goal))
     if result["next_offset"] is not None:
         lines.append("More goals: custos-memory context --offset " + str(result["next_offset"]) + " (use --json for IDs).")
+    stale = [g["goal_id"] for g in result["goals"] if g.get("stale")]
+    dupes = [(g["goal_id"], g["possible_duplicate_of"]) for g in result["goals"] if g.get("possible_duplicate_of")]
+    if stale:
+        lines.append("Stale asks (untouched for over %s h): %s. Each is a decision now: do it, decline it with a reason, "
+                     "or drop it via custos-memory complete; do not let it sit another day." % (os.environ.get("CUSTOS_STALE_HOURS", "12"), ", ".join(stale)))
+    if dupes:
+        lines.append("Possible duplicates of already-completed goals: " + ", ".join("%s ~ %s" % d for d in dupes)
+                     + ". Check custos-memory show on both; close the duplicate against the completed one.")
     if result["active_directed"]:
         lines.append("A deferred task is real work someone asked for: do it, then deliver with "
                      "chat reply --follow-up --reply-to TRIGGER SENDER and close it with custos-memory complete "

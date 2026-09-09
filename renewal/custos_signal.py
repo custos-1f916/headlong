@@ -91,6 +91,17 @@ def classify(envelope, policy):
                     a['contentType'].startswith('image/') for a in attachments)
     if image_count>len(images) and reaction is None:
         body=(body or '')+'\n[Some image attachments are unavailable: unsupported format, too large, or more than four images.]'
+    # A video, voice note or file used to vanish here (empty body -> dropped), so
+    # Custos never knew something had been shared and guessed. Announce it.
+    others=[a for a in attachments if isinstance(a,dict) and isinstance(a.get('contentType'),str)
+            and not a['contentType'].startswith('image/')]
+    if others and reaction is None:
+        kinds=[]
+        for a in others[:3]:
+            ct=a['contentType']; kind='Video' if ct.startswith('video/') else 'Audio' if ct.startswith('audio/') else 'File'
+            size=a.get('size'); sz=(', %.1f MB' % (size/1048576)) if type(size) is int and size>0 else ''
+            kinds.append(kind+' ('+ct+sz+')')
+        body=(body or '')+'\n['+'; '.join(kinds)+' attached: not readable here yet. Say so and ask what it shows, or ask for a few still frames.]'
     stamp = message.get('timestamp')
     if not isinstance(stamp, int) or isinstance(stamp, bool) or stamp <= 0:
         return None

@@ -626,6 +626,69 @@ class ResponderTests(MemoryFixture):
         self.assertEqual(cm.replay_unanswered(self.store, older_than=900, limit=3)["queued"], [])
         self.assertEqual(len(list((self.identity / "run" / "pending").glob("responder.message.*"))), 1)
 
+    def test_reaction_events_settle_without_a_model_call(self):
+        self.envelope["content"] = ('Private Signal conversation. Reply only to this conversation.\n'
+                                    '{"aci":"f3d28e43-bd8f-44fb-b9b1-d605a6aab285","scope":"group","speaker":"Friend (group admin)"}\n'
+                                    'Message:\nSignal reaction (ambient event, not a request): {"author":"fb85","emoji":"👍","removed":false,"timestamp":1}\n'
+                                    'Reaction target context: {"speaker":"Custos","text":"a line"}\nParticipation: group conversation not addressed to you.')
+        self.envelope["ambient"] = True
+        self.log.write_text(cm.encode(self.envelope) + "\n")
+        self.request = {**self.request, "envelope": self.envelope, "messages": [{"role": "user", "content": self.envelope["content"]}]}
+        with mock.patch.object(cm, "run", side_effect=lambda argv, *a, **kw: self.fail("model called for a reaction") if argv[0] == "llm" else self.real_run(argv, *a, **kw)):
+            result = cm.response(self.store, self.request)
+        self.assertEqual(result["decision"], "no-reply")
+        record = self.store.request("operator:42")
+        self.assertEqual(record[4]["status"], "completed")
+        self.assertEqual(record[4]["response"]["inference"], False)
+        self.assertEqual(self.outgoing(), [])
+        observation = [s for s in self.steps() if s.get("type") == "observation" and s.get("source") == "responder"][-1]
+        self.assertIn("Noted a reaction from Friend (group admin)", observation["content"])
+
+    def test_responder_is_told_when_it_last_spoke_in_the_conversation(self):
+        # An earlier reply from Custos to hal sits in the trajectory.
+        earlier = {"type": "message", "from": "custos", "to": "hal", "content": "I will look into it.",
+                   "step_id": "own-1", "ts": cm.dt.datetime.now(cm.dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")}
+        self.log.write_text(self.log.read_text() + cm.encode(earlier) + "\n")
+        seen = {}
+        def capture_system(argv, *args, **kwargs):
+            if argv[0] == "llm":
+                seen["system"] = argv[argv.index("-s") + 1]
+                return cm.encode({**self.plan, "decision": "reply", "goal": None, "person": None})
+            return self.real_run(argv, *args, **kwargs)
+        with mock.patch.object(cm, "run", side_effect=capture_system):
+            cm.response(self.store, self.request)
+        self.assertIn("Your last message in this conversation was", seen["system"])
+        self.assertIn("I will look into it.", seen["system"])
+        self.assertIn("prefer a reaction or no-reply", seen["system"])
+
+    def test_context_flags_stale_and_duplicate_asks(self):
+        # A deferred task older than the stale window.
+        gid = self.store.capture(*cm.envelope_payload(self.envelope))["goal_id"]
+        item = self.store.find(gid); rec = item[4]
+        rec["response"] = {"state": "sent", "plan": {"reply": "on it", "decision": "defer", "goal": rec["goal"], "memories": []}}
+        rec["received_at"] = (cm.dt.datetime.now(cm.dt.timezone.utc) - cm.dt.timedelta(hours=20)).isoformat()
+        self.store.save(item, rec)
+        # A completed goal with nearly the same outcome, and a fresh duplicate ask.
+        done = {**self.envelope, "step_id": "trigger-8", "request_id": "operator:88",
+                "content": "Confirm the baby-name repository and network access are reachable and workable."}
+        did = self.store.capture(*cm.envelope_payload(done))["goal_id"]
+        self.store.complete({"goal_id": did, "disposition": "completed", "evidence": "verified"})
+        dup = {**self.envelope, "step_id": "trigger-9", "request_id": "operator:99",
+               "content": "Confirm the baby-name repository and network access are reachable and workable again."}
+        dgid = self.store.capture(*cm.envelope_payload(dup))["goal_id"]
+        item = self.store.find(dgid); rec = item[4]
+        rec["response"] = {"state": "sent", "plan": {"reply": "on it", "decision": "defer", "goal": rec["goal"], "memories": []}}
+        self.store.save(item, rec)
+        result = self.store.context()
+        rows = {g["goal_id"]: g for g in result["goals"]}
+        self.assertTrue(rows[gid].get("stale"))
+        self.assertGreaterEqual(rows[gid]["age_hours"], 19)
+        self.assertEqual(rows[dgid].get("possible_duplicate_of"), did)
+        self.assertNotIn("stale", rows[dgid])
+        text_out = cm.context_text(result)
+        self.assertIn("Stale asks", text_out); self.assertIn(gid, text_out)
+        self.assertIn("Possible duplicates", text_out); self.assertIn(did, text_out)
+
     def test_legacy_defer_delivers_only_human_text(self):
         with mock.patch.object(cm, "run", side_effect=lambda argv, *a, **kw: "DEFER: inspect artifact\nI will check the artifact." if argv[0] == "llm" else self.real_run(argv, *a, **kw)):
             cm.response(self.store, self.request)

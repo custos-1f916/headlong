@@ -628,3 +628,35 @@ From `homelab/custos-audit-2026-09-09.md` (Hal: "Implement your suggestions").
   → memory); prompt and skill point at it.
 - Charter: friends may play with Custos's voice; a persona never changes what it will do.
 - Tests: renewal 161 (memory 40); upstream guard 14, mem flags 6, extract 17, others green.
+
+### Conversation audit applied — 2026-09-09 midday
+
+From `homelab/custos-conversation-audit-2026-09-09.md` (Hal: "Those sound good. I also wouldn't
+mind a nudge to start a conversation with someone on Signal").
+
+- **Social thinker reads the ledger.** Its prompt now carries `custos-memory pending` as "what
+  is still owed; anything not listed is settled", requires a reason that is new since the last
+  exchange before reaching out, and never re-raises a promise visible only in the transcript
+  (a reminder was re-sent ten hours after its goal closed). Default cadence calmer:
+  `min_gap_seconds` 1800, `wake_interval_seconds` 7200 (policy file; Custos may retune).
+- **Signal initiation nudge.** When Custos has not started a conversation on Signal for
+  `initiate_after_hours` (20; policy file / `SOCIAL_INITIATE_HOURS`), the social prompt asks
+  whether there is someone it would like to talk to. A proactive send is recorded as an
+  observation beginning "social: started a conversation with <name>", which is how the clock
+  resets.
+- **Responder knows when it last spoke.** Its prompt gets "Your last message in this conversation
+  was Ns ago: ‘…’"; short acknowledgements get a reaction or silence, and it does not talk over
+  the social thinker.
+- **Reactions cost no inference.** A reaction event is recorded as conversation memory and
+  settled without a model call (`response.inference: false`).
+- **Unreadable attachments are announced** by the bridge: "[Video (video/mp4, 12.3 MB) attached:
+  not readable here yet. Say so and ask what it shows, or ask for a few still frames.]" instead of
+  the message vanishing.
+- **Stale and duplicate asks.** `custos-memory context` marks deferred tasks untouched for
+  `CUSTOS_STALE_HOURS` (12) as `stale` and asks whose outcome largely repeats a goal completed in
+  the last 48 h as `possible_duplicate_of`; the routing text tells the mind to answer, decline or
+  drop them.
+- **Square initiation nudge.** Once a day at most, if Custos has started nothing of its own on
+  the square in 24 h, the routing hints invite a post (`MONOLITH_SQUARE_INITIATE_HOURS`).
+- Charter: never deliver a substantive answer in a borrowed voice.
+- Tests: renewal 164 (memory 43).
