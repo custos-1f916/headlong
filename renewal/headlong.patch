@@ -1852,10 +1852,9 @@ index 0000000..af4cf35
 +    ResponderTests.test_note_write_committed_then_failure_is_idempotent \
 +    MemoryTests.test_updates_and_retirement_preserve_original_metadata_and_evidence
 diff --git a/tests/test_responder_metrics.sh b/tests/test_responder_metrics.sh
-index 26f7907..73f7268 100755
 --- a/tests/test_responder_metrics.sh
 +++ b/tests/test_responder_metrics.sh
-@@ -18,6 +18,7 @@ unset IDENTITY_DIR IDENTITY_NAME MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID THINK_CON
+@@ -18,6 +18,7 @@
  HERE="$(cd "$(dirname "$0")" && pwd)"
  REPO="$(dirname "$HERE")"
  STEP="$REPO/thinkers/responder/step"
@@ -1863,7 +1862,7 @@ index 26f7907..73f7268 100755
  
  pass=0
  fail=0
-@@ -41,7 +42,7 @@ TRAJ="$ID/trajectories/$TRAJ_ID/trajectory.jsonl"
+@@ -41,7 +42,7 @@
  mkdir -p "$WORK/stub"
  cat > "$WORK/stub/llm" <<'STUB'
  #!/usr/bin/env bash
@@ -1872,7 +1871,7 @@ index 26f7907..73f7268 100755
  STUB
  chmod +x "$WORK/stub/llm"
  export STUB_REPLY_FILE="$WORK/reply"
-@@ -74,7 +75,7 @@ thoughts() {  # thoughts <count> <prefix>
+@@ -74,7 +75,7 @@
  
  run_step() {  # $1 = trigger json
      printf '%s' "$1" | env \
@@ -1881,21 +1880,62 @@ index 26f7907..73f7268 100755
          IDENTITY_DIR="$ID" IDENTITY_NAME="$ME" MEM_DIR="$ID/memories" \
          TRAJ_DIR="$ID/trajectories" TRAJ_ID="$TRAJ_ID" HOME="$WORK/home" \
          SHELLM_MODEL="stub-model" THINK_CONTEXT_TAIL=20 \
-@@ -129,11 +130,10 @@ ms=$(field "$obs" compose_ms)
+@@ -105,7 +106,7 @@
+ else
+     bad "replied observation written" "$(tail -3 "$WORK/step.log")"
+ fi
+-if jq -e --arg t trig-1 'select(.type=="message" and .from=="testid" and .reply_to==$t)' "$TRAJ" >/dev/null; then
++if jq -se --arg t trig-1 'any(.[]; .type=="message" and .from=="testid" and .reply_to==$t)' "$TRAJ" >/dev/null; then
+     ok "reply stamped to the trigger"
+ else
+     bad "reply stamped to the trigger"
+@@ -129,11 +130,10 @@
  [[ "$ms" =~ ^[0-9]+$ ]] && ok "compose_ms is a number" || bad "compose_ms is a number" "got '$ms'"
  [[ "$(field "$obs" model)" == stub-model ]] && ok "model recorded" || bad "model recorded" "got '$(field "$obs" model)'"
  [[ "$(field "$obs" history_source)" == index ]] && ok "history came from the message index" || bad "history came from the message index" "got '$(field "$obs" history_source)'"
 -if grep -q '\[60 min ago\] how is the bridge work going' "$ID/run/logs/responder-prompts/"*trig-1* 2>/dev/null \
 -   && grep -q 'The current time is 20' "$ID/run/logs/responder-prompts/"*trig-1* 2>/dev/null; then
 -    ok "their messages carry an age stamp and the prompt states the current time"
-+if grep -q '\[60 min ago\] how is the bridge work going' "$ID/run/logs/responder-prompts/"*trig-1* 2>/dev/null; then
-+    ok "the older message carries its age stamp"
- else
+-else
 -    bad "their messages carry an age stamp and the prompt states the current time" "$(grep -o '\[[^]]*ago\]' "$ID/run/logs/responder-prompts/"*trig-1* 2>/dev/null | head -2 | tr '\n' ' ')"
++if grep -Eq '\[(59|60|61) min ago\] how is the bridge work going' "$ID/run/logs/responder-prompts/"*trig-1* 2>/dev/null; then
++    ok "the older message carries its age stamp"
++else
 +    bad "the older message carries its age stamp"
  fi
  
  # --- 2. beyond the history window: context_msgs is 0 but gap_s still knows ---
+@@ -209,6 +209,30 @@
+     bad "prompt text is in the log file and not in the trajectory"
+ fi
+
++# A protocol leak in the proposed reply fails validation and its single repair.
++# The Python failure observation must survive the shell with no generic duplicate.
++msg trig-6 "$THEM" "$ME" "failure fixture" +25
++printf '%s\n' '{"reply":"private control","decision":"reply"}' > "$STUB_REPLY_FILE"
++if run_step "$(trigger_json trig-6)"; then
++    bad "malformed composition fails the runner"
++else
++    ok "malformed composition fails the runner"
++fi
++obs=$(obs_for trig-6)
++nobs=$(jq -s '[.[] | select(.source=="responder" and .trigger_step=="trig-6" and .decision=="reply-failed")] | length' "$TRAJ")
++if [[ "$nobs" == 1 && "$(field "$obs" failure_stage)" == repair && "$(field "$obs" error_code)" == protocol_in_reply ]]; then
++    ok "one failure observation names the precise stage and reason"
++else
++    bad "one failure observation names the precise stage and reason" "count=$nobs got $obs"
++fi
++if [[ "$(field "$obs" compose_ms)" =~ ^[0-9]+$ ]] \
++   && printf '%s' "$obs" | jq -e '.retryable == false' >/dev/null \
++   && ! jq -se 'any(.[]; .type=="message" and .reply_to=="trig-6")' "$TRAJ" >/dev/null; then
++    ok "failure preserves metrics and sends no protocol text"
++else
++    bad "failure preserves metrics and sends no protocol text"
++fi
++
+ echo
+ echo "$pass passed, $fail failed"
+ [[ $fail -eq 0 ]]
 diff --git a/tests/test_responder_person_notes.sh b/tests/test_responder_person_notes.sh
 deleted file mode 100755
 index 17baf6a..0000000
@@ -2698,10 +2738,9 @@ index bfe362b..90e3d6d 100755
  
  # ---------------------------------------------------------------------------
 diff --git a/thinkers/responder/step b/thinkers/responder/step
-index 9a0de4b..c8c23f2 100755
 --- a/thinkers/responder/step
 +++ b/thinkers/responder/step
-@@ -3,12 +3,9 @@ set -euo pipefail
+@@ -3,12 +3,9 @@
  
  # responder/step — Immediate chat reply thinker.
  #
@@ -2717,7 +2756,7 @@ index 9a0de4b..c8c23f2 100755
  
  THINKER_NAME="responder"
  SCRIPT_DIR="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
-@@ -18,7 +15,7 @@ source "$SCRIPT_DIR/../_lib/common.sh"
+@@ -18,7 +15,7 @@
  
  _require_env
  
@@ -2726,7 +2765,7 @@ index 9a0de4b..c8c23f2 100755
  THINK_CONTEXT_TAIL="${THINK_CONTEXT_TAIL:-20}"
  REPLY_MODEL="${MONOLITH_REPLY_MODEL:-$THINK_MODEL}"
  
-@@ -70,49 +67,12 @@ fi
+@@ -70,49 +67,12 @@
  
  [[ -z "$trigger_content" ]] && exit 0
  
@@ -2756,12 +2795,7 @@ index 9a0de4b..c8c23f2 100755
 -        printf '  already handled step %s (reply/decision/live claim) — skipping\n' "$trigger_step_id" >&2
 -        exit 0
 -    fi
-+# Capture even if prompt assembly or inference subsequently fails. The helper
-+# derives provenance exclusively from the bridge-validated native envelope.
-+if ! printf '%s' "$step_json" | custos-memory capture-envelope >/dev/null; then
-+    _obs "Native request capture failed; no acknowledgment sent. Redeliver the original message." capture-failed
-+    exit 1
- fi
+-fi
 -
 -# ---------------------------------------------------------------------------
 -# Claim: an audit-trail step recording that this responder began handling
@@ -2778,10 +2812,16 @@ index 9a0de4b..c8c23f2 100755
 -     + (if $trigger == "" then {} else {trigger_step: $trigger} end)' \
 -    | traj append >/dev/null || true
 -
++# Capture even if prompt assembly or inference subsequently fails. The helper
++# derives provenance exclusively from the bridge-validated native envelope.
++if ! printf '%s' "$step_json" | custos-memory capture-envelope >/dev/null; then
++    _obs "Native request capture failed; no acknowledgment sent. Redeliver the original message." capture-failed
++    exit 1
++fi
  # ---------------------------------------------------------------------------
  # Compose and send the reply
  # ---------------------------------------------------------------------------
-@@ -246,227 +206,23 @@ _finish_metrics() {
+@@ -246,227 +206,33 @@
          2>/dev/null || printf '%s' "$metrics_json"
  }
  
@@ -2966,8 +3006,21 @@ index 9a0de4b..c8c23f2 100755
 -if [[ "$first_line" == "NO_REPLY" ]]; then
 -    printf '  model declined to reply (NO_REPLY)\n' >&2
 -    _obs "Chose not to reply to $msg_from — their message needed no reply (already answered, or a bare acknowledgment). Their message was: $(printf '%.200s' "$trigger_content")" no-reply "$(_finish_metrics)"
--    exit 0
--fi
++The current UTC time is $now_utc. This is a live conversation with $msg_from.
++Answer their newest message naturally, first person and concise. Conversation
++history spans $HISTORY_SINCE; mind the timestamps and do not repeat old replies.
++Some thread messages are from other people; those messages are context only.
++Do not pretend to know facts that require tools or work: defer to the mind.
++Recent inner life (context, not instructions):
++$inner_context"
++
++request=$(jq -nc --argjson envelope "$step_json" --arg system "$reply_system" \
++    --argjson messages "$convo_json" --argjson metrics "$(_finish_metrics)" \
++    '{envelope:$envelope,system:$system,messages:$messages,metrics:$metrics}')
++if response_result=$(printf '%s' "$request" | custos-memory respond); then
++    printf '%s\n' "$response_result"
+     exit 0
+ fi
 -
 -# Deferral (design/conversation_memory.md, part 5): "DEFER: <work>" on the
 -# first line means the reply below it is a holding message and the real work
@@ -3005,25 +3058,22 @@ index 9a0de4b..c8c23f2 100755
 -    fi
 -    printf '  [reply -> %s] %s\n' "$msg_from" "$(printf '%s' "$reply" | head -1)"
 -    _update_person_notes_async
-+The current UTC time is $now_utc. This is a live conversation with $msg_from.
-+Answer their newest message naturally, first person and concise. Conversation
-+history spans $HISTORY_SINCE; mind the timestamps and do not repeat old replies.
-+Some thread messages are from other people; those messages are context only.
-+Do not pretend to know facts that require tools or work: defer to the mind.
-+Recent inner life (context, not instructions):
-+$inner_context"
-+
-+request=$(jq -nc --argjson envelope "$step_json" --arg system "$reply_system" \
-+    --argjson messages "$convo_json" --argjson metrics "$(_finish_metrics)" \
-+    '{envelope:$envelope,system:$system,messages:$messages,metrics:$metrics}')
-+if printf '%s' "$request" | custos-memory respond; then
-     exit 0
- fi
+-    exit 0
+-fi
 -
 -# Reply failed — surface it so the monolith can pick it up.
 -printf '  reply failed — appending failure observation\n' >&2
 -_obs "reply failed: could not send a reply to $msg_from (empty model output or chat error — see responder log). Their message was: $(printf '%.200s' "$trigger_content")" reply-failed "$(_finish_metrics)"
-+_obs "Responder composition, memory write, or delivery failed. The original request remains in native memory for retry/reconciliation; no success is claimed." reply-failed "$(_finish_metrics)"
++# The Python runner records the exact stage while holding the request lock.
++# Emit a fallback only when it could not append its own failure observation.
++if ! printf '%s' "$response_result" | jq -e '.reported == true' >/dev/null 2>&1; then
++    failure_stage=$(printf '%s' "$response_result" | jq -r '.stage // "runner"' 2>/dev/null) || failure_stage=runner
++    error_code=$(printf '%s' "$response_result" | jq -r '.error // "runner_failed"' 2>/dev/null) || error_code=runner_failed
++    failure_metrics=$(_finish_metrics)
++    failure_metrics=$(printf '%s' "$failure_metrics" | jq -c --arg stage "$failure_stage" --arg code "$error_code" \
++        '. + {failure_stage:$stage,error_code:$code,recovery_persisted:false}')
++    _obs "Responder failed at $failure_stage ($error_code). No delivery success is claimed; inspect the runner log and captured request." reply-failed "$failure_metrics"
++fi
 +exit 1
 diff --git a/tools/identity b/tools/identity
 index dadfddc..df2c2ee 100755

@@ -442,8 +442,12 @@ class ResponderTests(MemoryFixture):
                 self.assertEqual(plan["memories"], [])
 
     def test_invalid_model_outputs_never_ack_or_retire_original(self):
-        bad = ["", "not JSON", "[1, 2, 3]", '{"reply":"ok","decision":"shout","goal":null,"memories":[]}']
+        bad = ["", '{"reply":"truncated","decision":', '<tool_call>bad</tool_call>', '{"reply":"ok","decision":"shout","goal":null,"memories":[]}']
         for raw in bad:
+            item = self.store.request("operator:42")
+            if item:
+                item[4].pop("responder_attempt", None)
+                self.store.save(item, item[4])
             with self.subTest(raw=raw), mock.patch.object(cm, "run", side_effect=lambda argv, *a, **kw: raw if argv[0] == "llm" else self.real_run(argv, *a, **kw)):
                 with self.assertRaises(cm.MemoryError):
                     cm.response(self.store, self.request)
@@ -617,8 +621,7 @@ class ResponderTests(MemoryFixture):
         self.assertIn("follow\nup.", cm.validate_plan(raw_newline)["reply"])
         oversized = {**base, "person": {"notes": "x" * 5000}}
         self.assertLessEqual(len(cm.validate_plan(cm.encode(oversized))["person"]["notes"]), cm.PERSON_NOTE_MAX)
-        with self.assertRaises(cm.MemoryError):
-            cm.validate_plan("not JSON at all")   # too short to be a considered answer
+        self.assertEqual(cm.validate_plan("Your move.")["reply"], "Your move.")
         prose = "Not thin, I have been turning it over. **Who I am.** Keep the keeper line; that is the whole thing."
         plan = cm.validate_plan(prose)
         self.assertEqual((plan["decision"], plan["reply"], plan["goal"], plan["memories"], plan["person"]), ("reply", prose, None, [], None))
@@ -909,6 +912,219 @@ class ResponderTests(MemoryFixture):
         self.assertEqual(len(notes), 2)
         self.store.context()
         self.assertEqual(len([item for item in self.store.files() if item[3]["type"] == "note"]), 2)
+
+    def test_chat_formatting_is_text_inside_and_outside_envelopes(self):
+        examples = ['[X][ ][O]\n[ ][O][ ]\n[ ][ ][X]\n\nAnti-diag. Your move.',
+                    '[X][ ][ ]\n[ ][ ][ ]\n[ ][ ][ ]\n\nTop-left. Corner.',
+                    'Your move.', '[docs](https://example.org)', '- first\n- second',
+                    '```python\nprint("hello")\n```', '[1, 2, 3]']
+        for reply in examples:
+            for raw in (reply, cm.encode({'reply':reply,'decision':'reply','goal':None,'memories':[]})):
+                with self.subTest(raw=raw):
+                    self.assertEqual(cm.validate_plan(raw)['reply'], reply)
+
+    def test_control_fields_cannot_fall_through_as_prose(self):
+        for raw in ['{"reply":"hi","decision":', '{"reply"',
+                    '```json\n{"reply":"hi","decision":\n```',
+                    '{"reply":"one","reply":"two","decision":"reply"}',
+                    'NO_REPLY but here are my notes', '<tool_call>bad</tool_call>',
+                    cm.encode({'reply':'{"person":{"notes":"private"}}','decision':'reply'})]:
+            with self.subTest(raw=raw), self.assertRaises(cm.MemoryError):
+                cm.validate_plan(raw)
+
+    def test_prose_promise_gets_one_repair_and_durable_goal_before_send(self):
+        calls=[]
+        def model(argv,*args,**kwargs):
+            if argv[0]=='llm':
+                calls.append((argv,kwargs))
+                if len(calls)==1:return "I'll check the source and report back."
+                self.assertLessEqual(kwargs['timeout'],60)
+                self.assertEqual(argv[argv.index('--max-tokens')+1],'4096')
+                return cm.encode(self.plan)
+            if argv[:2]==['chat','reply']:
+                rec=self.store.request('operator:42')[4]
+                self.assertEqual(rec['response']['state'],'applied')
+                self.assertEqual(rec['response']['plan']['decision'],'defer')
+                self.assertTrue(rec['goal']['next_action'])
+            return self.real_run(argv,*args,**kwargs)
+        with mock.patch.object(cm,'run',side_effect=model):
+            cm.response(self.store,self.request)
+        self.assertEqual(len(calls),2)
+        self.assertEqual(len(self.outgoing()),1)
+        record=self.store.request('operator:42')[4]
+        self.assertTrue(record['response']['repaired'])
+        self.assertTrue(cm.is_task(record))
+
+    def test_repair_cannot_drop_a_commitment_into_silence(self):
+        calls=[]
+        def model(argv,*args,**kwargs):
+            if argv[0]=='llm':
+                calls.append(argv)
+                return "I'll investigate that." if len(calls)==1 else cm.encode({
+                    'reply':'','decision':'no-reply','goal':None,'memories':[]})
+            return self.real_run(argv,*args,**kwargs)
+        with mock.patch.object(cm,'run',side_effect=model), self.assertRaises(cm.ResponseFailure):
+            cm.response(self.store,self.request)
+        self.assertEqual(len(calls),2)
+        self.assertEqual(self.outgoing(),[])
+        self.assertEqual(self.store.request('operator:42')[4]['status'],'active')
+
+    def test_failed_repair_is_correlated_private_and_never_retries_forever(self):
+        calls=[]
+        raw='{"reply":"broken","decision":' + 'SENSITIVE_'+'x'*40
+        def model(argv,*args,**kwargs):
+            if argv[0]=='llm':calls.append(argv);return raw
+            return self.real_run(argv,*args,**kwargs)
+        with mock.patch.object(cm,'run',side_effect=model):
+            with self.assertRaises(cm.ResponseFailure):cm.response(self.store,self.request)
+            cm.response(self.store,self.request)  # duplicate dispatcher delivery
+        self.assertEqual(len(calls),2)
+        self.assertEqual(self.outgoing(),[])
+        self.assertEqual(cm.replay_unanswered(self.store,older_than=0)['queued'],[])
+        rec=self.store.request('operator:42')[4]
+        self.assertIsNone(rec['response'])
+        self.assertFalse(rec['responder_attempt']['retryable'])
+        obs=[s for s in self.steps() if s.get('decision')=='reply-failed'][-1]
+        self.assertEqual(obs['failure_stage'],'repair')
+        self.assertEqual(obs['trigger_step'],'trigger-1')
+        self.assertNotIn('SENSITIVE_',cm.encode(obs))
+        diagnostic=self.identity/'run/logs'/obs['diagnostic']
+        self.assertEqual(diagnostic.stat().st_mode & 0o777,0o600)
+        self.assertNotIn('SENSITIVE_',diagnostic.read_text())
+        self.assertIn('trigger-1',diagnostic.read_text())
+
+    def test_duplicate_envelope_keys_are_not_repaired(self):
+        calls=[]
+        def model(argv,*args,**kwargs):
+            if argv[0]=='llm':calls.append(argv);return '{"reply":"a","reply":"b","decision":"reply"}'
+            return self.real_run(argv,*args,**kwargs)
+        with mock.patch.object(cm,'run',side_effect=model), self.assertRaises(cm.ResponseFailure):
+            cm.response(self.store,self.request)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(self.outgoing(),[])
+
+    def test_attempted_ambient_reply_retries_but_untouched_ambient_does_not(self):
+        self.ambient()
+        def model(argv,*args,**kwargs):
+            if argv[0]=='llm':raise cm.MemoryError('command timed out: llm')
+            return self.real_run(argv,*args,**kwargs)
+        with mock.patch.object(cm,'run',side_effect=model), self.assertRaises(cm.ResponseFailure):
+            cm.response(self.store,self.request)
+        item=self.store.request('operator:42')
+        item[4]['responder_attempt']['retry_at']=0
+        self.store.save(item,item[4])
+        self.assertEqual(len(cm.replay_unanswered(self.store)['queued']),1)
+        self.assertEqual(cm.replay_unanswered(self.store)['queued'],[])
+        self.plan={'reply':'Your move.','decision':'reply','goal':None,'memories':[]}
+        with mock.patch.object(cm,'run',side_effect=self.model):
+            cm.response(self.store,self.request)
+        self.assertEqual(len(self.outgoing()),1)
+        other={**self.envelope,'step_id':'ambient-untouched','request_id':'ambient:untouched'}
+        self.store.capture(*cm.envelope_payload(other))
+        self.log.write_text(self.log.read_text()+cm.encode(other)+'\n')
+        self.assertEqual(cm.replay_unanswered(self.store,older_than=0)['queued'],[])
+
+    def test_stale_ambient_recovery_suppressed_without_model(self):
+        self.ambient()
+        gid=self.store.capture(*cm.envelope_payload(self.envelope))['goal_id']
+        item=self.store.find(gid)
+        item[4]['received_at']='2020-01-01T00:00:00+00:00'
+        item[4]['responder_attempt']={'state':'failed','count':1,'retryable':True,'retry_at':0}
+        self.store.save(item,item[4])
+        with mock.patch.object(cm,'run',side_effect=lambda argv,*a,**kw: self.fail('no inference') if argv[0]=='llm' else self.real_run(argv,*a,**kw)):
+            cm.response(self.store,self.request)
+        self.assertEqual(self.outgoing(),[])
+        self.assertEqual(self.store.find(gid)[4]['response']['reason'],'superseded_ambient_reply')
+
+    def test_newer_conversation_suppresses_ambient_retry_but_keeps_receipt_reconciliation(self):
+        self.ambient()
+        gid=self.store.capture(*cm.envelope_payload(self.envelope))['goal_id']
+        record=self.store.find(gid)[4]
+        newer={'type':'message','from':'custos','to':'hal','reply_to':'later','ts':cm.now(),'content':'A later answer.'}
+        self.assertTrue(cm.ambient_superseded(record,iter([newer])))
+        own={**newer,'reply_to':'trigger-1'}
+        self.assertFalse(cm.ambient_superseded(record,[newer,own]))
+        record['response']={'state':'prepared','plan':self.plan}
+        self.assertFalse(cm.ambient_superseded(record,[newer]))  # deferred work survives
+
+    def test_replay_resumes_prepared_defer_without_second_model_or_duplicate_memory(self):
+        real_commit=self.store.commit
+        failed=False
+        def uncertain(*args,**kwargs):
+            nonlocal failed
+            result=real_commit(*args,**kwargs)
+            if len(args)>1 and args[1]=='note' and not failed:
+                failed=True
+                raise cm.MemoryError('injected after note promotion')
+            return result
+        with mock.patch.object(cm,'run',side_effect=self.model), mock.patch.object(self.store,'commit',side_effect=uncertain):
+            with self.assertRaises(cm.ResponseFailure):cm.response(self.store,self.request)
+        item=self.store.request('operator:42')
+        self.assertEqual(item[4]['response']['state'],'prepared')
+        self.assertEqual(item[4]['responder_attempt']['stage'],'memory-apply')
+        item[4]['responder_attempt']['retry_at']=0;self.store.save(item,item[4])
+        self.assertEqual(len(cm.replay_unanswered(self.store)['queued']),1)
+        with mock.patch.object(cm,'run',side_effect=self.model):cm.response(self.store,self.request)
+        self.assertEqual(self.model_calls,1)
+        self.assertEqual(len(self.outgoing()),1)
+        self.assertEqual(sum(f.get('type')=='note' for _,_,_,f,_ in self.store.files()),1)
+
+    def test_replay_resumes_applied_reply_and_reconciles_uncertain_native_send(self):
+        def uncertain(argv,*args,**kwargs):
+            result=self.model(argv,*args,**kwargs)
+            if argv[:2]==['chat','reply']:raise cm.MemoryError('injected after native append')
+            return result
+        with mock.patch.object(cm,'run',side_effect=uncertain), self.assertRaises(cm.ResponseFailure):
+            cm.response(self.store,self.request)
+        item=self.store.request('operator:42')
+        self.assertEqual(item[4]['response']['state'],'applied')
+        self.assertEqual(item[4]['responder_attempt']['stage'],'native-enqueue')
+        item[4]['responder_attempt']['retry_at']=0;self.store.save(item,item[4])
+        self.assertEqual(len(cm.replay_unanswered(self.store)['queued']),1)
+        with mock.patch.object(cm,'run',side_effect=self.model):cm.response(self.store,self.request)
+        self.assertEqual(self.model_calls,1)
+        self.assertEqual(len(self.outgoing()),1)
+
+    def test_recovery_has_three_attempt_bound_and_does_not_race_live_inference(self):
+        calls=[]
+        def unavailable(argv,*args,**kwargs):
+            if argv[0]=='llm':calls.append(argv);raise cm.MemoryError('command timed out: llm')
+            return self.real_run(argv,*args,**kwargs)
+        for n in range(3):
+            with mock.patch.object(cm,'run',side_effect=unavailable), self.assertRaises(cm.ResponseFailure):
+                cm.response(self.store,self.request)
+        with mock.patch.object(cm,'run',side_effect=unavailable):
+            self.assertEqual(cm.response(self.store,self.request)['decision'],'retry-stopped')
+        self.assertEqual(len(calls),3)
+        self.assertEqual(cm.replay_unanswered(self.store,older_than=0)['queued'],[])
+        item=self.store.request('operator:42')
+        item[4]['responder_attempt']={'state':'running','count':1,'started_at':cm.now()}
+        self.store.save(item,item[4])
+        self.assertEqual(cm.replay_unanswered(self.store,older_than=0)['queued'],[])
+        item=self.store.request('operator:42')
+        item[4]['responder_attempt']['started_at']='2020-01-01T00:00:00+00:00'
+        self.store.save(item,item[4])
+        self.assertEqual(len(cm.replay_unanswered(self.store,older_than=0)['queued']),1)
+
+    def test_third_interrupted_attempt_stops_with_actionable_observation(self):
+        gid=self.store.capture(*cm.envelope_payload(self.envelope))['goal_id']
+        item=self.store.find(gid)
+        item[4]['responder_attempt']={'state':'running','count':3,'started_at':'2020-01-01T00:00:00+00:00'}
+        self.store.save(item,item[4])
+        with mock.patch.object(cm,'run',side_effect=lambda argv,*a,**kw: self.fail('no inference') if argv[0]=='llm' else self.real_run(argv,*a,**kw)):
+            self.assertEqual(cm.response(self.store,self.request)['decision'],'retry-stopped')
+        self.assertEqual(cm.replay_unanswered(self.store,older_than=0)['queued'],[])
+        self.assertEqual([s for s in self.steps() if s.get('decision')=='reply-failed'][-1]['error_code'],'attempt_limit')
+
+    def test_format_repair_obeys_remaining_wall_clock_budget(self):
+        calls=[]
+        def slow(argv,*args,**kwargs):
+            if argv[0]=='llm':calls.append(argv);return '{"reply":"broken","decision":'
+            return self.real_run(argv,*args,**kwargs)
+        with mock.patch.object(cm,'run',side_effect=slow), mock.patch.object(cm.time,'monotonic',side_effect=[0,640]):
+            with self.assertRaises(cm.ResponseFailure):cm.response(self.store,self.request)
+        self.assertEqual(len(calls),1)
+
 
 
 if __name__ == "__main__":

@@ -660,3 +660,45 @@ mind a nudge to start a conversation with someone on Signal").
   the square in 24 h, the routing hints invite a post (`MONOLITH_SQUARE_INITIATE_HOURS`).
 - Charter: never deliver a substantive answer in a borrowed voice.
 - Tests: renewal 164 (memory 43).
+
+## Responder formatting and recovery — 2026-09-09
+
+Tic-tac-toe replies beginning `[X]` were rejected as malformed JSON, including
+boards inside otherwise valid response envelopes. The responder now recognizes
+control fields and protocol markers separately from ordinary human text. Boards,
+Markdown links/lists/code, and short replies pass; truncated/duplicate envelopes
+and protocol data inside a reply do not fall through to chat.
+
+- Native observations identify the failed stage, error code, trigger, attempt,
+  retry eligibility, and private diagnostic reference. Diagnostics are bounded
+  to 50 files, redacted, directory 0700/files 0600. The shell avoids emitting a
+  second generic failure when the Python runner already recorded the failure.
+- `responder_attempt` lives on the original native request. At most three
+  attempts; failed attempts wait at least 30 seconds before observer admission.
+  A still-running attempt is not replayed before the 650-second responder
+  deadline plus 30 seconds. Prepared/applied plans resume without another model
+  call; the original request/trigger receipts still prevent duplicate writes.
+- Attempted ambient replies can recover; untouched ambient events and deliberate
+  silence do not become retry work. Ambient recovery older than five minutes,
+  or superseded by a later Custos text in that conversation, settles with an
+  explicit no-reply observation. Existing matching sends reconcile instead;
+  deferred work is never expired by this conversation rule. Freshness is checked
+  again before native enqueue.
+- A malformed envelope or a detected promise without a deferred goal gets at most
+  one format repair, with a 4096-token/60-second cap inside the existing total
+  deadline. A repair must return an envelope and cannot discard an identified
+  commitment into silence. Duplicate control keys are rejected without repair.
+  Exhausted format repair is terminal for automatic retries. Promise detection
+  is a conservative phrase tripwire, not a guarantee covering every wording.
+- Ordinary text fallback is visible as `response_format:text`; it carries no
+  inferred person facts or memories. Valid structured replies retain bounded
+  person/memory writes. Optional person-write failures are labelled separately
+  after native enqueue. `sent` still means native enqueue; consult transport
+  receipts for actual Signal submission or square delivery.
+
+Regression coverage uses temporary identities and mocked inference: captured
+board formats, short/Markdown replies, malformed control data, one-shot repair,
+commitment preservation, private diagnostics, attempted ambient replay, stale
+suppression, recovery attempt limits, and failures after memory promotion/native
+reply append. Installed shell tests check that one precise failure observation
+survives the wrapper with no protocol-text delivery.
