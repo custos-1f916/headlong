@@ -810,7 +810,58 @@ Do not put this JSON, commands, or protocol markers in the reply string.
 '''
 
 
-def validate_plan(raw):
+def lenient_json(raw):
+    """The model's JSON, or the first JSON object inside its reply.
+
+    Medium-effort replies sometimes arrive fenced in ```json, prefixed with a
+    word of prose, or with a raw newline inside a string. A human should not
+    lose their answer to that: peel the fence, find the outermost object, and
+    allow control characters inside strings. Duplicate keys still fail."""
+    candidates = [raw]
+    stripped = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.S)
+    if stripped != raw:
+        candidates.append(stripped)
+    start, end = raw.find("{"), raw.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(raw[start:end + 1])
+    last = None
+    for candidate in candidates:
+        for strict in (True, False):
+            try:
+                def pairs(items):
+                    result = {}
+                    for key, value in items:
+                        if key in result:
+                            raise InvalidInput("duplicate JSON key")
+                        result[key] = value
+                    return result
+                return json.loads(candidate, object_pairs_hook=pairs, strict=strict,
+                                  parse_constant=lambda _: (_ for _ in ()).throw(InvalidInput("nonfinite JSON")))
+            except InvalidInput as exc:
+                if "duplicate" in str(exc):
+                    raise
+                last = exc
+            except (ValueError, TypeError) as exc:
+                last = exc
+    raise InvalidInput("invalid JSON") from last
+
+
+def record_invalid_response(raw, reason):
+    """Keep the raw model reply that failed validation, bounded, for diagnosis."""
+    identity = os.environ.get("IDENTITY_DIR")
+    if not identity:
+        return
+    try:
+        logs = Path(identity) / "run/logs/responder-invalid"
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / (str(time.time_ns()) + ".txt")).write_text("# " + reason + "\n" + raw)
+        for old in sorted(logs.glob("*.txt"), reverse=True)[20:]:
+            old.unlink()
+    except OSError:
+        pass
+
+
+def validate_plan(raw, allow_reaction=True):
     raw = text(raw, "model response", 24576).strip()
     # Transitional native protocol remains supported; arbitrary prose is NOT
     # accepted, so malformed JSON can never be sent to the human as text.
@@ -824,22 +875,47 @@ def validate_plan(raw):
             "outcome": work, "next_action": work,
             "completion": "Deliver the result with evidence, or explain why it cannot be done"}, "memories": []}
     else:
-        plan = strict_json(raw)
-    keys(plan, {"reply", "decision", "goal", "memories"}, {"person"})
+        try:
+            plan = lenient_json(raw)
+        except InvalidInput:
+            record_invalid_response(raw, "invalid JSON")
+            raise
+    if not isinstance(plan, dict):
+        record_invalid_response(raw, "not an object")
+        raise InvalidInput("invalid JSON")
+    # Unknown extra fields are dropped rather than fatal; required ones must exist.
+    for key in list(plan):
+        if key not in {"reply", "decision", "goal", "memories", "person"}:
+            del plan[key]
+    plan.setdefault("memories", [])
+    plan.setdefault("goal", None)
     plan.setdefault("person", None)
+    keys(plan, {"reply", "decision", "goal", "memories"}, {"person"})
+    # The person note is optional: a malformed or oversized one is dropped,
+    # never allowed to fail the human's reply.
     if plan["person"] is not None:
-        keys(plan["person"], {"notes"}, {"display", "aliases"})
-        text(plan["person"]["notes"], "person notes", PERSON_NOTE_MAX)
-        if "display" in plan["person"]:
-            text(plan["person"]["display"], "person display", 64)
-        aliases = plan["person"].get("aliases", [])
-        if not isinstance(aliases, list) or len(aliases) > 12:
-            raise MemoryError("invalid person aliases")
-        for alias in aliases:
-            text(alias, "person alias", 48)
+        person = plan["person"]
+        ok = isinstance(person, dict) and isinstance(person.get("notes"), str) and person["notes"].strip()
+        if ok:
+            notes = person["notes"]
+            if len(notes) > PERSON_NOTE_MAX:
+                notes = notes[:PERSON_NOTE_MAX].rsplit(" ", 1)[0]
+            aliases = [a for a in (person.get("aliases") or []) if isinstance(a, str) and a.strip()][:12] if isinstance(person.get("aliases"), list) else []
+            display = person.get("display") if isinstance(person.get("display"), str) and 0 < len(person["display"]) <= 64 else None
+            plan["person"] = {"notes": notes, "aliases": [a[:48] for a in aliases]}
+            if display:
+                plan["person"]["display"] = display
+        else:
+            plan["person"] = None
+    if not isinstance(plan["reply"], str):
+        plan["reply"] = ""
     text(plan["reply"], "reply", 8192, empty=True)
     if plan["decision"] not in {"reply", "defer", "no-reply", "react"}:
         raise MemoryError("invalid reply decision")
+    if plan["decision"] == "react" and not allow_reaction:
+        # Chosen a reaction where the transport has none: fall back to silence
+        # rather than failing the turn.
+        plan = {**plan, "decision": "no-reply", "reply": "", "goal": None}
     if plan["decision"] == "react" and (not valid_emoji(plan["reply"]) or plan["goal"] is not None):
         raise MemoryError("reaction must be one emoji with no task")
     if (plan["decision"] == "no-reply") != (not plan["reply"].strip()):
@@ -850,15 +926,16 @@ def validate_plan(raw):
         keys(plan["goal"], {"outcome", "next_action", "completion"})
         for key, value in plan["goal"].items():
             text(value, key, 4096)
-    if not isinstance(plan["memories"], list) or len(plan["memories"]) > 2:
-        raise MemoryError("too many memory writes")
-    for memory in plan["memories"]:
-        keys(memory, {"type", "content"})
-        if memory["type"] not in {"note", "fact", "lesson"}:
-            raise MemoryError("disallowed memory type")
-        text(memory["content"], "memory content", 2048)
-        if MARKER.strip() in memory["content"] or NOTE_MARKER.strip() in memory["content"]:
-            raise MemoryError("reserved memory marker")
+    if not isinstance(plan["memories"], list):
+        plan["memories"] = []
+    kept = []
+    for memory in plan["memories"][:2]:
+        if (isinstance(memory, dict) and memory.get("type") in {"note", "fact", "lesson"}
+                and isinstance(memory.get("content"), str) and memory["content"].strip()
+                and len(memory["content"]) <= 2048 and "\x00" not in memory["content"]
+                and MARKER.strip() not in memory["content"] and NOTE_MARKER.strip() not in memory["content"]):
+            kept.append({"type": memory["type"], "content": memory["content"]})
+    plan["memories"] = kept
     return plan
 
 
@@ -1011,9 +1088,7 @@ def response(store, payload):
                     raw=run(argv+['--messages-file',str(message_file),'-s',system],timeout=RESPONSE_TIMEOUT)
             else:
                 raw=run(argv+['-M',encode(messages),'-s',system],timeout=RESPONSE_TIMEOUT)
-            plan = validate_plan(raw)
-            if plan["decision"] == "react" and not incoming.get("allow_reaction"):
-                raise InvalidInput("this transport does not support reactions")
+            plan = validate_plan(raw, allow_reaction=bool(incoming.get("allow_reaction")))
             if incoming.get("ambient") and plan["goal"] is not None and plan["decision"] != "defer":
                 raise InvalidInput("ambient task requires explicit defer decision")
             with store.lock():
