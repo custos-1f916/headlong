@@ -579,3 +579,19 @@ commit; live in LXC 122 the same night.
 - Tests: renewal 157 (memory 36, seven new); upstream 66 files including
   `test_shellm_guard.sh`, `test_mem_add_flags.sh`; `test_monolith_backoff.sh`
   now stubs `custos-memory`/`identity` (it had been failing since the renewal).
+
+### Tool-call markup and the Baby Name app — 2026-09-09
+
+- `bin/shellm` `normalize_toolcall_markup`: when a reply has no fence but uses
+  Qwen's `<tool_call>` / `<function=bash>` / `<parameter=…>` / `<bash>` markup
+  (4 of 46 replies on 2026-09-09, each a wasted turn), the code between the
+  openers and the first closer is lifted into a ```bash fence and executed,
+  with a stderr notice teaching the fence. A real fence always wins. The system
+  prompt now says the runtime is not a tool-calling API. Test cases in
+  `tests/test_extract_code_notice.sh`.
+- Hal opened the Baby Name app to Custos: nft boundary allows `192.168.86.62:3000`
+  (`custos-boundary.nft`), private repo `collettiquette/baby-name` with
+  `custos-1f916` as a push collaborator, pull-based deploy on LXC 108 (push to
+  `main`, status at `/deploy.json`), and `baby-name.ha1.io` through the proxy.
+  The repo's `AGENTS.md` carries the data rules (never touch `data/db.json`,
+  never change a `sex` field, duels persist).

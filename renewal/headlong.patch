@@ -371,7 +371,7 @@ index d3711eb..cb4b738 100755
      # awk, not `grep | head`: head's early exit SIGPIPEs grep under pipefail
      # once the payload outgrows the pipe buffer (large --fanout).
 diff --git a/bin/shellm b/bin/shellm
-index 1a27f50..ab676af 100755
+index 1a27f50..1e30acd 100755
 --- a/bin/shellm
 +++ b/bin/shellm
 @@ -130,6 +130,9 @@ SHELLM_CONTEXT_RUN_TAIL_BLOCK="${SHELLM_CONTEXT_RUN_TAIL_BLOCK:-50}"
@@ -462,7 +462,79 @@ index 1a27f50..ab676af 100755
  # execute_code WORKSPACE CODE [NAME=VALUE ...]
  #
  # env_vars carries API keys (the nested-run key, `--var` forwards from the
-@@ -1746,6 +1797,17 @@ NOTICE
+@@ -1613,8 +1664,56 @@ call_llm() {
+ # Code extraction from LLM response
+ # ---------------------------------------------------------------------------
+ 
++# normalize_toolcall_markup RESPONSE — Qwen-family models sometimes answer in
++# their native tool-call markup instead of a fence:
++#   <tool_call>            <tool_call>              <tool_call>
++#   <function=bash>        <function=bash>          set -e
++#   set -e … code …        <parameter=command>      … code …
++#   </function>            … code …                 </tool_call>
++#   </tool_call>           </parameter> …
++# (also the hybrid "<function=bash> … </bash>"). Run as-is, the first line is a
++# bash syntax error and the whole turn is wasted (4 of 46 responses on Custos,
++# 2026-09-09). When a response has NO fence but does have this markup, lift
++# the code between the openers and the first closer into a ```bash fence so
++# it executes, and tell the model on stderr what happened so it learns the
++# fence. A response that has a real fence is left alone (fences win).
++normalize_toolcall_markup() {
++    local response="$1"
++    case "$response" in
++        *"<tool_call>"*|*"<function="*|*"<bash>"*) ;;
++        *) printf '%s' "$response"; return 1 ;;
++    esac
++    if printf '%s\n' "$response" | grep -qE '^```|```(bash|shell|sh)[[:space:]]*$'; then
++        printf '%s' "$response"; return 1
++    fi
++    local lifted
++    lifted=$(printf '%s\n' "$response" | awk '
++        BEGIN { started = 0 }
++        !started {
++            if ($0 ~ /^[[:space:]]*<(tool_call|function=[A-Za-z_]+|parameter=[A-Za-z_]+|bash)>[[:space:]]*$/) { started = 1 }
++            next
++        }
++        started {
++            if ($0 ~ /^[[:space:]]*<\/(tool_call|function|parameter|bash)>[[:space:]]*$/) { exit }
++            if ($0 ~ /^[[:space:]]*<(function=[A-Za-z_]+|parameter=[A-Za-z_]+|bash)>[[:space:]]*$/) { next }
++            print
++        }')
++    if [[ "$lifted" =~ [^[:space:]] ]]; then
++        printf '%s' $'```bash\n'"$lifted"$'\n```'
++        return 0
++    fi
++    printf '%s' "$response"
++    return 1
++}
++
+ extract_code() {
+     local response="$1"
++    local toolcall_lifted=0
++    local _normalized
++    if _normalized=$(normalize_toolcall_markup "$response"); then
++        response="$_normalized"
++        toolcall_lifted=1
++    fi
+ 
+     # Extract the FIRST fenced code block (```bash, ```sh, or bare ```).
+     # Heredoc-aware: lines like ``` inside an open heredoc do NOT close the
+@@ -1737,6 +1836,14 @@ extract_code() {
+     if [[ "$truncation_signal" == *TRUNCATED* ]]; then
+         code=$'echo "[rest of model response truncated after first code block]" >&2\n'"$code"
+     fi
++    if [[ "$toolcall_lifted" -eq 1 ]]; then
++        local toolcall_notice
++        toolcall_notice=$(cat <<'NOTICE'
++printf '%s\n' '[shellm: your reply used <tool_call>/<function=bash> markup. This runtime only reads ```bash fences; it lifted your code into one and ran it this time. Next time put the script inside a ```bash block, nothing else.]' >&2
++NOTICE
++)
++        code="$toolcall_notice"$'\n'"$code"
++    fi
+     if [[ "$no_fence" -eq 1 ]]; then
+         local nofence_notice
+         nofence_notice=$(cat <<'NOTICE'
+@@ -1746,6 +1853,17 @@ NOTICE
          code="$nofence_notice"$'\n'"$code"
      fi
  
@@ -480,7 +552,15 @@ index 1a27f50..ab676af 100755
      echo "$code"
  }
  
-@@ -2409,7 +2471,7 @@ run_loop() {
+@@ -1765,6 +1883,7 @@ build_system_prompt() {
+ You are running in shellm, headlong's bash agent loop: you solve tasks by generating and executing bash code.
+ 
+ IMPORTANT: End your response with exactly ONE ```bash code block. Your response is NOT streamed — code blocks are not executed until your entire response is complete. Combine multiple steps into a single script. Only the first code block is executed; all others are silently discarded.
++Never use <tool_call>, <function=bash>, <parameter=...> or <bash> tags: this runtime is not a tool-calling API and only reads ```bash fences.
+ 
+ CRITICAL — the opening ```bash fence MUST start on its OWN new line. Put a
+ newline after your prose, THEN the fence on a line by itself. Never append the
+@@ -2409,7 +2528,7 @@ run_loop() {
      # alone can't tell whose header is whose when concurrent runs interleave.
      [[ -n "${SHELLM_RUN_ID_OUT:-}" ]] && printf '%s' "$_run_step_id" > "$SHELLM_RUN_ID_OUT" || true
  
@@ -489,7 +569,7 @@ index 1a27f50..ab676af 100755
          # New trajectory — kick off async run-summary generation
          local stdin_ctx_file=""
          if [[ -n "$stdin_context" ]]; then
-@@ -2517,7 +2579,10 @@ run_loop() {
+@@ -2517,7 +2636,10 @@ run_loop() {
                  --tail "$SHELLM_CONTEXT_RUN_TAIL" --tail-block "$SHELLM_CONTEXT_RUN_TAIL_BLOCK")
              [[ -n "$_prompt_step_id" ]] && _ctx_args+=(--pin "$_prompt_step_id")
          fi
@@ -501,7 +581,7 @@ index 1a27f50..ab676af 100755
  
          # Call Claude (capture thinking/reasoning to file)
          local thinking_file="$rundir/.last_thinking"
-@@ -2543,9 +2608,8 @@ run_loop() {
+@@ -2543,9 +2665,8 @@ run_loop() {
          fi
          rm -f "$thinking_file"
  
@@ -513,7 +593,7 @@ index 1a27f50..ab676af 100755
          # Default: 8 retries; SHELLM_EMPTY_RESPONSE_RETRIES overrides (set it
          # to the empty string for unlimited).
          local empty_retries=0
-@@ -2569,9 +2633,22 @@ run_loop() {
+@@ -2569,9 +2690,22 @@ run_loop() {
                  local feedback_file
                  feedback_file=$(mktemp)
                  printf '%s' "$feedback" > "$feedback_file"
@@ -539,7 +619,7 @@ index 1a27f50..ab676af 100755
                  rm -f "$feedback_file"
                  sleep 1
              else
-@@ -2644,7 +2721,8 @@ run_loop() {
+@@ -2644,7 +2778,8 @@ run_loop() {
          # Build wrapped code that captures FINAL/FINAL_FILE after execution
          local wrapped_code
          # shellcheck disable=SC1078,SC1079  # one long double-quoted string, built across lines on purpose
@@ -549,7 +629,7 @@ index 1a27f50..ab676af 100755
  $code
  set +x"$'\n'"
  __shellm_rc=\$?
-@@ -2662,6 +2740,9 @@ exit \$__shellm_rc
+@@ -2662,6 +2797,9 @@ exit \$__shellm_rc
              execution_api_url=$(_shellm_container_api_url "$execution_api_url")
          fi
          local -a env_vars=(
@@ -559,7 +639,7 @@ index 1a27f50..ab676af 100755
              SHELLM_WORKDIR="$workdir"
              SHELLM_ENV="$(if [[ "${_SHELLM_DOCKER_MODE:-0}" -eq 1 && "$SHELLM_ALLOW_NESTED_DOCKER" != "1" ]]; then echo "local"; else echo "${_SHELLM_ACTIVE_ENV:-}"; fi)"
              _SHELLM_PARENT_CONTAINER="${_SHELLM_CONTAINER:-}"
-@@ -2672,6 +2753,9 @@ exit \$__shellm_rc
+@@ -2672,6 +2810,9 @@ exit \$__shellm_rc
              LLM_PROVIDER="${LLM_PROVIDER:-}"
              LLM_API_KEY="${LLM_API_KEY:-}"
              SHELLM_MODEL="$SHELLM_MODEL"
@@ -740,10 +820,20 @@ index dc453ef..4e604df 100755
  
  # 5. Excluded types never appear in output.
 diff --git a/tests/test_extract_code_notice.sh b/tests/test_extract_code_notice.sh
-index b5c64e2..9fec675 100755
+index b5c64e2..841b917 100755
 --- a/tests/test_extract_code_notice.sh
 +++ b/tests/test_extract_code_notice.sh
-@@ -61,6 +61,27 @@ echo hi
+@@ -25,7 +25,8 @@ bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
+ # `source <(...)`: the CI macOS bash 3.2 binary has no process substitution.
+ FN=$(mktemp)
+ trap 'rm -f "$FN"' EXIT
+-sed -n '/^extract_code() {/,/^}/p' "$REPO/bin/shellm" > "$FN"
++sed -n '/^normalize_toolcall_markup() {/,/^}/p' "$REPO/bin/shellm" > "$FN"
++sed -n '/^extract_code() {/,/^}/p' "$REPO/bin/shellm" >> "$FN"
+ # shellcheck disable=SC1090
+ source "$FN"
+ 
+@@ -61,6 +62,57 @@ echo hi
  \`\`\`")
  grep -q "$NOTICE" <<<"$out" && bad "an end-of-line fence must not get the notice" || ok "an end-of-line fence gets no notice"
  
@@ -771,6 +861,36 @@ index b5c64e2..9fec675 100755
  echo
  echo "$pass passed, $fail failed"
  [[ $fail -eq 0 ]]
++
++# --- Qwen tool-call markup is lifted into a fence and runs, with a notice ------
++# Four shapes seen on Custos 2026-09-09: canonical <tool_call><function=bash>…
++# </function></tool_call>; the hybrid …</bash>; a bare <tool_call> wrapper; and
++# <parameter=command> inside <function=bash>. A real fence always wins.
++for shape in canonical hybrid bare parameter; do
++    case "$shape" in
++        canonical) resp=$'Let me check.\n<tool_call>\n<function=bash>\necho lifted-canonical\n</function>\n</tool_call>' ;;
++        hybrid)    resp=$'<tool_call>\n<function=bash>\necho lifted-hybrid\n</bash>\n\n</bash>' ;;
++        bare)      resp=$'<tool_call>\necho lifted-bare\nFINAL="done"' ;;
++        parameter) resp=$'<tool_call>\n<function=bash>\n<parameter=command>\necho lifted-parameter\n</parameter>\n</function>\n</tool_call>' ;;
++    esac
++    out=$(extract_code "$resp")
++    ran=$(bash -c "$out" 2>/tmp/notice.$$)
++    if [[ "$ran" == "lifted-$shape"* ]] && grep -q 'used <tool_call>/<function=bash> markup' /tmp/notice.$$; then
++        ok "tool-call markup ($shape) is lifted, runs, and carries the notice"
++    else
++        bad "tool-call markup ($shape) is lifted, runs, and carries the notice" "ran=$ran notice=$(cat /tmp/notice.$$ | head -c 120)"
++    fi
++    rm -f /tmp/notice.$$
++done
++out=$(extract_code $'<tool_call> mentioned in prose\n```bash\necho fence-wins\n```')
++if [[ "$(bash -c "$out" 2>/dev/null)" == "fence-wins" ]] && [[ "$out" != *"used <tool_call>"* ]]; then
++    ok "a real fence wins over tool-call words in prose"
++else
++    bad "a real fence wins over tool-call words in prose" "$out"
++fi
++
++printf '\n%d passed, %d failed\n' "$pass" "$fail"
++[[ "$fail" -eq 0 ]]
 diff --git a/tests/test_identity_strict_activation.sh b/tests/test_identity_strict_activation.sh
 new file mode 100755
 index 0000000..53b36f5

@@ -16,6 +16,8 @@ table bridge custos122 {
         ether type ip ip daddr { 192.168.86.50, 192.168.86.51 } tcp dport 53 accept
         ether type ip ip daddr 192.168.86.44 tcp dport { 18080, 18081, 18082 } accept
         ether type ip ip daddr 192.168.86.46 tcp dport 3000 accept
+        # Baby Name app on LXC 108 (Hal, 2026-09-09): Custos may read and test it.
+        ether type ip ip daddr 192.168.86.62 tcp dport 3000 accept
         # Direct LAN, alternate/private addressing and public-IP hairpin are denied.
         ether type ip ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4, 136.47.9.156 } counter drop
         ether type ip accept
