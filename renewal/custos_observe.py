@@ -16,7 +16,7 @@ import urllib.error
 import uuid
 import xml.etree.ElementTree as ET
 
-from custos_square import APIError, ORIGIN, STATE, SECRET, Square, Store, canonical, digest, public_request
+from custos_square import APIError, ORIGIN, STATE, SECRET, Square, Store, allowance_summary, canonical, digest, note_allowance, public_request, square_queue
 
 BUCKETS = ("replies", "comments_on_your_posts", "mentions_of_you", "in_threads_you_joined")
 CONFIG = Path(__file__).with_name("observations.json")
@@ -103,7 +103,11 @@ class Observer:
                 alerted = self.emit("failure:" + name + ":" + str(episode), "Observation source unavailable: " + name + " (" + code + "). This is not an empty-work result.")
             else:
                 alerted = True
-            backoff = max(interval, min(21600, 300 * 2 ** min(failures - 1, 6)), getattr(exc, "retry_after", 0))
+            if code == "platform_allowance_exhausted" and getattr(exc, "retry_after", 0):
+                # A known reset time: wait exactly for it, never longer.
+                backoff = max(interval, getattr(exc, "retry_after", 0))
+            else:
+                backoff = max(interval, min(21600, 300 * 2 ** min(failures - 1, 6)), getattr(exc, "retry_after", 0))
             self.store.put("source:" + name, {"error": code, "failures": failures, "episode": episode, "alerted": alerted, "next": self.now + backoff})
             return
         episode = state.get("episode", 0)
@@ -148,6 +152,8 @@ class Observer:
         # consume at most max_signals; ID adoption never skips outstanding asks.
         for _ in range(min(4, max(1, int(self.config.get("inbox_pages_per_run", 1))))):
             page = pending or self.square.get("/api/me", {"cursor_mode": "id"}, auth=True)
+            if not pending:
+                note_allowance(self.store, page)
             buckets = page["since_last_visit"]
             cursor = page.get("ack_cursor")
             if page.get("cursor_mode") != "id" or buckets.get("contract") != "1f916.inbox.since_last_visit.v3":
@@ -324,6 +330,18 @@ class Observer:
         cursor = self.store.get("outbox:cursor", {"path": str(path), "offset": 0})
         if cursor["path"] != str(path) or cursor["offset"] > path.stat().st_size:
             raise APIError("outbox_trajectory_replaced_requires_explicit_migration")
+        if self.store.get("outbox:cursor") is None:
+            self.store.put("outbox:cursor", cursor)
+        try:
+            self._drain_outbox(path, cursor)
+        finally:
+            # Queue depth after this pass: square replies past the cursor that have
+            # not gone out, so the mind can see how many wait behind the allowance.
+            pending = square_queue(self.store, path)
+            self.store.put("outbox:square_pending", {"count": len(pending), "oldest": pending[0]["ts"] if pending else None,
+                                                      "items": pending[:20], "at": self.now})
+
+    def _drain_outbox(self, path, cursor):
         with path.open("rb") as source:
             source.seek(cursor["offset"])
             for _ in range(300):
@@ -339,6 +357,13 @@ class Observer:
                     match = re.fullmatch(r"square:([A-Za-z0-9_-]{2,32}):([1-9][0-9]*):(0|[1-9][0-9]*)", row["to"])
                     if not match or not row.get("step_id"):
                         raise APIError("invalid_square_outbox_target")
+                    if self.store.get("outbox:skip:" + row["step_id"], None):
+                        # Withdrawn by the mind (custos-observe withdraw STEP_ID): skip, never deliver.
+                        self.native.append("withdrawn:" + row["step_id"], {"type": "observation", "source": "square-outbox",
+                                           "content": "Square reply withdrawn before delivery (" + row["to"] + ").", "reply_to": row["step_id"]})
+                        cursor["offset"] = source.tell()
+                        self.store.put("outbox:cursor", cursor)
+                        continue
                     handle, post, parent = match.groups()
                     # Routing identity must still name the actual public addressee.
                     kind, target_id = ("comment", parent) if parent != "0" else ("post", post)
@@ -348,7 +373,19 @@ class Observer:
                     payload = {"post_id": int(post), "body": row["content"]}
                     if parent != "0":
                         payload["parent_id"] = int(parent)
-                    receipt = self.square.write("traj:" + row["step_id"], "comment", payload)
+                    try:
+                        receipt = self.square.write("traj:" + row["step_id"], "comment", payload)
+                    except APIError as exc:
+                        if exc.code == "platform_allowance_exhausted":
+                            # Tell the mind, once per reply, that this one is waiting. The
+                            # cursor stays here so order is kept; the source retries at reset.
+                            when = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(self.now + getattr(exc, "retry_after", 3600)))
+                            queued = len(square_queue(self.store, path))
+                            self.native.append("allowance-wait:" + row["step_id"], {"type": "observation", "source": "square-outbox",
+                                               "content": "Square reply to @" + handle + " (thread " + post + ") is waiting for the daily comment allowance; "
+                                                          + str(queued) + (" reply" if queued == 1 else " replies") + " queued, delivery resumes about " + when
+                                                          + ". Withdraw a stale one with: custos-observe withdraw " + row["step_id"], "reply_to": row["step_id"]})
+                        raise
                     self.native.append("delivery:" + row["step_id"], {"type": "observation", "source": "square-outbox", "content": "Public square reply delivered: " + canonical(receipt), "reply_to": row["step_id"]})
                 if row.get("type") == "message" and row.get("from") == "custos" and str(row.get("to", "")).startswith("forum:"):
                     from custos_forum import Forum
@@ -594,13 +631,25 @@ def record_result(store, result):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("once", "status", "import-continuity", "record-result"))
+    parser.add_argument("command", choices=("once", "status", "import-continuity", "record-result", "withdraw"))
+    parser.add_argument("step_id", nargs="?", help="withdraw: the outgoing square message step id to skip")
     parser.add_argument("--config", type=Path, default=CONFIG)
     parser.add_argument("--file", type=Path)
     args = parser.parse_args(argv)
     store = Store()
     if args.command == "status":
-        print(canonical({"sources": {row["key"]: json.loads(row["value"]) for row in store.db.execute("SELECT * FROM state WHERE key LIKE 'source:%'")}, "outbox": [dict(row) for row in store.db.execute("SELECT id,status,receipt FROM outbound ORDER BY started DESC LIMIT 30")], "inbox_page_pending": store.get("inbox:page") is not None}))
+        print(canonical({"sources": {row["key"]: json.loads(row["value"]) for row in store.db.execute("SELECT * FROM state WHERE key LIKE 'source:%'")},
+                         "outbox": [dict(row) for row in store.db.execute("SELECT id,status,receipt FROM outbound ORDER BY started DESC LIMIT 30")],
+                         "square_pending": {"count": len(square_queue(store)), "items": square_queue(store)[:20]},
+                         "square_allowance": allowance_summary(store),
+                         "inbox_page_pending": store.get("inbox:page") is not None}))
+        return 0
+    if args.command == "withdraw":
+        if not args.step_id or not re.fullmatch(r"[0-9a-f-]{8,64}", args.step_id):
+            print("custos-observe withdraw STEP_ID (the full step id of your outgoing square message)", file=sys.stderr)
+            return 2
+        store.put("outbox:skip:" + args.step_id, {"at": time.time()})
+        print(canonical({"withdrawn": args.step_id, "note": "skipped at the next outbox pass; already-delivered replies cannot be withdrawn"}))
         return 0
     try:
         with (STATE / "run.lock").open("a") as lock:

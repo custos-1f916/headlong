@@ -316,3 +316,118 @@ class ObservationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SquareOutboxTests(unittest.TestCase):
+    """Replies composed past the daily comment allowance: they must wait for the
+    reset (not an exponential backoff), the mind must hear about each one, and a
+    stale one can be withdrawn without losing the ones behind it."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = Store(self.temp.name)
+        self.addCleanup(self.store.db.close)
+        self.traj = Path(self.temp.name) / "traj.jsonl"
+        self.traj.write_text("")
+        self.native = NativeFixture()
+        self.native.path = self.traj
+        self.now = 1788960000.0  # 2026-09-09 13:20Z
+        self.reset_ms = 1788998400000  # 2026-09-10 00:00Z
+
+    def compose(self, step, handle="egress", post=3100, parent=50000):
+        row = {"type": "message", "from": "custos", "to": "square:%s:%d:%d" % (handle, post, parent),
+               "content": "reply " + step, "step_id": step, "ts": "2026-09-09T13:0%s:00.000Z" % step[-1]}
+        with self.traj.open("a") as out:
+            out.write(json.dumps(row) + "\n")
+
+    def square(self, remaining):
+        store = self.store
+        class Fake(Square):
+            def __init__(self):
+                super().__init__(store)
+                self.remaining = remaining
+                self.posted = []
+            def validate(self, verb, payload):
+                pass
+            def get(self, path, query=None, auth=False):
+                if path == "/api/me":
+                    return {"handle": "custos", "today": {"comments_remaining": self.remaining, "posts_remaining": 1,
+                                                          "interval": {"until": 1788998400000, "utc_date": "2026-09-09"}}}
+                return {"comment": {"author": "egress"}, "post": {"author": "egress"}}
+            def request(self, path, query=None, **kwargs):
+                self.remaining -= 1
+                self.posted.append(kwargs["body"]["body"])
+                return {"id": 700 + len(self.posted)}, None
+            def receipt(self, identity):
+                return {"request_id": identity, "status": "delivered"}
+        return Fake()
+
+    def observer(self, api):
+        return Observer({}, self.store, api, self.native, now=self.now)
+
+    def test_allowance_exhausted_waits_until_reset_and_reports_each_queued_reply(self):
+        api = self.square(remaining=1)
+        for step in ("aaaaaaa1", "aaaaaaa2", "aaaaaaa3"):
+            self.compose(step)
+        observer = self.observer(api)
+        with patch("custos_square.time.time", return_value=self.now):
+            observer.source("square-outbox", 60, observer.outbox)
+        # One went out, the second hit the allowance, the third never reached the API.
+        self.assertEqual(api.posted, ["reply aaaaaaa1"])
+        self.assertIn("delivery:aaaaaaa1", self.native.messages)
+        waiting = self.native.messages["allowance-wait:aaaaaaa2"]["content"]
+        self.assertIn("2 replies queued", waiting)
+        self.assertIn("2026-09-10T00:00Z", waiting)
+        self.assertIn("custos-observe withdraw aaaaaaa2", waiting)
+        self.assertNotIn("allowance-wait:aaaaaaa3", self.native.messages)
+        # The source retries at the reset (+30 s), not after an exponential backoff.
+        state = self.store.get("source:square-outbox")
+        self.assertEqual(state["error"], "platform_allowance_exhausted")
+        self.assertAlmostEqual(state["next"], self.reset_ms / 1000 + 30, delta=1)
+        # Queue depth and the cached allowance are visible to other processes.
+        from custos_square import allowance_summary, square_queue
+        self.assertEqual([p["step_id"] for p in square_queue(self.store)], ["aaaaaaa2", "aaaaaaa3"])
+        summary = allowance_summary(self.store, now=self.now)
+        self.assertEqual((summary["comments_remaining"], summary["queued"], summary["fresh"]), (0, 2, True))
+        self.assertEqual(summary["resets_at_utc"], "2026-09-10 00:00Z")
+        # After the reset the day rolls over: a full allowance is assumed until the next sample.
+        rolled = allowance_summary(self.store, now=self.reset_ms / 1000 + 5)
+        self.assertEqual((rolled["comments_remaining"], rolled["fresh"]), (12, False))
+
+    def test_repeat_pass_before_reset_does_not_renotify_and_delivers_in_order_after(self):
+        api = self.square(remaining=0)
+        self.compose("bbbbbbb1")
+        self.compose("bbbbbbb2")
+        observer = self.observer(api)
+        with patch("custos_square.time.time", return_value=self.now):
+            observer.source("square-outbox", 60, observer.outbox)
+            observer.now += 600
+            observer.source("square-outbox", 60, observer.outbox)  # still backing off: nothing happens
+        self.assertEqual([k for k in self.native.messages if k.startswith("allowance-wait:")], ["allowance-wait:bbbbbbb1"])
+        api.remaining = 12
+        observer.now = self.reset_ms / 1000 + 31
+        with patch("custos_square.time.time", return_value=observer.now):
+            observer.source("square-outbox", 60, observer.outbox)
+        self.assertEqual(api.posted, ["reply bbbbbbb1", "reply bbbbbbb2"])
+        self.assertIn("recovery:square-outbox:1", self.native.messages)
+        self.assertEqual(self.store.get("outbox:square_pending")["count"], 0)
+
+    def test_withdrawn_reply_is_skipped_and_the_rest_still_deliver(self):
+        api = self.square(remaining=12)
+        self.compose("ccccccc1")
+        self.compose("ccccccc2")
+        self.compose("ccccccc3")
+        from custos_observe import main
+        import io, contextlib
+        with patch("custos_observe.Store", return_value=self.store), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(main(["withdraw", "ccccccc2"]), 0)
+        self.assertIn("ccccccc2", out.getvalue())
+        observer = self.observer(api)
+        with patch("custos_square.time.time", return_value=self.now):
+            observer.source("square-outbox", 60, observer.outbox)
+        self.assertEqual(api.posted, ["reply ccccccc1", "reply ccccccc3"])
+        self.assertIn("withdrawn:ccccccc2", self.native.messages)
+        self.assertNotIn("delivery:ccccccc2", self.native.messages)
+        from custos_square import square_queue
+        self.assertEqual(square_queue(self.store), [])

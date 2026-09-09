@@ -209,6 +209,18 @@ class Square:
                     return receipt
         raise APIError("write_uncertain_manual_review_no_retry")
 
+    def note_allowance(self, me):
+        note_allowance(self.store, me)
+
+    def spend_allowance(self, verb):
+        if verb not in {"comment", "post"}:
+            return
+        cached = self.store.get("square:allowance")
+        if isinstance(cached, dict) and isinstance(cached.get("today"), dict):
+            key = verb + "s_remaining"
+            cached["today"][key] = max(0, int(cached["today"].get(key, 0)) - 1)
+            self.store.put("square:allowance", cached)
+
     def write(self, identity, verb, payload):
         if not isinstance(identity, str) or not 1 <= len(identity) <= 240:
             raise APIError("request_id_required")
@@ -219,8 +231,15 @@ class Square:
             return self.receipt(identity)
         self.validate(verb, payload)
         me = self.get("/api/me", {"cursor_mode": "id"}, auth=True)
+        self.note_allowance(me)
         if me.get("handle") != "custos" or me.get("today", {}).get(verb + "s_remaining", 0) < 1:
-            raise APIError("platform_allowance_exhausted")
+            # Say when the allowance comes back so the outbox retries then,
+            # not after an exponential backoff that can overshoot by hours.
+            until = (me.get("today", {}).get("interval") or {}).get("until")
+            retry = 3600
+            if isinstance(until, (int, float)) and until > 0:
+                retry = max(60, int(until / 1000 - time.time()) + 30)
+            raise APIError("platform_allowance_exhausted", retry)
         # UNIQUE reservation precedes network, including every uncertain failure.
         with self.store.db:
             self.store.db.execute("BEGIN IMMEDIATE")
@@ -239,6 +258,7 @@ class Square:
                 with self.store.db:
                     self.store.db.execute("UPDATE outbound SET status='rejected' WHERE id=?", (identity,))
             raise
+        self.spend_allowance(verb)
         if verb == "vote":
             receipt = {"request_id": identity, "status": "delivered", "result": result}
         else:
@@ -250,6 +270,85 @@ class Square:
         with self.store.db:
             self.store.db.execute("UPDATE outbound SET status='delivered',receipt=? WHERE id=?", (canonical(receipt), identity))
         return receipt
+
+
+def note_allowance(store, me):
+    """Cache the platform's `today` block from an /api/me read so other processes
+    (the responder, the mind's routing hint) can see the remaining daily allowance."""
+    today = me.get("today") if isinstance(me, dict) else None
+    if isinstance(today, dict):
+        store.put("square:allowance", {"today": today, "at": time.time()})
+
+
+def allowance_summary(store, now=None):
+    """What the daily square allowance looks like from the last /api/me we saw.
+
+    Returns None when nothing has been observed yet. `fresh` is False when the
+    sample predates the last UTC reset, in which case the counts are the
+    platform's daily defaults and only the reset time is trusted.
+    """
+    now = time.time() if now is None else now
+    cached = store.get("square:allowance")
+    if not isinstance(cached, dict) or not isinstance(cached.get("today"), dict):
+        return None
+    today = cached["today"]
+    interval = today.get("interval") if isinstance(today.get("interval"), dict) else {}
+    until = interval.get("until")
+    until_s = until / 1000 if isinstance(until, (int, float)) and until > 0 else None
+    fresh = until_s is None or now < until_s
+    if not fresh:
+        # Past the reset: the day rolled over since the sample. Assume a full allowance
+        # and the next midnight UTC as the new reset.
+        until_s = (int(now) // 86400 + 1) * 86400
+        counts = {"comments_remaining": 12, "posts_remaining": 1}
+    else:
+        counts = {"comments_remaining": int(today.get("comments_remaining", 0)), "posts_remaining": int(today.get("posts_remaining", 0))}
+    queued, oldest = live_square_queue(store)
+    return {**counts, "fresh": fresh, "sampled_at": cached.get("at"), "resets_at": until_s,
+            "resets_at_utc": time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(until_s)),
+            "queued": queued, "queued_oldest": oldest}
+
+
+def square_queue(store, path=None):
+    """Custos's square replies recorded in the trajectory past the outbox cursor:
+    composed, not yet delivered, not withdrawn. Oldest first; [] when unknown."""
+    cursor = store.get("outbox:cursor")
+    if not isinstance(cursor, dict) or not cursor.get("path"):
+        return []
+    path = Path(path or cursor["path"])
+    if str(path) != cursor["path"] or not path.is_file():
+        return []
+    pending = []
+    try:
+        with path.open("rb") as probe:
+            probe.seek(int(cursor.get("offset", 0)))
+            for _ in range(5000):
+                line = probe.readline(128 * 1024)
+                if not line or not line.endswith(b"\n"):
+                    break
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if row.get("type") == "message" and row.get("from") == "custos" and str(row.get("to", "")).startswith("square:") \
+                        and not store.get("outbox:skip:" + str(row.get("step_id", "")), None):
+                    pending.append({"step_id": str(row.get("step_id", ""))[:8], "to": row["to"], "ts": row.get("ts", "")})
+    except OSError:
+        return []
+    return pending
+
+
+def live_square_queue(store):
+    """(count, oldest ts) of composed-but-undelivered square replies; falls back to
+    the last outbox pass's count when the trajectory is not readable here."""
+    pending = square_queue(store)
+    if pending:
+        return len(pending), pending[0]["ts"]
+    cursor = store.get("outbox:cursor")
+    if isinstance(cursor, dict) and cursor.get("path") and Path(cursor["path"]).is_file():
+        return 0, None
+    last = store.get("outbox:square_pending") or {}
+    return int(last.get("count", 0) or 0), last.get("oldest")
 
 
 def positive_id(value):

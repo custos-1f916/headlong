@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -661,6 +662,64 @@ def recent_steps(store, max_bytes=2 * 1024 * 1024):
                 continue
 
 
+def square_budget(now=None):
+    """The public square's remaining daily allowance and how many of Custos's
+    replies are still queued behind it, read from the observer's state. None
+    when the observer has never seen /api/me (fresh install, tests)."""
+    try:
+        from custos_square import STATE, allowance_summary
+    except ImportError:
+        return None
+    db_path = Path(STATE) / "observations.sqlite"
+    if not db_path.exists():
+        return None
+
+    class ReadOnly:
+        def __init__(self, db):
+            self.db = db
+
+        def get(self, key, default=None):
+            row = self.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+            return json.loads(row[0]) if row else default
+
+    try:
+        db = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True, timeout=5)
+    except sqlite3.Error:
+        return None
+    try:
+        return allowance_summary(ReadOnly(db), now)
+    except (sqlite3.Error, ValueError, TypeError, KeyError):
+        return None
+    finally:
+        db.close()
+
+
+def square_budget_text(budget, for_reply=True):
+    """One paragraph of budget facts for a prompt. Empty when there is nothing to say."""
+    if not budget:
+        return ""
+    left, queued = budget["comments_remaining"], budget["queued"]
+    if for_reply is False and left >= 4 and queued == 0:
+        return ""
+    line = ("Square allowance (data): %d comment%s left today of 12, %d of your replies still queued behind the "
+            "allowance%s; it resets at %s." % (left, "" if left == 1 else "s", queued,
+                                                (" (oldest from " + str(budget["queued_oldest"])[:16] + "Z)") if budget.get("queued_oldest") else "",
+                                                budget["resets_at_utc"]))
+    if not budget.get("fresh"):
+        line += " (Counts assume the day rolled over since the last check.)"
+    if for_reply:
+        if left < 1 or queued:
+            line += (" A reply you write now will not appear on the square until the queue ahead of it drains after the "
+                     "reset. Prefer no-reply for anything that does not need an answer today, one consolidated reply per "
+                     "thread, and never say you have posted: a queued reply is not a delivered one.")
+        elif left <= 3:
+            line += " Spend the remaining comments on the threads that matter most today; the rest can wait or stay unanswered."
+    else:
+        line += (" Square replies beyond the allowance queue in delivery order and post after the reset; "
+                 "custos-observe status shows the queue and custos-observe withdraw STEP_ID drops a stale one.")
+    return line
+
+
 def last_own_message(store, sender, me):
     """(seconds ago, text) of the last message Custos sent to this sender, or None."""
     last = None
@@ -1064,6 +1123,10 @@ def response(store, payload):
                            "substance, answers a question or explains work. Silence is still fine for "
                            "ambient chatter; do not react to everything. React attaches the emoji to "
                            "the incoming message; it does not send an emoji as a new message.")
+            if incoming["sender"].startswith("square:"):
+                budget_line = square_budget_text(square_budget(), for_reply=True)
+                if budget_line:
+                    system += "\n" + budget_line
             system += "\nActive goals (data):\n" + encode(store.context())
             messages = bounded_conversation(system, payload["messages"])
             if incoming.get('images'):
@@ -1261,6 +1324,9 @@ def context_text(result):
     if dupes:
         lines.append("Possible duplicates of already-completed goals: " + ", ".join("%s ~ %s" % d for d in dupes)
                      + ". Check custos-memory show on both; close the duplicate against the completed one.")
+    budget_line = square_budget_text(square_budget(), for_reply=False)
+    if budget_line:
+        lines.append(budget_line)
     if result["active_directed"]:
         lines.append("A deferred task is real work someone asked for: do it, then deliver with "
                      "chat reply --follow-up --reply-to TRIGGER SENDER and close it with custos-memory complete "

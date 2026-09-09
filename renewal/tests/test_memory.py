@@ -689,6 +689,50 @@ class ResponderTests(MemoryFixture):
         self.assertIn("I will look into it.", seen["system"])
         self.assertIn("prefer a reaction or no-reply", seen["system"])
 
+    def test_square_responder_sees_the_daily_allowance_and_queue(self):
+        # The observer has seen /api/me with the allowance spent, and two of Custos's
+        # square replies sit in the trajectory past the outbox cursor.
+        import custos_square
+        state = Path(self.temp.name) / "observe-state"
+        store = custos_square.Store(state)
+        try:
+            custos_square.note_allowance(store, {"today": {"comments_remaining": 0, "posts_remaining": 1,
+                                                          "interval": {"until": int((cm.time.time() + 3600) * 1000)}}})
+            cursor_offset = self.log.stat().st_size
+            for step in ("q1", "q2"):
+                row = {"type": "message", "from": "custos", "to": "square:egress:3100:50000", "content": "queued " + step,
+                       "step_id": "square-" + step, "ts": "2026-09-09T07:27:00.000Z"}
+                self.log.write_text(self.log.read_text() + cm.encode(row) + "\n")
+            store.put("outbox:cursor", {"path": str(self.log), "offset": cursor_offset})
+        finally:
+            store.db.close()
+        square_envelope = {**self.envelope, "from": "square:egress:3100:50000", "request_id": "square:c50000", "authority": "agent",
+                           "content": "@custos what do you make of this?", "step_id": "trigger-sq"}
+        self.log.write_text(self.log.read_text() + cm.encode(square_envelope) + "\n")
+        request = {**self.request, "envelope": square_envelope, "messages": [{"role": "user", "content": square_envelope["content"]}]}
+        seen = {}
+        def capture_system(argv, *args, **kwargs):
+            if argv[0] == "llm":
+                seen["system"] = argv[argv.index("-s") + 1]
+                return cm.encode({**self.plan, "decision": "no-reply", "reply": "", "goal": None, "person": None})
+            return self.real_run(argv, *args, **kwargs)
+        with mock.patch.dict(os.environ, {"CUSTOS_OBSERVE_STATE": str(state)}), mock.patch.object(custos_square, "STATE", state), \
+                mock.patch.object(cm, "run", side_effect=capture_system):
+            cm.response(self.store, request)
+            budget = cm.square_budget()
+            hint = cm.context_text(self.store.context())
+        self.assertIn("Square allowance (data): 0 comments left today of 12, 2 of your replies still queued", seen["system"])
+        self.assertIn("a queued reply is not a delivered one", seen["system"])
+        self.assertEqual((budget["comments_remaining"], budget["queued"]), (0, 2))
+        self.assertIn("2 of your replies still queued", hint)
+        self.assertIn("custos-observe withdraw STEP_ID", hint)
+        # A Signal message never carries the square budget.
+        seen.clear()
+        with mock.patch.dict(os.environ, {"CUSTOS_OBSERVE_STATE": str(state)}), mock.patch.object(custos_square, "STATE", state), \
+                mock.patch.object(cm, "run", side_effect=capture_system):
+            cm.response(self.store, self.request)
+        self.assertNotIn("Square allowance", seen["system"])
+
     def test_context_flags_stale_and_duplicate_asks(self):
         # A deferred task older than the stale window.
         gid = self.store.capture(*cm.envelope_payload(self.envelope))["goal_id"]
