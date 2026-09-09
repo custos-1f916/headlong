@@ -834,6 +834,31 @@ class ResponderTests(MemoryFixture):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(self.store.find(gid2)[4]["resolution"], {"disposition": "declined", "evidence": "the ask is moot"})
 
+    def test_goal_scratchpad_and_checklist_survive_and_render(self):
+        gid = self.store.capture(*cm.envelope_payload(self.envelope))["goal_id"]
+        item = self.store.find(gid); rec = item[4]
+        rec["response"] = {"state": "sent", "plan": {"reply": "on it", "decision": "defer", "goal": rec["goal"], "memories": []}}
+        self.store.save(item, rec)
+        env = {**os.environ, "IDENTITY_DIR": str(self.identity), "IDENTITY_NAME": "custos",
+               "TRAJ_DIR": str(self.identity / "trajectories"), "TRAJ_ID": self.traj_id, "ROOT_TRAJ_ID": self.traj_id}
+        tool = str(Path(cm.__file__).resolve().parent / "bin" / "custos-memory")
+        run = lambda *a: subprocess.run([tool, *a], capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL)
+        self.assertEqual(run("note", gid, "ruled", "out", "the", "cache").returncode, 0)
+        self.assertEqual(run("note", gid, "the lag is in the checkpoint reader").returncode, 0)
+        self.assertEqual(run("check", gid, "add", "land vd-rqz5 on main").returncode, 0)
+        self.assertEqual(run("check", gid, "add", "land vd-y1wl on main").returncode, 0)
+        out = run("check", gid, "done", "1")
+        self.assertEqual(out.returncode, 0, out.stderr); self.assertIn("1/2 done", out.stdout); self.assertIn("[x] 1.", out.stdout)
+        rec = self.store.find(gid)[4]
+        self.assertEqual([n["text"] for n in rec["scratchpad"]], ["ruled out the cache", "the lag is in the checkpoint reader"])
+        self.assertEqual(rec["checklist"][0]["item"], "land vd-rqz5 on main"); self.assertIsNotNone(rec["checklist"][0]["done_at"])
+        line = [l for l in cm.context_text(self.store.context()).splitlines() if l.startswith("- " + gid)][0]
+        self.assertIn("1/2 done", line); self.assertIn("last note: the lag is in the checkpoint reader", line)
+        shown = run("show", gid).stdout
+        self.assertIn("Checklist:", shown); self.assertIn("[ ] 2. land vd-y1wl on main", shown)
+        self.assertIn("Scratchpad", shown); self.assertIn("ruled out the cache", shown)
+        self.assertEqual(run("check", gid, "done", "9").returncode, 1)  # bad index fails plainly
+
     def test_legacy_defer_delivers_only_human_text(self):
         with mock.patch.object(cm, "run", side_effect=lambda argv, *a, **kw: "DEFER: inspect artifact\nI will check the artifact." if argv[0] == "llm" else self.real_run(argv, *a, **kw)):
             cm.response(self.store, self.request)

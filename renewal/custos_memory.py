@@ -386,6 +386,56 @@ class Store:
             self.save(item, record)
             return {"goal_id": payload["goal_id"], "status": "active"}
 
+    def note(self, payload):
+        """Append a dated working note to a goal: the per-goal scratchpad that
+        survives between wakes (Custos, 2026-09-09: FINAL is one sentence, not a
+        workspace; the 'why I was looking at this angle' was getting lost)."""
+        keys(payload, {"goal_id", "text"})
+        line = text(payload["text"], "text", 2000)
+        with self.lock():
+            item = self.find(payload["goal_id"])
+            record = item[4]
+            if not record or record["status"] != "active":
+                raise MemoryError("only active directed goals take notes")
+            pad = record.setdefault("scratchpad", [])
+            pad.append({"at": now(), "text": line})
+            del pad[:-40]
+            self.save(item, record)
+            return {"goal_id": payload["goal_id"], "notes": len(pad)}
+
+    def check(self, payload):
+        """Checklist on a goal: add items, mark them done. The goal line shows k/n,
+        so multi-step work has checkpoint state the mind can read without re-deriving it."""
+        keys(payload, {"goal_id", "op"}, {"item", "index"})
+        op = payload["op"]
+        if op not in {"add", "done", "undo", "remove"}:
+            raise MemoryError("op must be add, done, undo or remove")
+        with self.lock():
+            item = self.find(payload["goal_id"])
+            record = item[4]
+            if not record or record["status"] != "active":
+                raise MemoryError("only active directed goals have checklists")
+            items = record.setdefault("checklist", [])
+            if op == "add":
+                label = text(payload.get("item", ""), "item", 300)
+                if not label:
+                    raise MemoryError("item text required")
+                if len(items) >= 40:
+                    raise MemoryError("checklist full (40)")
+                items.append({"item": label, "done_at": None})
+            else:
+                index = payload.get("index")
+                if not isinstance(index, int) or not 1 <= index <= len(items):
+                    raise MemoryError("index must name an existing item (1-based)")
+                if op == "remove":
+                    items.pop(index - 1)
+                else:
+                    items[index - 1]["done_at"] = now() if op == "done" else None
+            self.save(item, record)
+            done = sum(1 for i in items if i.get("done_at"))
+            return {"goal_id": payload["goal_id"], "done": done, "total": len(items),
+                    "items": [("[x] " if i.get("done_at") else "[ ] ") + str(n + 1) + ". " + i["item"] for n, i in enumerate(items)]}
+
     def complete(self, payload):
         keys(payload, {"goal_id", "evidence", "disposition"})
         evidence = text(payload["evidence"], "evidence", 8192)
@@ -505,9 +555,13 @@ class Store:
                         # did not finish. The mind answers it, or lets it go.
                         next_action = ("The responder never finished answering this. Read it with custos-memory show; "
                                        "reply with chat reply --follow-up if it deserves one, or complete it with a reason.")
+                    pad = record.get("scratchpad") or []
+                    checklist = record.get("checklist") or []
                     goals.append({"goal_id": fields["id"], "summary": record["goal"]["outcome"][:240],
                                   "directed": True, "kind": "task" if is_task(record) else "unanswered",
                                   "who": speaker_of(origin["sender"], origin.get("content", "")),
+                                  "scratch": (pad[-1]["text"][:200] if pad else None), "notes": len(pad),
+                                  "checklist_done": sum(1 for i in checklist if i.get("done_at")), "checklist_total": len(checklist),
                                   "request_id": origin["request_id"][:256],
                                   "sender": origin["sender"][:128], "source_url": origin["source_url"][:256],
                                   "authority": origin["authority"], "status": record["status"],
@@ -849,6 +903,11 @@ Return one strict JSON object with exactly these fields:
   short honest holding reply and set goal {"outcome":"what they want",
   "next_action":"the concrete work","completion":"what evidence finishes it"}.
   Only defer creates a task for the mind; acknowledge remembering, not doing.
+  If your reply promises anything beyond this message (to look, read, check,
+  build, "come back with", "filed", "next steps"), the decision MUST be defer:
+  a promise with no goal behind it is broken by the next wake, because nothing
+  else remembers it. And promise only that you will look into it; the mind
+  decides the approach, the deliverable and the timing, not this reply.
 - react (only when the transport offers it): reply is exactly one emoji,
   attached to their message; goal stays null.
 You have NO Bash or tools here and never claim you did work you did not do; if
@@ -1369,9 +1428,13 @@ def goal_line(goal):
             tags.append("dup? " + goal["possible_duplicate_of"])
         if goal.get("response_state") not in (None, "sent"):
             tags.append(goal["response_state"])
+        if goal.get("checklist_total"):
+            tags.append("%d/%d done" % (goal.get("checklist_done", 0), goal["checklist_total"]))
         line = "- %s [%s] %s" % (goal["goal_id"], ", ".join(tags), clip(goal.get("summary"), 160))
         if goal.get("kind") == "task" and goal.get("next_action"):
             line += " | next: " + clip(goal["next_action"], 140)
+        if goal.get("scratch"):
+            line += " | last note: " + clip(goal["scratch"], 140)
         return line
     tags = [goal.get("type", "goal")]
     if goal.get("until"):
@@ -1478,11 +1541,13 @@ Examples (replace the sample ID and evidence with actual values):
   custos-memory complete 0123abcd Verified the artifact and delivered the result to Hal
   custos-memory complete 0123abcd declined The ask was moot: the thread was resolved by its author
   custos-memory update 0123abcd Inspect the retained failure report next
+  custos-memory note 0123abcd Ruled out the cache; the lag is in the checkpoint reader, see ledger/next-due.py
+  custos-memory check 0123abcd add Land custos/vd-rqz5 on main   |   custos-memory check 0123abcd done 1   |   custos-memory check 0123abcd list
   printf '%s\\n' '{"goal_id":"0123abcd","disposition":"completed","evidence":"Verified artifact and delivered result"}' | custos-memory complete
   custos-memory show 0123abcd
 An acknowledgment alone is not completion. Valid dispositions: completed, declined, abandoned.''')
     parser.add_argument("command", choices=["capture", "capture-envelope", "context", "pending", "show", "update", "complete", "respond",
-                                            "replay-unanswered", "archive-conversations", "expire-asks"])
+                                            "replay-unanswered", "archive-conversations", "expire-asks", "note", "check"])
     parser.add_argument("goal_id", nargs="?", help="Goal ID for show, update and complete (writes also take JSON on stdin)")
     parser.add_argument("words", nargs="*", help="complete: [completed|declined|abandoned] evidence…; update: the next action")
     parser.add_argument("--json", action="store_true")
@@ -1492,8 +1557,8 @@ An acknowledgment alone is not completion. Valid dispositions: completed, declin
     parser.add_argument("--older-than", type=int, default=None,
                         help="replay-unanswered: seconds (default 900); archive-conversations: days (default 2); expire-asks: hours (default 24)")
     args = parser.parse_args()
-    if args.goal_id is not None and args.command not in {"show", "update", "complete"}:
-        parser.error("Only show, update and complete take a positional goal ID; see --help for examples.")
+    if args.goal_id is not None and args.command not in {"show", "update", "complete", "note", "check"}:
+        parser.error("Only show, update, complete, note and check take a positional goal ID; see --help for examples.")
     try:
         store = Store()
         if args.command in {"context", "pending"}:
@@ -1513,7 +1578,18 @@ An acknowledgment alone is not completion. Valid dispositions: completed, declin
             return
         if args.command == "show":
             with store.lock():
-                print(store.find(args.goal_id)[0].read_text(), end="")
+                item = store.find(args.goal_id)
+                print(item[0].read_text(), end="")
+                record = item[4]
+            if record:
+                if record.get("checklist"):
+                    print("\nChecklist:")
+                    for n, i in enumerate(record["checklist"], 1):
+                        print(("  [x] " if i.get("done_at") else "  [ ] ") + str(n) + ". " + i["item"])
+                if record.get("scratchpad"):
+                    print("\nScratchpad (your working notes, newest last):")
+                    for entry in record["scratchpad"]:
+                        print("  " + str(entry.get("at", ""))[:16] + "  " + entry["text"])
             return
         if args.command == "replay-unanswered":
             print(encode(replay_unanswered(store, args.older_than if args.older_than is not None else 900,
@@ -1525,6 +1601,40 @@ An acknowledgment alone is not completion. Valid dispositions: completed, declin
         if args.command == "expire-asks":
             print(encode({"expired": expire_asks(store, args.older_than if args.older_than is not None else 24, min(args.limit, 20))}))
             return
+        if args.command == "note":
+            if not args.goal_id:
+                raise InvalidInput("usage: custos-memory note GOAL_ID your working note…")
+            body = " ".join(args.words).strip()
+            if not body and not sys.stdin.isatty():
+                body = sys.stdin.read(MAX_INPUT).strip()
+            if not body:
+                raise InvalidInput("usage: custos-memory note GOAL_ID your working note…")
+            print(encode(store.note({"goal_id": args.goal_id, "text": body})))
+            return 0
+        if args.command == "check":
+            words = list(args.words)
+            if not args.goal_id or not words:
+                raise InvalidInput("usage: custos-memory check GOAL_ID add ITEM… | done N | undo N | remove N | list")
+            op = words[0].lower()
+            if op == "list":
+                with store.lock():
+                    record = store.find(args.goal_id)[4]
+                items = (record or {}).get("checklist") or []
+                for n, i in enumerate(items, 1):
+                    print(("[x] " if i.get("done_at") else "[ ] ") + str(n) + ". " + i["item"])
+                print("%d/%d done" % (sum(1 for i in items if i.get("done_at")), len(items)))
+                return 0
+            payload = {"goal_id": args.goal_id, "op": op}
+            if op == "add":
+                payload["item"] = " ".join(words[1:]).strip()
+            else:
+                try:
+                    payload["index"] = int(words[1])
+                except (IndexError, ValueError):
+                    raise InvalidInput("usage: custos-memory check GOAL_ID done N (1-based item number)")
+            result = store.check(payload)
+            print("\n".join(result["items"]) + ("\n" if result["items"] else "") + "%d/%d done" % (result["done"], result["total"]))
+            return 0
         if args.command in {"update", "complete"}:
             payload = write_payload(args)
         else:
