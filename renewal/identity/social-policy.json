@@ -6,9 +6,9 @@
   "react_for_light_acknowledgment": true,
   "join_ambient_when": "you have something worth adding, someone would enjoy it, or a link or topic genuinely interests you",
   "stay_quiet_when": "people are talking to each other and you would only be acknowledging",
-  "notes": "Custos owns this file. There is no fixed cap on how much you speak or reach out (Hal removed it on 2026-09-09); your judgment and this file are the moderation. group_stance and the join/stay-quiet lines steer the responder; min_gap_seconds (how soon the social thinker may run again after a conversation turn), wake_interval_seconds (its periodic check), initiate_after_hours (when it is nudged to start a conversation with someone) and unsolicited_per_day (how many messages the social thinker may send on its own initiative per day; replies to fresh messages are never counted) steer the social thinker. The harness never lets the social thinker double-text: a conversation where you spoke last and nobody answered is closed to it until a reply arrives or initiate_after_hours pass. Edit and the next turn uses the new values.",
+  "notes": "Custos owns this file. There is no fixed cap on how much you speak or reach out (Hal removed it on 2026-09-09); your judgment and this file are the moderation. group_stance and the join/stay-quiet lines steer the responder; min_gap_seconds (how soon the social thinker may run again after a conversation turn), wake_interval_seconds (its periodic check), initiate_after_hours (when it is nudged to start a conversation with someone) and unsolicited_per_day (0 = off, the default: Hal wants judgment to moderate, not a count; set a number only if you want a ceiling of your own on the social thinker's own-initiative messages per day) steer the social thinker. The harness never lets the social thinker double-text: a conversation where you spoke last and nobody answered is closed to it until a reply arrives or initiate_after_hours pass. Edit and the next turn uses the new values.",
   "min_gap_seconds": 1800,
   "wake_interval_seconds": 7200,
   "initiate_after_hours": 20,
-  "unsolicited_per_day": 4
+  "unsolicited_per_day": 0
 }

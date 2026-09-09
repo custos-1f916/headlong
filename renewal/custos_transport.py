@@ -170,6 +170,11 @@ def outbox(args):
                 continue
             if not (event.get('type') == 'message' and event.get('from') == 'custos' and event.get('to') == args.sender):
                 continue
+            if event.get('delivered_by') == 'custos-actions':
+                # Recorded by custos-actions for the conversation ledger; that
+                # service delivered (or is delivering) it. Sending it again here
+                # would double-post.
+                continue
             if receipts is None:
                 receipts = {}
                 for receipt in state.glob('*.json'):

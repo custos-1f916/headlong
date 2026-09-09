@@ -305,6 +305,16 @@ class ResponderTests(MemoryFixture):
         self.assertFalse(self.store.capture(incoming, trigger)['created'])
         self.assertEqual(self.store.context()['active_directed'], 1)  # fixture's original direct ask only
 
+    def test_transport_outbox_skips_messages_custos_actions_already_delivered(self):
+        import argparse
+        route = 'signal-abcdefabcdefabcdefabcdef'
+        for row in ({'type': 'message', 'from': 'custos', 'to': route, 'content': 'via chat', 'step_id': 'via-chat', 'source': 'chat'},
+                    {'type': 'message', 'from': 'custos', 'to': route, 'content': 'via actions', 'step_id': 'via-actions',
+                     'source': 'custos-actions', 'delivered_by': 'custos-actions', 'request_id': 'signal-x-1', 'phase': 'submitted'}):
+            self.log.write_text(self.log.read_text() + cm.encode(row) + "\n")
+        result = ct.outbox(argparse.Namespace(sender=route, offset=0, trajectory=''))
+        self.assertEqual([e['content'] for e in result['events']], ['via chat'])
+
     def test_ambient_no_reply_retires_context_without_sending(self):
         self.ambient()
         self.plan = {'reply': '', 'decision': 'no-reply', 'goal': None, 'memories': []}

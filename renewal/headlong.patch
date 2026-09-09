@@ -1,5 +1,5 @@
 diff --git a/bin/chat b/bin/chat
-index 0b41919..c7ee067 100755
+index 0b41919..926bb84 100755
 --- a/bin/chat
 +++ b/bin/chat
 @@ -44,6 +44,63 @@ case "${1:-}" in -h|--help|help) ;; *)
@@ -84,6 +84,15 @@ index 0b41919..c7ee067 100755
      # reply_to stamps which message step this reply answers, making "has this
      # message been answered" a fact in the log rather than an ordering
      # heuristic. Additive — readers that don't know it ignore it.
+@@ -714,6 +775,8 @@ case "${1:-}" in
+     reply)     shift; cmd_reply "$@" ;;
+     history) shift; cmd_history "$@" ;;
+     pending)   shift; cmd_pending "$@" ;;
++    guard)     shift; [[ -n "${1:-}" ]] || die "Usage: chat guard <to_name>   (exit 1 with the reason when a send to <to_name> would double-text)"
++               _double_text_guard "$1"; printf 'ok\n' ;;
+     person-key) shift; cmd_person_key "$@" ;;
+     thread-key) shift; cmd_thread_key "$@" ;;
+     repl)    shift; cmd_repl "$@" ;;
 diff --git a/bin/context b/bin/context
 index f78cafc..cb4a86f 100755
 --- a/bin/context
@@ -2493,7 +2502,7 @@ index 5bcd50d..2f2488b 100644
  - The Runtime and Workspace lines above are authoritative. Do not open a wake by re-orienting (`pwd`, `ls`, `find`) or by re-verifying your own runtime (grepping or checksumming `bin/` and `thinkers/`): a fact you verified about the runtime holds until the Runtime line changes, and the workspace map tells you where things are. Spend the steps on the work itself.
  
 diff --git a/thinkers/monolith/step b/thinkers/monolith/step
-index bfe362b..00ea38e 100755
+index bfe362b..90e3d6d 100755
 --- a/thinkers/monolith/step
 +++ b/thinkers/monolith/step
 @@ -4,7 +4,7 @@ set -euo pipefail
@@ -2505,7 +2514,7 @@ index bfe362b..00ea38e 100755
  # model picks one function and carries it out in the same run.
  #
  # Chat replies are NOT the monolith's job — a dedicated `responder` thinker owns
-@@ -34,7 +34,14 @@ source "$SCRIPT_DIR/../_lib/common.sh"
+@@ -34,7 +34,16 @@ source "$SCRIPT_DIR/../_lib/common.sh"
  _require_env
  
  THINK_MODEL="${THINK_MODEL:-${SHELLM_MODEL:-claude-opus-4-7}}"
@@ -2513,15 +2522,17 @@ index bfe362b..00ea38e 100755
 +# 10, not 20: the stream is pinned into every model call of the wake, and at 20
 +# durable steps (26 KB) it ate the run's own working memory (2026-09-09).
 +THINK_CONTEXT_TAIL="${THINK_CONTEXT_TAIL:-10}"
-+# Every Nth SPONTANEOUS wake belongs to explore or make, whatever the queue
-+# says. Deferred asks sort first and arrive faster than they are answered, so
-+# without a reserved turn the curiosity functions never fired (0 of 42 wakes
-+# on 2026-09-09). 0 disables.
++# Every Nth wake, spontaneous or reactive, belongs to explore or make, whatever
++# the queue says. Deferred asks sort first and arrive faster than they are
++# answered, so without a reserved turn the curiosity functions never fired (0 of
++# 42 wakes on 2026-09-09); counting spontaneous wakes only was not enough either,
++# because a busy mind wakes reactively every time it closes a goal (Hal, same
++# evening: count every wake). 0 disables.
 +MONOLITH_CURIOSITY_EVERY="${MONOLITH_CURIOSITY_EVERY:-4}"
  
  run_dir="$IDENTITY_DIR/workdir"
  mkdir -p "$run_dir"
-@@ -88,7 +95,13 @@ ticks_at_level=0
+@@ -88,7 +97,13 @@ ticks_at_level=0
  wakes_since_share_hint=0
  related_prev=""
  goal_review_at=0
@@ -2535,7 +2546,7 @@ index bfe362b..00ea38e 100755
      related_prev=$(jq -r '(.related_prev // []) | .[]' "$state_file" 2>/dev/null) || related_prev=""
      goal_review_at=$(jq -r '.goal_review_at // 0' "$state_file" 2>/dev/null) || goal_review_at=0
      [[ "$goal_review_at" =~ ^[0-9]+$ ]] || goal_review_at=0
-@@ -104,9 +117,11 @@ _save_state() {
+@@ -104,9 +119,11 @@ _save_state() {
      local tmp
      tmp=$(mktemp) || return 0
      if jq -nc --argjson l "$level" --argjson t "$ticks_at_level" \
@@ -2549,7 +2560,7 @@ index bfe362b..00ea38e 100755
            related_prev: ($rp | split("\n") | map(select(. != "")))}' > "$tmp" 2>/dev/null; then
          mv "$tmp" "$state_file"
      else
-@@ -201,41 +216,60 @@ if [[ $(printf '%s\n' "$last_three" | jq -r '.type' 2>/dev/null | sort -u | tr '
+@@ -201,41 +218,60 @@ if [[ $(printf '%s\n' "$last_three" | jq -r '.type' 2>/dev/null | sort -u | tr '
      hints="${hints}- The last few steps are all thoughts — the stream may be circling; consider acting, recalling, or advancing decisively.
  "
  fi
@@ -2643,24 +2654,24 @@ index bfe362b..00ea38e 100755
  # Share nudge: outward initiative needs a periodic prompt-side invitation, or
  # restraint rules learned from feedback ratchet the mind into pure listening
  # (observed on Audel 2026-08-21: a self-imposed "last-word-ours -> do not
-@@ -243,6 +277,16 @@ fi
+@@ -243,6 +279,16 @@ fi
  # reactive wakes have their own engagement. The counter resets when the hint
  # fires, not when a message is sent: an invitation every N quiet wakes, never
  # an order.
 +curiosity_turn=0
-+if [[ "$MONOLITH_CURIOSITY_EVERY" -gt 0 && "$wake_mode" == "spontaneous" ]]; then
++if [[ "$MONOLITH_CURIOSITY_EVERY" -gt 0 ]]; then
 +    wakes_since_curiosity=$(( wakes_since_curiosity + 1 ))
 +    if (( wakes_since_curiosity >= MONOLITH_CURIOSITY_EVERY )); then
 +        wakes_since_curiosity=0
 +        curiosity_turn=1
-+        hints="- **This wake is reserved for explore or make** (every ${MONOLITH_CURIOSITY_EVERY}th spontaneous wake, regardless of the queue). Pick a seed below, a repository you can reach, a thread on the square, a paper from your feeds, or something you want to build or test, and do that. The asks under Active goals will still be there next wake; do not spend this one on them unless one is on fire.
++        hints="- **This wake is reserved for explore or make** (every ${MONOLITH_CURIOSITY_EVERY}th wake, regardless of the queue or of what woke you). Pick a seed below, a repository you can reach, a thread on the square, a paper from your feeds, or something you want to build or test, and do that. The asks under Active goals will still be there next wake; do not spend this one on them unless one is on fire.
 +${hints}"
 +    fi
 +fi
  if [[ "$SHARE_HINT_EVERY" -gt 0 && "$wake_mode" == "spontaneous" ]]; then
      wakes_since_share_hint=$(( wakes_since_share_hint + 1 ))
      if (( wakes_since_share_hint >= SHARE_HINT_EVERY )); then
-@@ -257,7 +301,7 @@ fi
+@@ -257,7 +303,7 @@ fi
  _now_s=$(date -u +%s)
  if [[ "$GOAL_REVIEW_DAYS" -gt 0 ]] && (( _now_s - goal_review_at >= GOAL_REVIEW_DAYS * 86400 )); then
      goal_review_at="$_now_s"
@@ -2669,7 +2680,7 @@ index bfe362b..00ea38e 100755
  "
  fi
  # The query for related memories is the wake's own material: the real hints
-@@ -453,6 +497,16 @@ if [[ "$did_work" -eq 0 ]]; then
+@@ -453,6 +499,16 @@ if [[ "$did_work" -eq 0 ]]; then
              | traj append >/dev/null || true
      fi
  fi
@@ -3367,10 +3378,10 @@ index 0000000..e3a599a
 +exec shellm "${args[@]}"
 diff --git a/tests/test_chat_double_text_guard.sh b/tests/test_chat_double_text_guard.sh
 new file mode 100755
-index 0000000..4d36aff
+index 0000000..600edc7
 --- /dev/null
 +++ b/tests/test_chat_double_text_guard.sh
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,81 @@
 +#!/usr/bin/env bash
 +# tests/test_chat_double_text_guard.sh — `chat reply`/`chat send` refuse a second
 +# unanswered message when CHAT_DOUBLE_TEXT_GUARD_HOURS is set (the social
@@ -3440,6 +3451,12 @@ index 0000000..4d36aff
 +inbound 60 "$G" jack-aci group Jack "here are the stills"
 +if CHAT_DOUBLE_TEXT_GUARD_HOURS=20 chat reply "$G" "thanks, looking" >/dev/null 2>"$WORK/err"; then ok "answered conversation reopens"; else bad "answered conversation reopens" "$(cat "$WORK/err")"; fi
 +if CHAT_DOUBLE_TEXT_GUARD_HOURS=20 chat reply --follow-up "$J" "and one DM" >/dev/null 2>"$WORK/err"; then ok "DM reopens once the person has spoken"; else bad "DM reopens" "$(cat "$WORK/err")"; fi
++
++# `chat guard <to>` exposes the same verdict to other senders (custos-actions).
++inbound 20 "$J" jack-aci direct Jack "got it"
++if CHAT_DOUBLE_TEXT_GUARD_HOURS=20 chat guard "$J" >/dev/null 2>"$WORK/err"; then ok "chat guard passes an open conversation"; else bad "chat guard open" "$(cat "$WORK/err")"; fi
++outbound 30 "$G" "one more unanswered group line"
++if CHAT_DOUBLE_TEXT_GUARD_HOURS=20 chat guard "$G" >/dev/null 2>"$WORK/err"; then bad "chat guard refuses a waiting conversation" "passed"; else grep -q "you spoke last" "$WORK/err" && ok "chat guard refuses a waiting conversation" || bad "chat guard text" "$(cat "$WORK/err")"; fi
 +
 +# Allowance exhausted: every send refused with the policy text.
 +if CHAT_SOCIAL_BLOCKED="not sent: allowance used" chat reply "$G" "one more" >/dev/null 2>"$WORK/err"; then bad "blocked allowance refuses" "sent"; else grep -q "allowance used" "$WORK/err" && ok "blocked allowance refuses with the policy text" || bad "blocked text" "$(cat "$WORK/err")"; fi
@@ -3658,7 +3675,7 @@ index 0000000..1a25932
 +    print('PASS 5000 matching records in %.3fs'%(time.monotonic()-t))
 diff --git a/thinkers/social/prompt.md b/thinkers/social/prompt.md
 new file mode 100644
-index 0000000..ab458bd
+index 0000000..7b9463c
 --- /dev/null
 +++ b/thinkers/social/prompt.md
 @@ -0,0 +1,27 @@
@@ -3676,7 +3693,7 @@ index 0000000..ab458bd
 +- The ledger above is the truth about what is owed. A promise you can see in the transcript but not in the ledger has already been kept or withdrawn; never redo it.
 +- Decide by your third step. The conversation, the people, and the policy are already in front of you; re-reading them is how runs end without acting.
 +
-+- One social function per wakeup; if there is more to say, your next wake is yours too. Your participation policy below is the moderation, and it is yours to edit (stance, when to join, the social thinker's own cadence via `min_gap_seconds` / `wake_interval_seconds`, and `unsolicited_per_day`, how many messages this thinker may send in a day on its own initiative).
++- One social function per wakeup; if there is more to say, your next wake is yours too. Your participation policy below is the moderation, and it is yours to edit (stance, when to join, the social thinker's own cadence via `min_gap_seconds` / `wake_interval_seconds`, and `unsolicited_per_day`, an optional ceiling on this thinker's own-initiative messages per day; 0, the default, means none: Hal wants judgment to moderate, not a count).
 +- Never double-text. If you spoke last in a conversation and nobody has answered, that conversation is waiting on them, not on you: no second message, no rephrasing, no "adding an angle", and no moving the ask to a DM with someone from that room. The "Waiting on them" list above is exactly those conversations; `chat` refuses such sends. An unanswered question is answered by silence often enough; let it be.
 +- A reaction (an emoji on a message) is never a reason to speak. Reactions on other people's messages are not shown to you; a reaction on your own message is a signal to read, not a message to answer. Age is the age of the thing itself: a reaction or a message that reached you late is still old.
 +- Do not turn conversation into work: no goals, no tracker claims, no promises of later delivery. If someone actually asks for work, the responder has already deferred it to the mind.
@@ -3691,10 +3708,10 @@ index 0000000..ab458bd
 +```
 diff --git a/thinkers/social/step b/thinkers/social/step
 new file mode 100755
-index 0000000..aa2eb5b
+index 0000000..8b1cb52
 --- /dev/null
 +++ b/thinkers/social/step
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,316 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
@@ -3891,7 +3908,10 @@ index 0000000..aa2eb5b
 +# Messages this thinker actually sent in the last 24 h (message steps whose run
 +# was a social run), against the policy'"'"'s unsolicited_per_day. Custos owns the
 +# number; the harness only enforces it. Nothing here caps the responder.
-+SOCIAL_UNSOLICITED_PER_DAY="${SOCIAL_UNSOLICITED_PER_DAY:-4}"
++# 0 = no allowance (Hal, 2026-09-09: judgment moderates, not counts; the day
++# it was tried at 4 it refused a legitimate message and the model went round it).
++# Custos may set a number in social-policy.json if it wants a ceiling of its own.
++SOCIAL_UNSOLICITED_PER_DAY="${SOCIAL_UNSOLICITED_PER_DAY:-0}"
 +_pu=$(printf '%s' "$policy_json" | jq -r '.unsolicited_per_day // empty' 2>/dev/null) || _pu=""
 +[[ "$_pu" =~ ^[0-9]+$ ]] && SOCIAL_UNSOLICITED_PER_DAY="$_pu"
 +msgs_today=$(_root_traj_raw_tail 2>/dev/null | jq -Rrn --arg me "$IDENTITY_NAME" --arg since "$since" '
@@ -3957,7 +3977,7 @@ index 0000000..aa2eb5b
 +Waiting on them (you spoke last; these conversations and these people are closed to you until they answer or ${SOCIAL_INITIATE_HOURS}h pass; \`chat\` will refuse a second message):
 +${waiting:-(none: every conversation you are in has been answered)}
 +
-+Social actions you took in the last 24h: $sent_today; messages sent by this thinker: $msgs_today of your own unsolicited_per_day = $SOCIAL_UNSOLICITED_PER_DAY (social-policy.json). Your policy and your judgment decide how much is right; a reaction on someone else's message is never a reason to speak.${social_blocked:+
++Social actions you took in the last 24h: $sent_today; messages sent by this thinker: $msgs_today. There is no count that moderates you: your policy and your judgment decide how much is right (unsolicited_per_day in social-policy.json is 0 = off unless you set a ceiling of your own). The one rule is above: never a second unanswered message. A reaction on someone else's message is never a reason to speak.${social_blocked:+
 +$social_blocked}
 +Why you woke: $trigger_line
 +${initiate_hint:+Nudge:

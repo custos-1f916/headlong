@@ -146,3 +146,63 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(json.loads(state.read_text())['previous_commit'],'a'*40)
 
 if __name__=='__main__': unittest.main()
+
+
+class ActionsClientTests(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        import custos_actions_client as cac
+        self.cac = cac
+
+    def test_route_matches_the_bridge_and_labels_resolve_uniquely(self):
+        import hashlib
+        self.assertEqual(self.cac.route_for('dm:8f14-aci'), 'signal-' + hashlib.sha256(b'dm:8f14-aci').hexdigest()[:24])
+        contacts = [{'target': 'dm:8f14-aci', 'label': 'Dani', 'kind': 'dm'}, {'target': 'group:abc=', 'label': 'Group', 'kind': 'group'}]
+        self.assertEqual(self.cac.resolve_target('dani', contacts), 'dm:8f14-aci')
+        self.assertEqual(self.cac.resolve_target('group:abc=', contacts), 'group:abc=')
+        with self.assertRaises(ValueError):
+            self.cac.resolve_target('nobody', contacts)
+
+    def test_guard_refuses_blocked_allowance_and_chat_verdicts(self):
+        with patch.dict('os.environ', {'CHAT_SOCIAL_BLOCKED': 'not sent: allowance used'}, clear=False):
+            with self.assertRaises(ValueError) as caught:
+                self.cac.guard('signal-x')
+            self.assertIn('allowance used', str(caught.exception))
+        fake = Mock(return_value=Mock(returncode=1, stderr='chat: error: not sent: you spoke last in this conversation (2h ago) and nobody has answered.', stdout=''))
+        with patch.dict('os.environ', {'CHAT_DOUBLE_TEXT_GUARD_HOURS': '20', 'CHAT_SOCIAL_BLOCKED': ''}, clear=False), patch.object(self.cac.subprocess, 'run', fake):
+            with self.assertRaises(ValueError) as caught:
+                self.cac.guard('signal-x')
+            self.assertIn('you spoke last', str(caught.exception))
+            self.assertEqual(fake.call_args[0][0][:3], ['chat', 'guard', 'signal-x'])
+        # No guard env: nothing is checked (responder / mind paths).
+        with patch.dict('os.environ', {'CHAT_DOUBLE_TEXT_GUARD_HOURS': '', 'CHAT_SOCIAL_BLOCKED': ''}, clear=False), patch.object(self.cac.subprocess, 'run', fake):
+            self.cac.guard('signal-x')
+
+    def test_send_refused_by_guard_never_reaches_the_service_and_accepted_send_is_recorded(self):
+        calls = []
+        def fake_call(payload):
+            calls.append(payload)
+            if payload == {'action': 'signal-contacts'}:
+                return 200, {'ok': True, 'contacts': [{'target': 'dm:aci-1', 'label': 'Dani', 'kind': 'dm'}]}
+            return 200, {'ok': True, 'phase': 'queued', 'request_id': payload['request_id']}
+        recorded = []
+        body = json.dumps({'request_id': 'signal-test-1', 'target': 'Dani', 'message': 'hello'})
+        with patch.object(self.cac, 'call', side_effect=fake_call), patch.object(self.cac, 'record', side_effect=lambda *a: recorded.append(a)), \
+                patch.object(sys, 'argv', ['custos-actions', 'signal-send']), patch.object(sys, 'stdin', io.TextIOWrapper(io.BytesIO(body.encode()))), \
+                patch.dict('os.environ', {'CHAT_SOCIAL_BLOCKED': 'not sent: blocked for the test', 'CHAT_DOUBLE_TEXT_GUARD_HOURS': ''}, clear=False), \
+                patch('sys.stdout', new_callable=io.StringIO) as out:
+            rc = self.cac.main()
+        self.assertEqual(rc, 1)
+        self.assertIn('blocked for the test', out.getvalue())
+        self.assertEqual([c['action'] for c in calls], ['signal-contacts'])  # resolved the label, never sent
+        self.assertEqual(recorded, [])
+        calls.clear()
+        with patch.object(self.cac, 'call', side_effect=fake_call), patch.object(self.cac, 'record', side_effect=lambda *a: recorded.append(a)), \
+                patch.object(sys, 'argv', ['custos-actions', 'signal-send']), patch.object(sys, 'stdin', io.TextIOWrapper(io.BytesIO(body.encode()))), \
+                patch.dict('os.environ', {'CHAT_SOCIAL_BLOCKED': '', 'CHAT_DOUBLE_TEXT_GUARD_HOURS': ''}, clear=False), \
+                patch('sys.stdout', new_callable=io.StringIO) as out:
+            rc = self.cac.main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls[-1]['action'], 'signal-send')
+        self.assertEqual(calls[-1]['target'], 'Dani')
+        self.assertEqual(recorded, [(self.cac.route_for('dm:aci-1'), 'hello', 'signal-test-1', 'queued')])
