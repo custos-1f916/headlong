@@ -878,8 +878,18 @@ def validate_plan(raw, allow_reaction=True):
         try:
             plan = lenient_json(raw)
         except InvalidInput:
-            record_invalid_response(raw, "invalid JSON")
-            raise
+            # A considered answer to a long question sometimes comes back as
+            # plain prose. If it is prose (not a broken JSON attempt: no
+            # "decision" key, no protocol markers) the prose IS the reply; the
+            # human should not lose it to the envelope format. Kept in the
+            # invalid-reply log so the pattern stays visible.
+            looks_prose = ('"decision"' not in raw and '"reply"' not in raw and len(raw) >= 40
+                           and not raw.lstrip().startswith(("{", "[", "```", "DEFER:", "NO_REPLY", "chat reply")))
+            if not looks_prose:
+                record_invalid_response(raw, "invalid JSON")
+                raise
+            record_invalid_response(raw, "prose accepted as reply")
+            plan = {"reply": raw, "decision": "reply", "goal": None, "memories": [], "person": None}
     if not isinstance(plan, dict):
         record_invalid_response(raw, "not an object")
         raise InvalidInput("invalid JSON")

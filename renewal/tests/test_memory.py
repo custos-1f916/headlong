@@ -604,7 +604,12 @@ class ResponderTests(MemoryFixture):
         oversized = {**base, "person": {"notes": "x" * 5000}}
         self.assertLessEqual(len(cm.validate_plan(cm.encode(oversized))["person"]["notes"]), cm.PERSON_NOTE_MAX)
         with self.assertRaises(cm.MemoryError):
-            cm.validate_plan("not JSON at all")
+            cm.validate_plan("not JSON at all")   # too short to be a considered answer
+        prose = "Not thin, I have been turning it over. **Who I am.** Keep the keeper line; that is the whole thing."
+        plan = cm.validate_plan(prose)
+        self.assertEqual((plan["decision"], plan["reply"], plan["goal"], plan["memories"], plan["person"]), ("reply", prose, None, [], None))
+        with self.assertRaises(cm.MemoryError):   # a broken JSON attempt is still refused
+            cm.validate_plan('{"reply":"ok","decision":"reply","goal":null,"memories":[' + "x" * 60)
 
     def test_archive_moves_settled_conversations_and_keeps_idempotency(self):
         self.plan = {"reply": "Hello!", "decision": "reply", "goal": None, "memories": []}
