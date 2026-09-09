@@ -104,11 +104,12 @@ class Observer:
             else:
                 alerted = True
             if code == "platform_allowance_exhausted" and getattr(exc, "retry_after", 0):
-                # A known reset time: wait exactly for it, never longer.
-                backoff = max(interval, getattr(exc, "retry_after", 0))
+                # A known reset time: wait exactly for it, never longer. retry_after was
+                # measured against the wall clock inside write(), so anchor it there too.
+                next_at = max(self.now + interval, time.time() + getattr(exc, "retry_after", 0))
             else:
-                backoff = max(interval, min(21600, 300 * 2 ** min(failures - 1, 6)), getattr(exc, "retry_after", 0))
-            self.store.put("source:" + name, {"error": code, "failures": failures, "episode": episode, "alerted": alerted, "next": self.now + backoff})
+                next_at = self.now + max(interval, min(21600, 300 * 2 ** min(failures - 1, 6)), getattr(exc, "retry_after", 0))
+            self.store.put("source:" + name, {"error": code, "failures": failures, "episode": episode, "alerted": alerted, "next": next_at})
             return
         episode = state.get("episode", 0)
         if state.get("error"):

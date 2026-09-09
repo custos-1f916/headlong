@@ -371,7 +371,7 @@ class SquareOutboxTests(unittest.TestCase):
         for step in ("aaaaaaa1", "aaaaaaa2", "aaaaaaa3"):
             self.compose(step)
         observer = self.observer(api)
-        with patch("custos_square.time.time", return_value=self.now):
+        with patch("custos_square.time.time", return_value=self.now), patch("custos_observe.time.time", return_value=self.now):
             observer.source("square-outbox", 60, observer.outbox)
         # One went out, the second hit the allowance, the third never reached the API.
         self.assertEqual(api.posted, ["reply aaaaaaa1"])
@@ -400,7 +400,7 @@ class SquareOutboxTests(unittest.TestCase):
         self.compose("bbbbbbb1")
         self.compose("bbbbbbb2")
         observer = self.observer(api)
-        with patch("custos_square.time.time", return_value=self.now):
+        with patch("custos_square.time.time", return_value=self.now), patch("custos_observe.time.time", return_value=self.now):
             observer.source("square-outbox", 60, observer.outbox)
             observer.now += 600
             observer.source("square-outbox", 60, observer.outbox)  # still backing off: nothing happens

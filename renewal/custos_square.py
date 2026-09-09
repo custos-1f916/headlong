@@ -322,7 +322,9 @@ def square_queue(store, path=None):
     try:
         with path.open("rb") as probe:
             probe.seek(int(cursor.get("offset", 0)))
-            for _ in range(5000):
+            while True:
+                # Bounded by the file, not a line count: the cursor can sit tens of
+                # megabytes behind the head while replies wait for the allowance.
                 line = probe.readline(128 * 1024)
                 if not line or not line.endswith(b"\n"):
                     break
