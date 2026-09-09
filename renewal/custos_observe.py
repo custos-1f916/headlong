@@ -16,7 +16,7 @@ import urllib.error
 import uuid
 import xml.etree.ElementTree as ET
 
-from custos_square import APIError, ORIGIN, STATE, SECRET, Square, Store, allowance_summary, canonical, digest, note_allowance, public_request, square_queue
+from custos_square import APIError, ORIGIN, STATE, SECRET, Square, Store, allowance_summary, canonical, digest, note_allowance, public_request, square_queue, MAX_AGE_HOURS
 
 BUCKETS = ("replies", "comments_on_your_posts", "mentions_of_you", "in_threads_you_joined")
 CONFIG = Path(__file__).with_name("observations.json")
@@ -495,6 +495,28 @@ class Observer:
                         cursor["offset"] = source.tell()
                         self.store.put("outbox:cursor", cursor)
                         continue
+                    if MAX_AGE_HOURS > 0 and row.get("ts"):
+                        # Freshness cap: a reply composed more than MAX_AGE_HOURS ago is
+                        # dropped undelivered rather than posted stale. The queue drains at
+                        # only the daily allowance, so a backlog otherwise posts day-old
+                        # takes onto threads that have moved on. Placed before the delivery
+                        # attempt so stale replies clear even while the allowance is exhausted
+                        # (they sit oldest-first at the head of the queue).
+                        try:
+                            composed = datetime.fromisoformat(row["ts"].replace("Z", "+00:00")).timestamp()
+                        except (ValueError, KeyError, AttributeError):
+                            composed = None
+                        if composed is not None and (self.now - composed) > MAX_AGE_HOURS * 3600:
+                            age_h = (self.now - composed) / 3600.0
+                            note = ("Square reply to " + row["to"]
+                                    + " dropped undelivered: composed %.1f h ago, past the %g h freshness cap. " % (age_h, MAX_AGE_HOURS)
+                                    + "A day-old take is staler than no reply and the thread has moved on; "
+                                    + "reply sooner or let it go. A queued reply is not a delivered one.")
+                            self.native.append("stale:" + row["step_id"], {"type": "observation", "source": "square-outbox",
+                                               "content": note, "reply_to": row["step_id"]})
+                            cursor["offset"] = source.tell()
+                            self.store.put("outbox:cursor", cursor)
+                            continue
                     handle, post, parent = match.groups()
                     # Routing identity must still name the actual public addressee.
                     kind, target_id = ("comment", parent) if parent != "0" else ("post", post)

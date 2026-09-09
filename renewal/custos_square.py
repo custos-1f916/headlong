@@ -24,6 +24,12 @@ MAX_RESPONSE = 4 * 1024 * 1024
 # no /api/me sample exists for the current UTC day; live counts always win.
 DAILY_COMMENTS = int(os.environ.get("CUSTOS_SQUARE_DAILY_COMMENTS", "20"))
 DAILY_POSTS = int(os.environ.get("CUSTOS_SQUARE_DAILY_POSTS", "1"))
+# A square reply composed more than this many hours ago is dropped undelivered by
+# the outbox rather than posted stale: the queue drains at only DAILY_COMMENTS a day,
+# so a backlog otherwise posts day-old takes onto threads that have moved on. 0
+# disables the cap. The live /api/me counts still gate how many post per day; this
+# governs how old a queued reply may be when its turn finally comes.
+MAX_AGE_HOURS = float(os.environ.get("CUSTOS_SQUARE_MAX_AGE_HOURS", "12") or 12)
 SECRET = re.compile(r"1f916_sk_[a-zA-Z0-9_\-]+")
 
 
