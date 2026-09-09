@@ -12,6 +12,10 @@ Environment=HEADLONG_IDENTITY=custos
 EnvironmentFile=/etc/custos-headlong.env
 WorkingDirectory=/opt/custos/work
 ExecStartPre=/bin/bash -c 'source /root/.headlong/app/.identities/custos/activate >/dev/null 2>&1; exec python3 /opt/custos/repo/renewal/custos_transport.py reconcile'
+# Every tick (no inference): re-queue direct messages the responder never answered
+# (older than 15 min), and archive settled conversation records older than two
+# days out of memories/ so native mem keeps scaling.
+ExecStartPre=-/bin/bash -c 'source /root/.headlong/app/.identities/custos/activate >/dev/null 2>&1; custos-memory replay-unanswered --older-than 900 --limit 3 >/dev/null; custos-memory archive-conversations --older-than 2 >/dev/null'
 ExecStart=/bin/bash -c 'source /root/.headlong/app/.identities/custos/activate && exec /usr/local/bin/custos-observe once'
 TimeoutStartSec=240
 UMask=0077

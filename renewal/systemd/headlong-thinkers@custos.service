@@ -13,6 +13,9 @@ WorkingDirectory=/opt/custos/work
 PIDFile=/root/.headlong/app/.identities/custos/run/dispatcher.pid
 ExecCondition=/usr/bin/python3 /opt/custos/repo/renewal/mind_enabled.py
 ExecStart=/bin/bash -c 'source /root/.headlong/app/.identities/custos/activate >/dev/null 2>&1; exec thinkers start monolith responder social'
+# Messages that arrived while the mind was stopped (a maintenance window) are
+# handed back to the responder once the dispatcher is up, oldest first.
+ExecStartPost=/bin/bash -c 'sleep 8; source /root/.headlong/app/.identities/custos/activate >/dev/null 2>&1; custos-memory replay-unanswered --older-than 60 --limit 5 || true'
 ExecStop=/bin/bash -c 'source /root/.headlong/app/.identities/custos/activate >/dev/null 2>&1; exec thinkers stop --self --force'
 Restart=on-failure
 RestartSec=30

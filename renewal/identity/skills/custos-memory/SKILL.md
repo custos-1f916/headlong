@@ -54,12 +54,12 @@ trajectories for an invocation when the current CLI documents its contract.
 - Self-chosen work: `mem add --type goal "Outcome; next action; completion evidence"`. `mem add --type todo --until YYYY-MM-DD "Bounded next action"` expires after that UTC date; expiry is neither a scheduler nor proof of completion. Do not put expiring deadlines on owed work to make it disappear.
 - Recall cheaply: `mem prefilter "specific question" --top 8`, then `mem show HEX_ID`. `mem search "question"` uses admitted inference when lexical recall is insufficient. `mem list --short` and `mem list --type goal` are inventories, not instructions to load every body.
 - Edit existing self-chosen goals with `mem edit HEX_ID "updated complete body"`; keep source, uncertainty, outcome, and next action in the body. Generic edit preserves native type/expiry but drops custom frontmatter, so do not store lifecycle/provenance there. Use IDs returned by mem, not guessed slugs.
-- Before `mem forget HEX_ID` retires a self-chosen goal, record its outcome or abandonment reason and evidence in trajectory; retain a concise reusable lesson only if one exists. Directed goals use the helper's evidence-backed completion. Resolved goals should leave active context, not accumulate contradictory status paragraphs.
+- Retire a finished self-chosen goal with `mem done HEX_ID "what happened"`: it dates a DONE line into the body and flips the type to `memory`, which is what removes it from the active count (a body that merely says DONE while the type stays `goal` keeps counting). Use `mem forget` only for records that were wrong to begin with, never for person notes. Directed goals use the helper's evidence-backed completion. Resolved goals should leave active context, not accumulate contradictory status paragraphs.
 
 ## Search execution and coverage
 
 `mem prefilter "query" --top 8` is fast local ranking; `mem search "query"` adds
-a semantic model call at xhigh. It is usable but can take longer than 20–30
+a semantic model call (medium effort). It is usable but can take longer than 20–30
 seconds: do not wrap it in such a short timeout or hide its stderr. Its heartbeat
 ends on success, failure or cancellation. If an explicit wrapper is needed, use
 `timeout --kill-after=5 650 mem search "query"`; the gateway/client have their

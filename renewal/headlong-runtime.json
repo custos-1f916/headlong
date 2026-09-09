@@ -2,7 +2,7 @@
   "upstream": "https://github.com/laude-institute/headlong.git",
   "base_commit": "5458fee8e722c9eb45a75739e9fa1f92419ebafc",
   "patch": "headlong.patch",
-  "patch_sha256": "cce864b1e84d395b9cf12cec70ed957baa9fcd20a62d3313605abc5faa0c2dee",
+  "patch_sha256": "4621a4f55167f4e9aba1fe52a8bcb8d5b4770d5a45f5229256e4ac54feb52131",
   "live_path": "/root/.headlong/app",
   "dependencies": {
     "jq": {

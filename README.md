@@ -595,3 +595,36 @@ commit; live in LXC 122 the same night.
   `main`, status at `/deploy.json`), and `baby-name.ha1.io` through the proxy.
   The repo's `AGENTS.md` carries the data rules (never touch `data/db.json`,
   never change a `sex` field, duels persist).
+
+### First-night audit applied — 2026-09-09
+
+From `homelab/custos-audit-2026-09-09.md` (Hal: "Implement your suggestions").
+
+- **Contention.** `bin/llm` gains an admission-retry budget (`LLM_ADMISSION_RETRIES`, default
+  3) for the gateway's explicit 503 busy denial only, waiting its `retry_after`; a stalled or
+  interrupted stream is still never retried. `LLM_SPEED_TIME=600` in the identity env so a
+  call queued behind another thinker's generation is not aborted by curl's low-speed guard.
+- **Effort tiering.** `SHELLM_EFFORT=xhigh` for the mind's wakes; `LLM_EFFORT=medium` for
+  tools without an explicit effort (recall, rollups); `CUSTOS_RESPONSE_EFFORT=medium` for the
+  responder (`custos_memory.RESPONSE_EFFORT` reads it); `SOCIAL_EFFORT=medium` for the social
+  thinker. The gateway admits medium and xhigh only; `LLM_EFFORT_ALLOWLIST=medium,xhigh`.
+- **Social thinker.** `SOCIAL_MAX_ITERATIONS=14`; full person notes in its prompt; "decide by
+  your third step"; a run that ends without acting writes an observation instead of failing
+  silently; never `mem forget` a person note.
+- **Person notes.** `display` is fixed after creation (a proposed new name becomes an alias);
+  the contract says the note is about the sender of the message, never someone they mention;
+  at most one extra memory per reply (validator allows two).
+- **Unanswered messages.** `custos-memory replay-unanswered [--older-than S] [--limit N]`
+  writes the original message step into `run/pending/responder.message.*` so the dispatcher
+  gives the responder the wake it missed; run by the thinkers unit's `ExecStartPost` (after a
+  stop) and by `custos-observe` every tick (older than 15 min).
+- **Memory growth.** `custos-memory archive-conversations [--older-than DAYS]` moves settled,
+  non-task conversation records to `IDENTITY_DIR/.state/conversations/` (still consulted for
+  request-id idempotency: a replayed archived request is neither re-captured nor re-answered);
+  run by `custos-observe` every tick with a two-day window.
+- **Guard.** `bin/shellm-guard.sh` is sourced at the top of each block (was inlined into the
+  block's argv, filling `ps` output) and exports its functions so child scripts inherit them.
+- **`mem done ID [reason]`** retires a goal/objective/todo in one step (dated DONE line, type
+  → memory); prompt and skill point at it.
+- Charter: friends may play with Custos's voice; a persona never changes what it will do.
+- Tests: renewal 161 (memory 40); upstream guard 14, mem flags 6, extract 17, others green.

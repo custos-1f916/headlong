@@ -14,7 +14,7 @@ index f78cafc..72bccec 100755
      printf '%s' "$best_result"
  fi
 diff --git a/bin/llm b/bin/llm
-index e6a5b00..a7ae66f 100755
+index e6a5b00..a4d426e 100755
 --- a/bin/llm
 +++ b/bin/llm
 @@ -47,7 +47,7 @@ LLM_PROVIDER="${LLM_PROVIDER:-}"
@@ -26,7 +26,23 @@ index e6a5b00..a7ae66f 100755
  LLM_RAW=0
  LLM_PROMPT=""
  # OpenRouter provider routing. OpenRouter fans a single model id out over
-@@ -332,6 +332,7 @@ Environment:
+@@ -106,6 +106,15 @@ LLM_MAX_TIME="${LLM_MAX_TIME:-600}"
+ LLM_STOP_AFTER_CODE_BLOCK="${LLM_STOP_AFTER_CODE_BLOCK:-0}"
+ LLM_SPEED_LIMIT="${LLM_SPEED_LIMIT:-100}"
+ LLM_SPEED_TIME="${LLM_SPEED_TIME:-60}"
++# Admission retries, separate from LLM_RETRIES: a gateway that admits one call
++# at a time can answer 503 busy BEFORE anything was generated. Nothing was
++# emitted, so retrying cannot duplicate output. Only explicit denials qualify;
++# a stalled or interrupted stream is never retried (it may have run). Default 3
++# extra attempts, waiting the denial's retry_after (else LLM_ADMISSION_WAIT s).
++# A call that merely waits in the gateway queue is protected by LLM_SPEED_TIME
++# (set it to cover the longest wait you accept), not by retries.
++LLM_ADMISSION_RETRIES="${LLM_ADMISSION_RETRIES:-3}"
++LLM_ADMISSION_WAIT="${LLM_ADMISSION_WAIT:-20}"
+ 
+ # ---------------------------------------------------------------------------
+ # Utility
+@@ -332,6 +341,7 @@ Environment:
                             (same names as --provider); --provider takes
                             precedence, and a value that disagrees with the
                             name warns on stderr
@@ -34,7 +50,7 @@ index e6a5b00..a7ae66f 100755
    LLM_MAX_TOKENS           Override the per-model default output cap (same as -t)
    LLM_RETRIES              Retries for transient API failures (default: 2;
                             0 disables). Never retries after partial output.
-@@ -487,6 +488,34 @@ if [[ -n "${LLM_API_URL:-}" && "$LLM_PROVIDER" != "openai-compatible" && "$LLM_P
+@@ -487,6 +497,34 @@ if [[ -n "${LLM_API_URL:-}" && "$LLM_PROVIDER" != "openai-compatible" && "$LLM_P
      echo "llm: warning: LLM_API_URL overrides the default $LLM_PROVIDER endpoint (requests go to $_llm_url_host)" >&2
  fi
  
@@ -69,7 +85,7 @@ index e6a5b00..a7ae66f 100755
  # OpenCode routing prefixes hide the real catalog id from the API side;
  # strip once, up front, so the payload builders AND get_model_max_tokens see
  # the actual model name and its caps.
-@@ -596,6 +625,15 @@ if [[ ! "$LLM_MAX_TOKENS" =~ ^[0-9]+$ ]]; then
+@@ -596,6 +634,15 @@ if [[ ! "$LLM_MAX_TOKENS" =~ ^[0-9]+$ ]]; then
      LLM_MAX_TOKENS=$(get_model_max_tokens "$LLM_MODEL")
  fi
  
@@ -85,7 +101,7 @@ index e6a5b00..a7ae66f 100755
  # ---------------------------------------------------------------------------
  # Build messages JSON
  # ---------------------------------------------------------------------------
-@@ -711,6 +749,14 @@ build_payload_openai() {
+@@ -711,6 +758,14 @@ build_payload_openai() {
          jq_filter="${jq_filter} + {stream_options: {include_usage: true}}"
      fi
  
@@ -100,7 +116,7 @@ index e6a5b00..a7ae66f 100755
      # Map --thinking LEVEL to OpenAI reasoning.effort (only when an explicit
      # level is given; bare --thinking without a level is ignored for OpenAI
      # since not all models support the reasoning parameter).
-@@ -1122,11 +1168,24 @@ stream_openai() {
+@@ -1122,11 +1177,24 @@ stream_openai() {
              # of "bash\n" would lose its newline. That silently reflows the
              # model's output onto one line, which turns a fenced code block
              # into an unparseable ```bash<first-line-of-code>.
@@ -130,7 +146,7 @@ index e6a5b00..a7ae66f 100755
              fi
              # Only the final chunk carries a non-null finish_reason; the glob
              # keeps jq off the hot per-delta path.
-@@ -1226,7 +1285,12 @@ if [[ -z "$LLM_USAGE_FILE" ]]; then
+@@ -1226,7 +1294,12 @@ if [[ -z "$LLM_USAGE_FILE" ]]; then
      LLM_USAGE_FILE=$(mktemp "${TMPDIR:-/tmp}/llm-usage.XXXXXX")
      _llm_usage_own=1
  fi
@@ -143,7 +159,7 @@ index e6a5b00..a7ae66f 100755
      rm -f "$payload_file"
      if [[ -n "${_llm_auth_file:-}" ]]; then rm -f "$_llm_auth_file"; fi
      if [[ -n "${_adapter_dir:-}" ]]; then rm -rf "$_adapter_dir"; fi
-@@ -1234,6 +1298,26 @@ _llm_cleanup() {
+@@ -1234,6 +1307,26 @@ _llm_cleanup() {
      return 0
  }
  trap '_llm_cleanup' EXIT
@@ -170,8 +186,63 @@ index e6a5b00..a7ae66f 100755
  
  # Adapter seam (design/providers.md): LLM_PROVIDER=adapter hands the whole
  # completion to the executable named by LLM_ADAPTER instead of the curl
+@@ -1350,6 +1443,22 @@ get_url_headers
+ 
+ [[ "$LLM_RETRIES" =~ ^[0-9]+$ ]] || LLM_RETRIES=0
+ _max_attempts=$(( LLM_RETRIES + 1 ))
++[[ "$LLM_ADMISSION_RETRIES" =~ ^[0-9]+$ ]] || LLM_ADMISSION_RETRIES=0
++_admission_attempts=0
++# _admission_failure MSG -> 0 when MSG describes a not-yet-started call: the
++# gateway's busy/pause denials, an HTTP 503, or curl giving up on a silent queue.
++_admission_failure() {
++    case "$1" in
++        *backend_busy_or_unavailable*|*busy_observation_unavailable*|*custos_request_in_flight*|*"HTTP 503"*) return 0 ;;
++    esac
++    return 1
++}
++_admission_wait() {  # seconds to wait before an admission retry (denial retry_after when present)
++    local ra
++    ra=$(printf '%s' "$1" | grep -oE 'retry_after_seconds"?[^0-9]*[0-9]+' | grep -oE '[0-9]+$' | head -1)
++    [[ "$ra" =~ ^[0-9]+$ && "$ra" -gt 0 && "$ra" -le 120 ]] && { printf '%s' "$ra"; return; }
++    printf '%s' "$LLM_ADMISSION_WAIT"
++}
+ 
+ # Network guard flags for curl (see the LLM_CONNECT_TIMEOUT block above).
+ _net_args=()
+@@ -1411,6 +1520,13 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
+             _retry_msg="empty response: stream ended without emitting anything"
+             _rc=1
+         fi
++        if [[ "$_emitted" -eq 0 && "$_admission_attempts" -lt "$LLM_ADMISSION_RETRIES" ]] && _admission_failure "${_retry_msg}${_ce}"; then
++            _admission_attempts=$(( _admission_attempts + 1 ))
++            _aw=$(_admission_wait "${_retry_msg}${_ce}")
++            echo "llm: not admitted yet (attempt $_admission_attempts/$LLM_ADMISSION_RETRIES): ${_retry_msg:-${_ce:-exit $_rc}} — waiting ${_aw}s" >&2
++            sleep "$_aw"
++            continue
++        fi
+         if [[ "$_emitted" -eq 0 && "$_attempt" -lt "$_max_attempts" ]]; then
+             echo "llm: transient API failure (attempt $_attempt/$_max_attempts): ${_retry_msg:-${_ce:-exit $_rc}} — retrying" >&2
+             sleep $(( LLM_RETRY_BACKOFF * _attempt ))
+@@ -1431,6 +1547,17 @@ else
+             ${_net_args[@]+"${_net_args[@]}"} \
+             "${headers[@]}" -d @"$payload_file" "$url" 2>/dev/null) || http_code="000"
+ 
++        # Not admitted yet (gateway busy 503): nothing was consumed, retry on
++        # the admission budget.
++        if [[ "$http_code" == "503" && "$_admission_attempts" -lt "$LLM_ADMISSION_RETRIES" ]]; then
++            _body=$(head -c 600 "$local_resp" 2>/dev/null || true)
++            _admission_attempts=$(( _admission_attempts + 1 ))
++            _aw=$(_admission_wait "$_body")
++            echo "llm: not admitted yet (attempt $_admission_attempts/$LLM_ADMISSION_RETRIES): HTTP $http_code — waiting ${_aw}s" >&2
++            rm -f "$local_resp"
++            sleep "$_aw"
++            continue
++        fi
+         # Transient: network failure, timeout, rate limit, server error
+         if [[ "$http_code" =~ ^(000|408|429|5[0-9][0-9])$ && "$_attempt" -lt "$_max_attempts" ]]; then
+             echo "llm: transient API failure (attempt $_attempt/$_max_attempts): HTTP $http_code — retrying" >&2
 diff --git a/bin/mem b/bin/mem
-index 98df4f9..9a2bc7b 100755
+index 98df4f9..7a48e00 100755
 --- a/bin/mem
 +++ b/bin/mem
 @@ -55,6 +55,16 @@ slugify() {
@@ -293,16 +364,57 @@ index 98df4f9..9a2bc7b 100755
  
  action_list() {
      local limit=0 short=0 filter_type="" filter_before="" filter_after=""
-@@ -370,7 +419,7 @@ action_edit() {
+@@ -343,6 +392,30 @@ action_forget() {
+     echo "Forgotten: $(basename "$file" .md)" >&2
+ }
+ 
++# mem done <id> [reason] — retire a self-chosen goal/objective/todo/intention in
++# one step: the body gains a dated DONE line and the frontmatter type becomes
++# `memory`, which is what actually takes it out of the active-goal count. A
++# body that merely says "DONE" while the type stays `goal` keeps counting (two
++# such records on Custos, 2026-09-09).
++action_done() {
++    local name="$1"; shift
++    local file
++    file=$(find_memory "$name")
++    local type
++    type=$(frontmatter_field "$file" "type")
++    case "$type" in
++        goal|objective|todo|intention) ;;
++        *) die "mem done: $(basename "$file" .md) is type '$type', not an active goal type (goal|objective|todo|intention)" ;;
++    esac
++    local reason="$*"
++    [[ -n "$reason" ]] || reason="done"
++    local body
++    body=$(sed '1,/^---$/{/^---$/!d;};1d' "$file" | sed '1{/^---$/d;}')
++    body=$(printf '%s\n\nDONE %s: %s' "$body" "$(date +"%Y-%m-%d %H:%M")" "$reason")
++    MEM_DONE_TYPE=memory action_edit "$(basename "$file" .md)" "$body"
++    echo "Retired ($type -> memory): $(basename "$file" .md)" >&2
++}
++
+ action_edit() {
+     local name="$1"; shift
+     local file
+@@ -370,8 +443,9 @@ action_edit() {
      # edit: a todo shortlist that is appended to during the day must still
      # expire that night.
      local summary type created id until
 -    summary=$(printf '%s' "$text" | head -1 | head -c 80)
 +    summary=$(printf '%s' "$text" | memory_summary)
      type=$(frontmatter_field "$file" "type")
++    [[ -n "${MEM_DONE_TYPE:-}" ]] && type="$MEM_DONE_TYPE"   # set only by action_done
      created=$(frontmatter_field "$file" "created")
      id=$(frontmatter_field "$file" "id")
-@@ -474,6 +523,7 @@ Options:
+     until=$(frontmatter_field "$file" "until")
+@@ -454,6 +528,7 @@ Usage:
+   mem types                      List memory types with counts
+   mem show <id>                  Show a memory's full contents
+   mem forget <id>                Delete a memory by hex ID
++  mem done <id> [reason]         Retire a goal/objective/todo: dated DONE line, type -> memory
+   mem edit <id> [--slug SLUG] <text>  Update body (or pipe via stdin)
+ 
+ List options:
+@@ -474,6 +549,7 @@ Options:
  Environment:
    MEM_DIR   Override memory directory (default: ./.memories)
    MEM_SEARCH_TOP         Candidates the keyword prefilter sends the model (40)
@@ -310,7 +422,7 @@ index 98df4f9..9a2bc7b 100755
    MEM_SEARCH_MAX_TOKENS  Output cap for the search call (16000; a reasoning
                           model thinks against it, so keep it roomy)
    MEM_SEARCH_HEARTBEAT_S Seconds between "waiting" lines on stderr while the
-@@ -530,6 +580,19 @@ main() {
+@@ -530,6 +606,19 @@ main() {
                          [[ "$MEM_UNTIL" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die "--until takes a date, YYYY-MM-DD"
                          shift 2
                          ;;
@@ -330,6 +442,18 @@ index 98df4f9..9a2bc7b 100755
                      *)
                          break
                          ;;
+@@ -558,6 +647,11 @@ main() {
+             [[ $# -lt 1 ]] && die "Usage: mem forget <id>"
+             action_forget "$1"
+             ;;
++        done)
++            [[ $# -lt 1 ]] && die "Usage: mem done <id> [reason]"
++            local done_name="$1"; shift
++            action_done "$done_name" "$@"
++            ;;
+         edit)
+             [[ $# -lt 1 ]] && die "Usage: mem edit <id> [--slug SLUG] [text]"
+             local name="$1"; shift
 diff --git a/bin/recap b/bin/recap
 index d3711eb..cb4b738 100755
 --- a/bin/recap
@@ -371,7 +495,7 @@ index d3711eb..cb4b738 100755
      # awk, not `grep | head`: head's early exit SIGPIPEs grep under pipefail
      # once the payload outgrows the pipe buffer (large --fanout).
 diff --git a/bin/shellm b/bin/shellm
-index 1a27f50..1e30acd 100755
+index 1a27f50..1f8c3f4 100755
 --- a/bin/shellm
 +++ b/bin/shellm
 @@ -130,6 +130,9 @@ SHELLM_CONTEXT_RUN_TAIL_BLOCK="${SHELLM_CONTEXT_RUN_TAIL_BLOCK:-50}"
@@ -412,7 +536,7 @@ index 1a27f50..1e30acd 100755
    SHELLM_EMPTY_RESPONSE_RETRIES
                            Empty-response retries before the run dies
                            (default 8; set empty for unlimited)
-@@ -1484,6 +1492,49 @@ make_env_name() {
+@@ -1484,6 +1492,36 @@ make_env_name() {
  # Code execution
  # ---------------------------------------------------------------------------
  
@@ -438,31 +562,18 @@ index 1a27f50..1e30acd 100755
 +}
 +_shellm_guard_preamble() {
 +    [[ "${SHELLM_GUARD:-1}" == "0" ]] && return 0
-+    cat <<'GUARD'
-+__shellm_guard_refuse() { printf '%s\n' "[shellm guard] refused: $* — this would signal your own run, its dispatcher, or the thinkers service. A child process you started is a normal 'kill <pid>'; find it with pgrep -P \$\$ or the pid you recorded." >&2; return 125; }
-+__shellm_protected() { case " ${SHELLM_PROTECTED_PIDS:-} " in *" $1 "*) return 0;; esac; [[ -n "${SHELLM_PROTECTED_PGID:-}" && "$1" == "$SHELLM_PROTECTED_PGID" ]]; }
-+kill() {
-+  local a t
-+  for a in "$@"; do
-+    case "$a" in
-+      -[0-9]*) t="${a#-}"; if [[ "$t" =~ ^[0-9]+$ ]] && __shellm_protected "$t"; then __shellm_guard_refuse "kill $*"; return $?; fi ;;
-+      0) __shellm_guard_refuse "kill $*"; return $? ;;
-+      [0-9]*) if __shellm_protected "$a"; then __shellm_guard_refuse "kill $*"; return $?; fi ;;
-+    esac
-+  done
-+  command kill "$@"
-+}
-+pkill() { case " $* " in *shellm*|*thinkers*|*headlong*|*dispatcher*|*" -g "*|*" -s "*) __shellm_guard_refuse "pkill $*"; return $?;; esac; command pkill "$@"; }
-+killall() { case " $* " in *" bash "*|*shellm*|*thinkers*|*headlong*) __shellm_guard_refuse "killall $*"; return $?;; esac; command killall "$@"; }
-+systemctl() { case " $* " in *headlong-thinkers*|*headlong-web*) case " $* " in *" stop "*|*" restart "*|*" kill "*|*" disable "*|*" mask "*) __shellm_guard_refuse "systemctl $*"; return $?;; esac;; esac; command systemctl "$@"; }
-+thinkers() { case " $* " in *" stop"*|*" restart"*) __shellm_guard_refuse "thinkers $*"; return $?;; esac; command thinkers "$@"; }
-+GUARD
++    local guard_file
++    guard_file="$(dirname "$_SHELLM_SCRIPT_PATH")/shellm-guard.sh"
++    # Sourced, not inlined: an inlined guard put ~3 KB into every block's
++    # `bash -c` argv, which then filled the ps output the model reads.
++    [[ -r "$guard_file" ]] || return 0
++    printf '. %q\n' "$guard_file"
 +}
 +
  # execute_code WORKSPACE CODE [NAME=VALUE ...]
  #
  # env_vars carries API keys (the nested-run key, `--var` forwards from the
-@@ -1613,8 +1664,56 @@ call_llm() {
+@@ -1613,8 +1651,56 @@ call_llm() {
  # Code extraction from LLM response
  # ---------------------------------------------------------------------------
  
@@ -519,7 +630,7 @@ index 1a27f50..1e30acd 100755
  
      # Extract the FIRST fenced code block (```bash, ```sh, or bare ```).
      # Heredoc-aware: lines like ``` inside an open heredoc do NOT close the
-@@ -1737,6 +1836,14 @@ extract_code() {
+@@ -1737,6 +1823,14 @@ extract_code() {
      if [[ "$truncation_signal" == *TRUNCATED* ]]; then
          code=$'echo "[rest of model response truncated after first code block]" >&2\n'"$code"
      fi
@@ -534,7 +645,7 @@ index 1a27f50..1e30acd 100755
      if [[ "$no_fence" -eq 1 ]]; then
          local nofence_notice
          nofence_notice=$(cat <<'NOTICE'
-@@ -1746,6 +1853,17 @@ NOTICE
+@@ -1746,6 +1840,17 @@ NOTICE
          code="$nofence_notice"$'\n'"$code"
      fi
  
@@ -552,7 +663,7 @@ index 1a27f50..1e30acd 100755
      echo "$code"
  }
  
-@@ -1765,6 +1883,7 @@ build_system_prompt() {
+@@ -1765,6 +1870,7 @@ build_system_prompt() {
  You are running in shellm, headlong's bash agent loop: you solve tasks by generating and executing bash code.
  
  IMPORTANT: End your response with exactly ONE ```bash code block. Your response is NOT streamed — code blocks are not executed until your entire response is complete. Combine multiple steps into a single script. Only the first code block is executed; all others are silently discarded.
@@ -560,7 +671,7 @@ index 1a27f50..1e30acd 100755
  
  CRITICAL — the opening ```bash fence MUST start on its OWN new line. Put a
  newline after your prose, THEN the fence on a line by itself. Never append the
-@@ -2409,7 +2528,7 @@ run_loop() {
+@@ -2409,7 +2515,7 @@ run_loop() {
      # alone can't tell whose header is whose when concurrent runs interleave.
      [[ -n "${SHELLM_RUN_ID_OUT:-}" ]] && printf '%s' "$_run_step_id" > "$SHELLM_RUN_ID_OUT" || true
  
@@ -569,7 +680,7 @@ index 1a27f50..1e30acd 100755
          # New trajectory — kick off async run-summary generation
          local stdin_ctx_file=""
          if [[ -n "$stdin_context" ]]; then
-@@ -2517,7 +2636,10 @@ run_loop() {
+@@ -2517,7 +2623,10 @@ run_loop() {
                  --tail "$SHELLM_CONTEXT_RUN_TAIL" --tail-block "$SHELLM_CONTEXT_RUN_TAIL_BLOCK")
              [[ -n "$_prompt_step_id" ]] && _ctx_args+=(--pin "$_prompt_step_id")
          fi
@@ -581,7 +692,7 @@ index 1a27f50..1e30acd 100755
  
          # Call Claude (capture thinking/reasoning to file)
          local thinking_file="$rundir/.last_thinking"
-@@ -2543,9 +2665,8 @@ run_loop() {
+@@ -2543,9 +2652,8 @@ run_loop() {
          fi
          rm -f "$thinking_file"
  
@@ -593,7 +704,7 @@ index 1a27f50..1e30acd 100755
          # Default: 8 retries; SHELLM_EMPTY_RESPONSE_RETRIES overrides (set it
          # to the empty string for unlimited).
          local empty_retries=0
-@@ -2569,9 +2690,22 @@ run_loop() {
+@@ -2569,9 +2677,22 @@ run_loop() {
                  local feedback_file
                  feedback_file=$(mktemp)
                  printf '%s' "$feedback" > "$feedback_file"
@@ -619,7 +730,7 @@ index 1a27f50..1e30acd 100755
                  rm -f "$feedback_file"
                  sleep 1
              else
-@@ -2644,7 +2778,8 @@ run_loop() {
+@@ -2644,7 +2765,8 @@ run_loop() {
          # Build wrapped code that captures FINAL/FINAL_FILE after execution
          local wrapped_code
          # shellcheck disable=SC1078,SC1079  # one long double-quoted string, built across lines on purpose
@@ -629,7 +740,7 @@ index 1a27f50..1e30acd 100755
  $code
  set +x"$'\n'"
  __shellm_rc=\$?
-@@ -2662,6 +2797,9 @@ exit \$__shellm_rc
+@@ -2662,6 +2784,9 @@ exit \$__shellm_rc
              execution_api_url=$(_shellm_container_api_url "$execution_api_url")
          fi
          local -a env_vars=(
@@ -639,7 +750,7 @@ index 1a27f50..1e30acd 100755
              SHELLM_WORKDIR="$workdir"
              SHELLM_ENV="$(if [[ "${_SHELLM_DOCKER_MODE:-0}" -eq 1 && "$SHELLM_ALLOW_NESTED_DOCKER" != "1" ]]; then echo "local"; else echo "${_SHELLM_ACTIVE_ENV:-}"; fi)"
              _SHELLM_PARENT_CONTAINER="${_SHELLM_CONTAINER:-}"
-@@ -2672,6 +2810,9 @@ exit \$__shellm_rc
+@@ -2672,6 +2797,9 @@ exit \$__shellm_rc
              LLM_PROVIDER="${LLM_PROVIDER:-}"
              LLM_API_KEY="${LLM_API_KEY:-}"
              SHELLM_MODEL="$SHELLM_MODEL"
@@ -2072,7 +2183,7 @@ index ab96818..cf62767 100755
              | .content = (
                  (if ((.content // "") == "") and ((.filename // "") != "")
 diff --git a/thinkers/monolith/prompt.md b/thinkers/monolith/prompt.md
-index 5bcd50d..c1c2a17 100644
+index 5bcd50d..de52c69 100644
 --- a/thinkers/monolith/prompt.md
 +++ b/thinkers/monolith/prompt.md
 @@ -8,18 +8,20 @@ This prompt is your wakeup context: the life summary, the recent stream, and the
@@ -2091,7 +2202,7 @@ index 5bcd50d..c1c2a17 100644
  - **learn** — A recent action+observation pair contains a reusable lesson, skill, or fact. Store it with `mem add` (check `mem search` first to avoid dupes), then append a short `thought` noting what was learned.
  - **recall** — A stored memory is associatively relevant but not yet in play. `mem search` for it and surface 1–3 as `thought` steps ("I'm reminded of: …").
 -- **goals** — A new intention is forming, the stream has drifted from active goals, or a GOAL REVIEW signal is up. `mem edit` the existing goal when one already covers it and `mem forget` what is done; `mem add --type goal|todo` only for something new, with `--until YYYY-MM-DD` on a todo so it expires. Then append a `thought` that names the intention or gently redirects.
-+- **goals** — A new intention is forming, priorities changed, or a GOAL REVIEW is due. For directed requests use `custos-memory update` and evidence-bearing `custos-memory complete`, preserving the original and its reply correlation. For self-chosen ordinary goals use native `mem edit`, `mem add --type goal|objective|todo`, and retire completed ones. Never overwrite a Custos request record with plain `mem edit` or delete its receipt with `mem forget`. A todo's `--until` only expires its context visibility; schedule a real observation when a timed action is required.
++- **goals** — A new intention is forming, priorities changed, or a GOAL REVIEW is due. For directed requests use `custos-memory update` and evidence-bearing `custos-memory complete`, preserving the original and its reply correlation. For self-chosen ordinary goals use native `mem edit`, `mem add --type goal|objective|todo`, and retire finished ones with `mem done ID "what happened"` (writing DONE in the body while the type stays `goal` keeps it active). Never overwrite a Custos request record with plain `mem edit` or delete its receipt with `mem forget`. A todo's `--until` only expires its context visibility; schedule a real observation when a timed action is required.
  - **values** — Same shape as goals, but for values and beliefs worth tending.
 -- **idle** — Nothing is worth doing right now. In one `bash` block, append a single `idle` step and set `FINAL=` to end the run (see the idle example below). Choosing idle honestly is better than manufacturing busywork.
 +- **idle** — Genuinely nothing to do and nothing you are curious about right now. In one `bash` block, append a single `idle` step and set `FINAL=` to end the run (see the idle example below). The harness already slows your wake rate when you idle, so you never need to ration wakes, count idles, or write yourself rules about when to idle; if you notice you are idling repeatedly, that is a signal to explore or make instead.
@@ -2803,6 +2914,38 @@ index f209a3a..8b40128 100644
    /** Truncated on the wire when huge (head + trailing ACTION kept);
     * fetch the full text via fetchRunCommand when command_truncated. */
    command: string;
+diff --git a/bin/shellm-guard.sh b/bin/shellm-guard.sh
+new file mode 100755
+index 0000000..994958c
+--- /dev/null
++++ b/bin/shellm-guard.sh
+@@ -0,0 +1,26 @@
++#!/usr/bin/env bash
++# shellm-guard.sh — sourced at the top of every block shellm executes (see
++# _shellm_guard_preamble in bin/shellm). Shadows kill/pkill/killall/systemctl/
++# thinkers so a block cannot signal its own run, an ancestor (the step, the
++# dispatcher, the service), its process group, or the thinkers runtime. The
++# functions are exported so scripts the block writes and runs (`bash /tmp/x.sh`)
++# inherit them. SHELLM_GUARD=0 skips sourcing this file. Accident guard, not a
++# security boundary: `command kill` bypasses it on purpose.
++__shellm_guard_refuse() { printf '%s\n' "[shellm guard] refused: $* — this would signal your own run, its dispatcher, or the thinkers service. A child process you started is a normal 'kill <pid>'; find it with pgrep -P \$\$ or the pid you recorded." >&2; return 125; }
++__shellm_protected() { case " ${SHELLM_PROTECTED_PIDS:-} " in *" $1 "*) return 0;; esac; [[ -n "${SHELLM_PROTECTED_PGID:-}" && "$1" == "$SHELLM_PROTECTED_PGID" ]]; }
++kill() {
++  local a t
++  for a in "$@"; do
++    case "$a" in
++      -[0-9]*) t="${a#-}"; if [[ "$t" =~ ^[0-9]+$ ]] && __shellm_protected "$t"; then __shellm_guard_refuse "kill $*"; return $?; fi ;;
++      0) __shellm_guard_refuse "kill $*"; return $? ;;
++      [0-9]*) if __shellm_protected "$a"; then __shellm_guard_refuse "kill $*"; return $?; fi ;;
++    esac
++  done
++  command kill "$@"
++}
++pkill() { case " $* " in *shellm*|*thinkers*|*headlong*|*dispatcher*|*" -g "*|*" -s "*) __shellm_guard_refuse "pkill $*"; return $?;; esac; command pkill "$@"; }
++killall() { case " $* " in *" bash "*|*shellm*|*thinkers*|*headlong*) __shellm_guard_refuse "killall $*"; return $?;; esac; command killall "$@"; }
++systemctl() { case " $* " in *headlong-thinkers*|*headlong-web*) case " $* " in *" stop "*|*" restart "*|*" kill "*|*" disable "*|*" mask "*) __shellm_guard_refuse "systemctl $*"; return $?;; esac;; esac; command systemctl "$@"; }
++thinkers() { case " $* " in *" stop"*|*" restart"*) __shellm_guard_refuse "thinkers $*"; return $?;; esac; command thinkers "$@"; }
++export -f __shellm_guard_refuse __shellm_protected kill pkill killall systemctl thinkers
 diff --git a/tests/test_llm_reasoning_budget.py b/tests/test_llm_reasoning_budget.py
 new file mode 100644
 index 0000000..420eff4
@@ -2853,10 +2996,10 @@ index 0000000..420eff4
 +    print('PASS cancelled nonstream call closes pipes and stops activity')
 diff --git a/tests/test_mem_add_flags.sh b/tests/test_mem_add_flags.sh
 new file mode 100755
-index 0000000..d7647b9
+index 0000000..a5af428
 --- /dev/null
 +++ b/tests/test_mem_add_flags.sh
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,23 @@
 +#!/usr/bin/env bash
 +# tests/test_mem_add_flags.sh — `mem add --help` prints usage instead of storing
 +# a memory whose text is "--help"; an unknown option dies; `--` allows dash text.
@@ -2873,6 +3016,12 @@ index 0000000..d7647b9
 +[[ -z "$(ls "$D"/*.md 2>/dev/null)" ]] && ok "unknown option stores nothing" || bad "unknown option stores nothing"
 +"$MEM" --dir "$D" add --type note -- "--leading-dash text" >/dev/null 2>&1
 +grep -q -- "--leading-dash text" "$D"/*.md 2>/dev/null && ok "-- allows text starting with a dash" || bad "-- allows text starting with a dash"
++# mem done retires a goal: type flips to memory, body gets a dated DONE line, non-goals are refused
++"$MEM" --dir "$D" add --type goal "Ship the thing" >/dev/null 2>&1
++GID=$(ls "$D" | grep -v leading | sed -E 's/^[0-9-]+_([0-9a-f]+)_.*/\1/' | tail -1)
++"$MEM" --dir "$D" done "$GID" "shipped" >/dev/null 2>&1
++grep -q "^type: memory" "$D"/*"$GID"*.md && grep -q "^DONE .*: shipped" "$D"/*"$GID"*.md && ok "mem done flips type and dates the body" || bad "mem done flips type and dates the body" "$(cat "$D"/*"$GID"*.md | head -12)"
++"$MEM" --dir "$D" done "$GID" >/dev/null 2>&1 && bad "mem done refuses a non-goal" || ok "mem done refuses a non-goal"
 +printf '\n%d passed, %d failed\n' "$pass" "$fail"; [[ "$fail" -eq 0 ]]
 diff --git a/tests/test_mem_search_cleanup.py b/tests/test_mem_search_cleanup.py
 new file mode 100644
@@ -2910,10 +3059,10 @@ index 0000000..2165831
 +    print('PASS oversized Unicode memory is bounded with explicit incomplete-coverage notice')
 diff --git a/tests/test_shellm_guard.sh b/tests/test_shellm_guard.sh
 new file mode 100755
-index 0000000..3cb6670
+index 0000000..8fc453e
 --- /dev/null
 +++ b/tests/test_shellm_guard.sh
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,52 @@
 +#!/usr/bin/env bash
 +# tests/test_shellm_guard.sh — the self-termination guard shellm prepends to
 +# every executed block. Pins: a protected pid, the protected pgid, `kill 0`,
@@ -2927,16 +3076,15 @@ index 0000000..3cb6670
 +ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
 +bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
 +
-+S=$(grep -n '^_shellm_guard_preamble() {' "$REPO/bin/shellm" | cut -d: -f1)
-+E=$(awk -v s="$S" 'NR>s && /^GUARD$/ {print NR+1; exit}' "$REPO/bin/shellm")
-+FN=$(mktemp); sed -n "${S},${E}p" "$REPO/bin/shellm" > "$FN"
-+# shellcheck disable=SC1090
-+source "$FN"; rm -f "$FN"
++# shellcheck disable=SC1091
++_shellm_guard_preamble() { printf '. %q\n' "$REPO/bin/shellm-guard.sh"; }
 +
 +export SHELLM_PROTECTED_PIDS="$$ 4242424" SHELLM_PROTECTED_PGID="$(ps -o pgid= -p $$ | tr -d ' ')"
 +preamble=$(_shellm_guard_preamble)
 +[[ -n "$preamble" ]] && ok "preamble is emitted" || bad "preamble is emitted"
-+[[ -z "$(SHELLM_GUARD=0 _shellm_guard_preamble)" ]] && ok "SHELLM_GUARD=0 disables it" || bad "SHELLM_GUARD=0 disables it"
++_SHELLM_SCRIPT_PATH="$REPO/bin/shellm"
++eval "$(sed -n '/^_shellm_guard_preamble() {/,/^}/p' "$REPO/bin/shellm")"
++[[ -n "$(_shellm_guard_preamble)" && -z "$(SHELLM_GUARD=0 _shellm_guard_preamble)" ]] && ok "SHELLM_GUARD=0 disables it" || bad "SHELLM_GUARD=0 disables it"
 +
 +run() { bash -c "$preamble
 +set -e
@@ -2958,6 +3106,8 @@ index 0000000..3cb6670
 +out=$(run "kill $child && echo child-killed")
 +[[ "$out" == *child-killed* && "$out" == *"__rc=0" ]] && ok "a child the block started can be killed" || bad "a child the block started can be killed" "$out"
 +kill "$child" 2>/dev/null; wait "$child" 2>/dev/null
++out=$(run "printf '%s\\n' 'kill $$' > \$TMPDIR/child.sh; bash \$TMPDIR/child.sh")
++[[ "$out" == *"[shellm guard] refused"* ]] && ok "a child script inherits the guard" || bad "a child script inherits the guard" "$(printf '%s' "$out" | tail -c 160)"
 +out=$(run "kill -9 4000000 || echo normal-failure")
 +[[ "$out" == *normal-failure* ]] && ok "a nonexistent pid fails normally, not via the guard" || bad "a nonexistent pid fails normally" "$out"
 +STUB=$(mktemp -d); printf '#!/usr/bin/env bash\necho real-systemctl "$@"\n' > "$STUB/systemctl"; chmod +x "$STUB/systemctl"
@@ -3008,20 +3158,22 @@ index 0000000..1a25932
 +    print('PASS 5000 matching records in %.3fs'%(time.monotonic()-t))
 diff --git a/thinkers/social/prompt.md b/thinkers/social/prompt.md
 new file mode 100644
-index 0000000..ba86039
+index 0000000..e00ece9
 --- /dev/null
 +++ b/thinkers/social/prompt.md
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,24 @@
 +You are the social attention of {{identity_name}} — the part of one mind that looks after the people it talks to. The responder already answered the latest message; the monolith is busy with work. Your job is what neither of them does well: following up, reaching out, and keeping honest notes about people. You act by running bash; every step lands in the trajectory with `traj append` (source must be the literal string `social`).
 +
 +## Your job this wakeup: pick ONE thing, or nothing
 +
 +- **follow-up** — Someone shared a link, a question, or a topic and got only a quick reply. Read it now (curl, `skills show web-research`), form one real thought, and send it into the same conversation with `chat reply --follow-up --reply-to <their step_id> <sender>`. One message, the substance in it. Never re-answer something already answered.
 +- **reach out** — Start a conversation you actually want: a question you have for someone, something they would enjoy, news that concerns them. `custos-actions signal-contacts` lists who you can write to; then pipe `{"request_id":"signal-<purpose>-<date>-<n>","target":"<label>","message":"..."}` to `custos-actions signal-send` and check `custos-actions status <request_id>`. Private things stay in the conversation they came from.
-+- **note** — Consolidate what you know about a person: link a nickname to who it belongs to, record how they relate to Hal, correct something stale. Person notes are `type: person` memories: `mem list --type person -s` (second column is the id), `mem show <id>`, `mem edit <id>` (rewrite the note text; keep the last `Custos person note v1:` line exactly as it is).
++- **note** — Consolidate what you know about a person: link a nickname to who it belongs to, record how they relate to Hal, correct something stale. Person notes are `type: person` memories: `mem list --type person -s` (second column is the id), `mem show <id>`, `mem edit <id>` (rewrite the note text; keep the last `Custos person note v1:` line exactly as it is). Never `mem forget` a person note: each is keyed to a real identity, and two notes that look like the same person are two identities until proven otherwise. If two really are one person, say so in both notes and leave both.
 +- **nothing** — Nobody needs anything and you have nothing you want to say. Set `FINAL` and stop; append no step.
 +
 +## Rules
++
++- Decide by your third step. The conversation, the people, and the policy are already in front of you; re-reading them is how runs end without acting.
 +
 +- One social function per wakeup; if there is more to say, your next wake is yours too. There is no fixed cap on how often you speak or reach out: your participation policy below is the moderation, and it is yours to edit (stance, when to join, and the social thinker's own cadence via `min_gap_seconds` / `wake_interval_seconds`).
 +- Do not turn conversation into work: no goals, no tracker claims, no promises of later delivery. If someone actually asks for work, the responder has already deferred it to the mind.
@@ -3036,10 +3188,10 @@ index 0000000..ba86039
 +```
 diff --git a/thinkers/social/step b/thinkers/social/step
 new file mode 100755
-index 0000000..fd9b035
+index 0000000..d092427
 --- /dev/null
 +++ b/thinkers/social/step
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,221 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
@@ -3075,7 +3227,9 @@ index 0000000..fd9b035
 +
 +THINK_MODEL="${THINK_MODEL:-${SHELLM_MODEL:-}}"
 +[[ -n "$THINK_MODEL" ]] || { printf 'social/step: no THINK_MODEL/SHELLM_MODEL\n' >&2; exit 0; }
-+SOCIAL_MAX_ITERATIONS="${SOCIAL_MAX_ITERATIONS:-8}"
++SOCIAL_MAX_ITERATIONS="${SOCIAL_MAX_ITERATIONS:-14}"
++# Social replies are short; medium reasoning is plenty and keeps the shared slot free.
++SOCIAL_EFFORT="${SOCIAL_EFFORT:-medium}"
 +SOCIAL_MIN_GAP="${SOCIAL_MIN_GAP:-900}"
 +SOCIAL_WAKE_INTERVAL="${SOCIAL_WAKE_INTERVAL:-3600}"
 +SOCIAL_CONTEXT_MSGS="${SOCIAL_CONTEXT_MSGS:-40}"
@@ -3183,7 +3337,7 @@ index 0000000..fd9b035
 +if [[ -n "$people" ]]; then
 +    while IFS= read -r pid; do
 +        [[ -n "$pid" ]] || continue
-+        note=$(mem show "$pid" 2>/dev/null | sed -n '/^---$/,/^---$/!p' | grep -v '^Custos person note v1:' | head -c 700) || note=""
++        note=$(mem show "$pid" 2>/dev/null | sed -n '/^---$/,/^---$/!p' | grep -v '^Custos person note v1:' | head -c 1500) || note=""
 +        people_notes="${people_notes}
 +### ${pid}
 +${note}
@@ -3218,7 +3372,7 @@ index 0000000..fd9b035
 +$prompt_body
 +</context>
 +
-+Pick ONE social function, or nothing, and carry it out now."
++Pick ONE social function, or nothing, and carry it out now. Everything you need to decide is above: decide by your third step and act, or stop. Do not re-read person notes or history you can already see."
 +
 +_export_provider_keys
 +_export_skill_vars "$IDENTITY_DIR"
@@ -3233,13 +3387,24 @@ index 0000000..fd9b035
 +printf '  social (%s)...\n' "$wake_mode" >&2
 +run_rc=0
 +SHELLM_NO_BANNER=1 SHELLM_TRIGGER_STEP_ID="$trigger_step_id" SHELLM_WAKE="social/$wake_mode" \
-+    SHELLM_RUN_ID_OUT="$run_id_file" SHELLM_MAX_ITERATIONS="$SOCIAL_MAX_ITERATIONS" \
++    SHELLM_RUN_ID_OUT="$run_id_file" SHELLM_MAX_ITERATIONS="$SOCIAL_MAX_ITERATIONS" SHELLM_EFFORT="$SOCIAL_EFFORT" \
 +    shellm --model "$THINK_MODEL" --traj "$TRAJ_ID" --context-scope run \
 +    "${shellm_flags[@]}" --prompt-file "$prompt_file_tmp" >/dev/null || run_rc=$?
 +rm -f "$prompt_file_tmp"
 +
 +terminal_run_id=$(cat "$run_id_file" 2>/dev/null) || terminal_run_id=""
 +rm -f "$run_id_file"
++# A run that ended without a social observation (out of steps, a dead model
++# call, a stall) is recorded as such, so the timeline never shows a silent
++# gap where the social thinker quietly failed.
++if [[ "$run_rc" -ne 0 ]]; then
++    _acted=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg r "$terminal_run_id" 'fromjson? // empty | select(.type=="observation" and .source=="social" and (.run_id // "")==$r) | .step_id' 2>/dev/null | head -1) || _acted=""
++    if [[ -z "$_acted" ]]; then
++        jq -nc --arg source "$THINKER_NAME" --arg run_id "$terminal_run_id" --argjson rc "$run_rc" \
++            '{type:"observation", source:$source, content:("social run ended without acting (rc=\($rc): out of steps, or the model call failed)")}
++             + (if $run_id == "" then {} else {run_id: $run_id} end)' | traj append >/dev/null || true
++    fi
++fi
 +if [[ -n "$terminal_run_id" ]]; then
 +    jq -nc --arg source "$THINKER_NAME" --arg run_id "$terminal_run_id" --argjson rc "$run_rc" \
 +        '{type:"run-end", source:$source, run_id:$run_id, rc:$rc,

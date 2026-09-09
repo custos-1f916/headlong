@@ -208,10 +208,10 @@ class ResponderTests(MemoryFixture):
     def outgoing(self):
         return [step for step in self.steps() if step.get("type") == "message" and step.get("from") == "custos"]
 
-    def test_responder_uses_xhigh_and_outlives_inference_deadlines(self):
+    def test_responder_uses_medium_effort_by_default_and_outlives_inference_deadlines(self):
         def checked(argv, *args, **kwargs):
             if argv[0] == "llm":
-                self.assertEqual(argv[argv.index("--effort") + 1], "xhigh")
+                self.assertEqual(argv[argv.index("--effort") + 1], "medium")
                 self.assertGreaterEqual(int(argv[argv.index("--max-tokens") + 1]), 65536)
                 self.assertGreater(kwargs["timeout"], 630)
             return self.model(argv, *args, **kwargs)
@@ -560,6 +560,71 @@ class ResponderTests(MemoryFixture):
         self.assertIn('"group_stance":"chatty"', seen["system"])
         self.assertIn("You have no note yet about hal", seen["system"])
         self.assertIn("fine to ask them something back", seen["system"])
+
+    def test_person_display_is_fixed_after_creation(self):
+        self.plan = {"reply": "Hi.", "decision": "reply", "goal": None, "memories": [],
+                     "person": {"display": "Hal", "aliases": [], "notes": "Hal is my operator."}}
+        with mock.patch.object(cm, "run", side_effect=self.model):
+            cm.response(self.store, self.request)
+        # A later reply tries to relabel the same person's note as someone they mentioned.
+        self.envelope = {**self.envelope, "step_id": "trigger-3", "request_id": "operator:44", "content": "Ryan says hi."}
+        self.log.write_text(self.log.read_text() + cm.encode(self.envelope) + "\n")
+        self.request = {**self.request, "envelope": self.envelope, "messages": [{"role": "user", "content": "Ryan says hi."}]}
+        self.plan["person"] = {"display": "Ryan", "aliases": [], "notes": "Ryan is Hal's friend who says hi."}
+        with mock.patch.object(cm, "run", side_effect=lambda argv, *a, **kw: cm.encode(self.plan) if argv[0] == "llm" else self.real_run(argv, *a, **kw)):
+            cm.response(self.store, self.request)
+        found = cm.People(self.store).find("hal")
+        self.assertEqual(found[1]["display"], "Hal")
+        self.assertIn("Ryan", found[1]["aliases"])  # the proposed name is kept, as an alias
+        self.assertEqual(len([i for i in self.store.files() if i[3].get("type") == "person"]), 1)
+
+    def test_at_most_two_memories_per_reply(self):
+        plan = {**self.plan, "memories": [{"type": "note", "content": str(n)} for n in range(3)]}
+        with self.assertRaises(cm.MemoryError):
+            cm.validate_plan(cm.encode(plan))
+
+    def test_archive_moves_settled_conversations_and_keeps_idempotency(self):
+        self.plan = {"reply": "Hello!", "decision": "reply", "goal": None, "memories": []}
+        with mock.patch.object(cm, "run", side_effect=self.model):
+            cm.response(self.store, self.request)
+        record = self.store.request("operator:42")
+        self.assertEqual(record[4]["status"], "completed")
+        # Too new to archive.
+        self.assertEqual(self.store.archive_conversations(older_than_days=2), 0)
+        # Age it and archive.
+        item = self.store.find(record[3]["id"]); rec = item[4]
+        rec["received_at"] = "2020-01-01T00:00:00+00:00"; self.store.save(item, rec)
+        self.assertEqual(self.store.archive_conversations(older_than_days=2), 1)
+        self.assertIsNone(self.store.request("operator:42"))
+        self.assertTrue(any(self.store.archive_dir().glob("*.md")))
+        # A replayed envelope for the archived request creates nothing and replies nothing.
+        receipt = self.store.capture(*cm.envelope_payload(self.envelope))
+        self.assertTrue(receipt["archived"]); self.assertFalse(receipt["created"])
+        self.assertIsNone(self.store.request("operator:42"))
+        with mock.patch.object(cm, "run", side_effect=lambda *a, **kw: self.fail("no model call for an archived request")):
+            self.assertEqual(cm.response(self.store, self.request)["decision"], "archived")
+        self.assertEqual(len(self.outgoing()), 1)
+        # Deferred tasks are never archived.
+        other = {**self.envelope, "step_id": "trigger-7", "request_id": "operator:77"}
+        gid = self.store.capture(*cm.envelope_payload(other))["goal_id"]
+        item = self.store.find(gid); rec = item[4]
+        rec["response"] = {"state": "sent", "plan": {"reply": "on it", "decision": "defer", "goal": rec["goal"], "memories": []}}
+        rec["received_at"] = "2020-01-01T00:00:00+00:00"; self.store.save(item, rec)
+        self.assertEqual(self.store.archive_conversations(older_than_days=2), 0)
+
+    def test_replay_unanswered_queues_the_original_message_for_the_responder(self):
+        # Captured while the responder was down: record exists, no response.
+        self.store.capture(*cm.envelope_payload(self.envelope))
+        item = self.store.find(self.store.request("operator:42")[3]["id"]); rec = item[4]
+        rec["received_at"] = "2020-01-01T00:00:00+00:00"; self.store.save(item, rec)
+        result = cm.replay_unanswered(self.store, older_than=900, limit=3)
+        self.assertEqual([q["trigger_step"] for q in result["queued"]], ["trigger-1"])
+        pending = list((self.identity / "run" / "pending").glob("responder.message.*"))
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(json.loads(pending[0].read_text())["step_id"], "trigger-1")
+        # Idempotent while the pending file is still there; fresh messages are not replayed.
+        self.assertEqual(cm.replay_unanswered(self.store, older_than=900, limit=3)["queued"], [])
+        self.assertEqual(len(list((self.identity / "run" / "pending").glob("responder.message.*"))), 1)
 
     def test_legacy_defer_delivers_only_human_text(self):
         with mock.patch.object(cm, "run", side_effect=lambda argv, *a, **kw: "DEFER: inspect artifact\nI will check the artifact." if argv[0] == "llm" else self.real_run(argv, *a, **kw)):
