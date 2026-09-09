@@ -470,7 +470,7 @@ class Observer:
             # not gone out, so the mind can see how many wait behind the allowance.
             pending = square_queue(self.store, path)
             self.store.put("outbox:square_pending", {"count": len(pending), "oldest": pending[0]["ts"] if pending else None,
-                                                      "items": pending[:20], "at": self.now})
+                                                      "items": pending[:200], "at": self.now})
 
     def _drain_outbox(self, path, cursor):
         with path.open("rb") as source:
@@ -773,7 +773,7 @@ def main(argv=None):
     if args.command == "status":
         print(canonical({"sources": {row["key"]: json.loads(row["value"]) for row in store.db.execute("SELECT * FROM state WHERE key LIKE 'source:%'")},
                          "outbox": [dict(row) for row in store.db.execute("SELECT id,status,receipt FROM outbound ORDER BY started DESC LIMIT 30")],
-                         "square_pending": {"count": len(square_queue(store)), "items": square_queue(store)[:20]},
+                         "square_pending": (lambda q: {"count": len(q), "items": q[:200], "note": "every queued reply, oldest first; items past 200 are omitted"})(square_queue(store)),
                          "square_allowance": allowance_summary(store),
                          "inbox_page_pending": store.get("inbox:page") is not None}))
         return 0
