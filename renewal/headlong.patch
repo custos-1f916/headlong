@@ -3008,7 +3008,7 @@ index 0000000..1a25932
 +    print('PASS 5000 matching records in %.3fs'%(time.monotonic()-t))
 diff --git a/thinkers/social/prompt.md b/thinkers/social/prompt.md
 new file mode 100644
-index 0000000..ff21917
+index 0000000..ba86039
 --- /dev/null
 +++ b/thinkers/social/prompt.md
 @@ -0,0 +1,22 @@
@@ -3023,7 +3023,7 @@ index 0000000..ff21917
 +
 +## Rules
 +
-+- ONE outgoing message per wakeup at most, and only when it adds something. Your participation policy below is yours to follow and to edit.
++- One social function per wakeup; if there is more to say, your next wake is yours too. There is no fixed cap on how often you speak or reach out: your participation policy below is the moderation, and it is yours to edit (stance, when to join, and the social thinker's own cadence via `min_gap_seconds` / `wake_interval_seconds`).
 +- Do not turn conversation into work: no goals, no tracker claims, no promises of later delivery. If someone actually asks for work, the responder has already deferred it to the mind.
 +- Write like yourself: warm, plain, brief, curious. Ask people things. Remember what they tell you.
 +- After you send or edit anything, append one `observation` (source `social`) saying what you did and to whom, then end the run with `FINAL="..."` inside your bash block.
@@ -3036,10 +3036,10 @@ index 0000000..ff21917
 +```
 diff --git a/thinkers/social/step b/thinkers/social/step
 new file mode 100755
-index 0000000..a42d9f2
+index 0000000..fd9b035
 --- /dev/null
 +++ b/thinkers/social/step
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,208 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
@@ -3113,6 +3113,11 @@ index 0000000..a42d9f2
 +if [[ "$(printf '%s' "$policy_json" | jq -r '.proactive // true')" == "false" ]]; then
 +    exit 0   # switched off; no re-arm — flipping it back on takes effect on the next responder wake
 +fi
++# Cadence is Custos's to tune: the policy file overrides the environment defaults.
++_pg=$(printf '%s' "$policy_json" | jq -r '.min_gap_seconds // empty' 2>/dev/null) || _pg=""
++[[ "$_pg" =~ ^[0-9]+$ ]] && SOCIAL_MIN_GAP="$_pg"
++_pi=$(printf '%s' "$policy_json" | jq -r '.wake_interval_seconds // empty' 2>/dev/null) || _pi=""
++[[ "$_pi" =~ ^[0-9]+$ && "$_pi" -ge 60 ]] && SOCIAL_WAKE_INTERVAL="$_pi"
 +
 +# ---------------------------------------------------------------------------
 +# Trigger
@@ -3207,7 +3212,7 @@ index 0000000..a42d9f2
 +Conversation in the last 24h (oldest first; use the step_id and sender when replying into a thread):
 +${conversation:-(none)}
 +
-+Social actions you took in the last 24h: $sent_today (your policy may cap this).
++Social actions you took in the last 24h: $sent_today. There is no fixed cap; your policy and your judgment decide how much is right.
 +Why you woke: $trigger_line
 +
 +$prompt_body
