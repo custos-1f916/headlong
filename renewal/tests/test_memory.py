@@ -55,14 +55,18 @@ class CommandDiagnosticsTests(unittest.TestCase):
 
 
 class MemoryTests(MemoryFixture):
-    def test_positional_write_id_rejected_before_reading_stdin(self):
+    def test_positional_write_without_text_fails_fast_instead_of_hanging_on_stdin(self):
+        # `custos-memory complete ID` with nothing typed and an idle pipe on stdin
+        # (what a bash block inside a wake inherits) must not block: it waits a
+        # moment for piped text, then fails with a usage message.
         goal_id = self.store.capture(self.payload)["goal_id"]
         with subprocess.Popen(
             [sys.executable, cm.__file__, "complete", goal_id],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         ) as process:
             try:
-                self.assertEqual(process.wait(timeout=3), 2)
+                self.assertEqual(process.wait(timeout=3), 1)
+                self.assertIn(b"evidence required", process.stderr.read())
             finally:
                 if process.poll() is None:
                     process.kill()
@@ -760,6 +764,65 @@ class ResponderTests(MemoryFixture):
         text_out = cm.context_text(result)
         self.assertIn("Stale asks", text_out); self.assertIn(gid, text_out)
         self.assertIn("Possible duplicates", text_out); self.assertIn(did, text_out)
+
+    def test_context_renders_compact_goal_lines_not_records(self):
+        gid = self.store.capture(*cm.envelope_payload(self.envelope))["goal_id"]
+        item = self.store.find(gid); rec = item[4]
+        rec["response"] = {"state": "sent", "plan": {"reply": "on it", "decision": "defer", "goal": rec["goal"], "memories": []}}
+        self.store.save(item, rec)
+        text_out = cm.context_text(self.store.context())
+        line = [l for l in text_out.splitlines() if l.startswith("- " + gid)]
+        self.assertEqual(len(line), 1, text_out)
+        self.assertIn("[task, from hal", line[0])
+        self.assertIn("| next:", line[0])
+        # No raw record fields: request ids, trigger steps and hashes stay behind custos-memory show.
+        self.assertNotIn('"request_id"', text_out)
+        self.assertNotIn("trigger_step", text_out)
+        self.assertLess(len(text_out.encode()), 1500)
+
+    def test_agent_asks_expire_after_a_day_operator_asks_do_not(self):
+        agent_ask = {**self.envelope, "from": "square:egress:3100:50000", "request_id": "square:c50000", "authority": "agent",
+                     "content": "@custos please benchmark my parser", "step_id": "trigger-agent"}
+        aid = self.store.capture(*cm.envelope_payload(agent_ask))["goal_id"]
+        oid = self.store.capture(*cm.envelope_payload(self.envelope))["goal_id"]
+        for gid in (aid, oid):
+            item = self.store.find(gid); rec = item[4]
+            rec["response"] = {"state": "sent", "plan": {"reply": "on it", "decision": "defer", "goal": rec["goal"], "memories": []}}
+            rec["received_at"] = (cm.dt.datetime.now(cm.dt.timezone.utc) - cm.dt.timedelta(hours=30)).isoformat()
+            self.store.save(item, rec)
+        expired = cm.expire_asks(self.store, 24)
+        self.assertEqual([e["goal_id"] for e in expired], [aid])
+        self.assertEqual(self.store.find(aid)[4]["status"], "declined")
+        self.assertIn("Expired by the harness", self.store.find(aid)[4]["resolution"]["evidence"])
+        self.assertEqual(self.store.find(oid)[4]["status"], "active")
+        observation = [s for s in self.steps() if s.get("type") == "observation" and s.get("source") == "goals"]
+        self.assertEqual(len(observation), 1)
+        self.assertIn("asker not told", observation[0]["content"])
+        # Idempotent: nothing left to expire.
+        self.assertEqual(cm.expire_asks(self.store, 24), [])
+
+    def test_complete_and_update_accept_positional_and_lenient_forms(self):
+        gid = self.store.capture(*cm.envelope_payload(self.envelope))["goal_id"]
+        item = self.store.find(gid); rec = item[4]
+        rec["response"] = {"state": "sent", "plan": {"reply": "on it", "decision": "defer", "goal": rec["goal"], "memories": []}}
+        self.store.save(item, rec)
+        env = {**os.environ, "IDENTITY_DIR": str(self.identity), "IDENTITY_NAME": "custos",
+               "TRAJ_DIR": str(self.identity / "trajectories"), "TRAJ_ID": self.traj_id, "ROOT_TRAJ_ID": self.traj_id}
+        tool = str(Path(cm.__file__).resolve().parent / "bin" / "custos-memory")
+        out = subprocess.run([tool, "update", gid, "Read", "the", "failure", "report", "next"], capture_output=True, text=True, env=env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.store.find(gid)[4]["goal"]["next_action"], "Read the failure report next")
+        fenced = "```json\n{\"goal_id\": \"%s\", \"disposition\": \"completed\", \"evidence\": \"tests pass\",}\n```" % gid
+        out = subprocess.run([tool, "complete"], input=fenced, capture_output=True, text=True, env=env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.store.find(gid)[4]["status"], "completed")
+        gid2 = self.store.capture(*cm.envelope_payload({**self.envelope, "step_id": "trigger-2", "request_id": "operator:43"}))["goal_id"]
+        item = self.store.find(gid2); rec = item[4]
+        rec["response"] = {"state": "sent", "plan": {"reply": "on it", "decision": "defer", "goal": rec["goal"], "memories": []}}
+        self.store.save(item, rec)
+        out = subprocess.run([tool, "complete", gid2, "declined", "the", "ask", "is", "moot"], capture_output=True, text=True, env=env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.store.find(gid2)[4]["resolution"], {"disposition": "declined", "evidence": "the ask is moot"})
 
     def test_legacy_defer_delivers_only_human_text(self):
         with mock.patch.object(cm, "run", side_effect=lambda argv, *a, **kw: "DEFER: inspect artifact\nI will check the artifact." if argv[0] == "llm" else self.real_run(argv, *a, **kw)):

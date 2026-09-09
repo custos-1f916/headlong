@@ -419,6 +419,13 @@ def main(argv=None):
             result = square.receipt(args.request_id)
         else:
             payload = {k: v for k, v in vars(args).items() if k not in ("verb", "request_id", "body_file") and v is not None}
+            if args.verb in ("comment", "post"):
+                # A direct write draws on the same daily allowance as the outbox queue
+                # and goes out ahead of every reply waiting there. Say so; do not block.
+                queued = square_queue(square.store)
+                if queued:
+                    print("custos-square: note: %d of your replies are queued in the outbox (oldest %s); this direct %s posts ahead of "
+                          "them and spends one of the same daily comments." % (len(queued), str(queued[0].get("ts", ""))[:16], args.verb), file=sys.stderr)
             if args.verb != "vote":
                 with open(args.body_file, "rb") as source:
                     raw = source.read(32001)

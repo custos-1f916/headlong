@@ -117,7 +117,9 @@ def payload(raw, max_tokens):
                 raise ValueError("invalid content")
             elif isinstance(content,str):
                 text_bytes += len(content.encode())
-        if text_bytes > 131072:
+        # 256 KiB, not 128: the mind's context cap moved from 96 to 192 KiB on
+        # 2026-09-09 (johan prefills ~6k tok/s, so a 49K-token call costs ~8 s).
+        if text_bytes > 262144:
             raise ValueError('text exceeds admitted envelope')
         return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
     except (ValueError, TypeError, RecursionError, OverflowError):

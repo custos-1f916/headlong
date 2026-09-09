@@ -63,7 +63,9 @@ class ImageTests(unittest.TestCase):
 
     def test_text_budget_remains_bounded_despite_larger_media_envelope(self):
         with self.assertRaises(cg.Denied):
-            cg.payload(json.dumps({'model':cg.MODEL,'messages':[{'role':'user','content':'x'*131073}]}).encode(),65536)
+            cg.payload(json.dumps({'model':cg.MODEL,'messages':[{'role':'user','content':'x'*262145}]}).encode(),65536)
+        # 256 KiB of text is admitted (the mind's context cap is 192 KiB since 2026-09-09).
+        cg.payload(json.dumps({'model':cg.MODEL,'messages':[{'role':'user','content':'x'*200000}]}).encode(),65536)
 
 
 if __name__=='__main__': unittest.main()

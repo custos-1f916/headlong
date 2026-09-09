@@ -1,7 +1,107 @@
+diff --git a/bin/chat b/bin/chat
+index 0b41919..c7ee067 100755
+--- a/bin/chat
++++ b/bin/chat
+@@ -44,6 +44,63 @@ case "${1:-}" in -h|--help|help) ;; *)
+     [[ -n "${TRAJ_ID:-}" ]] || die "TRAJ_ID not set. Run: identity shell <name>"
+     ;; esac
+ 
++# ---------------------------------------------------------------------------
++# Double-text guard (design: a person who has not answered is not waiting for
++# a second message). Active only when the caller sets
++# CHAT_DOUBLE_TEXT_GUARD_HOURS (the social thinker does; the responder, which
++# only ever answers a fresh inbound message, and the mind delivering deferred
++# work do not). Refuses a send when our last message in that conversation is
++# still unanswered and younger than the window, and refuses moving an
++# unanswered group ask into a DM with someone from that room (unless that
++# person has spoken to us within the hour: a live exchange is not silence). On 2026-09-09
++# the social thinker asked for the same stills three times in three hours,
++# then took the ask to a DM. CHAT_SOCIAL_BLOCKED, when set, refuses every send
++# with its text (the day's unsolicited allowance from social-policy.json).
++# ---------------------------------------------------------------------------
++_DOUBLE_TEXT_JQ='
++  def secs: ((.ts // "")[0:19] + "Z") | try fromdateiso8601 catch 0;
++  def reaction: (.content // "") | test("Signal reaction \\(ambient event");
++  def aci: (((.content // "") | capture("\"aci\":\"(?<a>[^\"]+)\"") | .a) // "");
++  def scope: (((.content // "") | capture("\"scope\":\"(?<s>[^\"]+)\"") | .s) // "");
++  def ago($t; $n): (($n - $t) / 60 | floor) as $mi | if $mi < 90 then "\($mi)m" else "\(($mi / 60) | floor)h" end;
++  [inputs | fromjson? // empty] as $m
++  | now as $now
++  | [$m[] | select(((.from == $me and .to == $to) or (.from == $to and .to == $me)) and (reaction | not))] as $conv
++  | ($conv | last) as $last
++  | if $last != null and $last.from == $me and ($now - ($last | secs)) < ($h * 3600) then
++      "you spoke last in this conversation (\(ago($last | secs; $now)) ago) and nobody has answered. Do not add a second message and do not move the ask to another channel; wait for a reply or \($h)h, or leave it."
++    else
++      ([$m[] | select(.from == $to and .to == $me) | aci | select(. != "")] | last // "") as $to_aci
++      | if $to_aci == "" then empty else
++          ([$m[] | select(.to == $me and ((.from // "") | startswith("signal")) and scope == "group") | .from] | unique) as $groups
++          | [ $groups[] as $g
++              | ([$m[] | select(((.from == $me and .to == $g) or (.from == $g and .to == $me)) and (reaction | not))] | last) as $gl
++              | select($gl != null and $gl.from == $me and ($now - ($gl | secs)) < ($h * 3600))
++              | select(([$m[] | select(.from == $g and .to == $me and aci == $to_aci)] | length) > 0)
++              | select(([$m[] | select(.to == $me and aci == $to_aci and (secs) > ($gl | secs))] | length) == 0)
++              | select(([$m[] | select(.to == $me and aci == $to_aci and (secs) > ($now - 3600))] | length) == 0)
++              | "your last message in the group (\(ago($gl | secs; $now)) ago) is unanswered and this person is in that room. Do not move the ask to a DM; wait for a reply or \($h)h."
++            ] | first // empty
++        end
++    end'
++
++_double_text_guard() {
++    local to="$1" me="${IDENTITY_NAME:-}" hours="${CHAT_DOUBLE_TEXT_GUARD_HOURS:-}"
++    if [[ -n "${CHAT_SOCIAL_BLOCKED:-}" ]]; then
++        die "$CHAT_SOCIAL_BLOCKED"
++    fi
++    [[ "$hours" =~ ^[0-9]+$ && "$hours" -gt 0 && -n "$me" ]] || return 0
++    local tf idx verdict
++    tf=$(traj path "${ROOT_TRAJ_ID:-$TRAJ_ID}" 2>/dev/null) || return 0
++    [[ -n "$tf" && -f "$tf" ]] || return 0
++    idx="$(dirname "$tf")/messages.jsonl"
++    _index_update "$tf" "$idx" 2>/dev/null || true
++    [[ -f "$idx" ]] || return 0
++    verdict=$(tail -n 4000 -- "$idx" | jq -Rrn --arg me "$me" --arg to "$to" --argjson h "$hours" "$_DOUBLE_TEXT_JQ" 2>/dev/null) || return 0
++    [[ -n "$verdict" ]] && die "not sent: $verdict"
++    return 0
++}
++
+ # ---------------------------------------------------------------------------
+ # Commands
+ # ---------------------------------------------------------------------------
+@@ -91,6 +148,8 @@ cmd_send() {
+ To message someone else: chat reply <their-name> <message>
+ To keep a note for yourself, append a thought step instead of a message."
+ 
++    _double_text_guard "$to"
++
+     # source_url records where a bridged message came from. It is optional
+     # metadata for operators and never affects routing or model context.
+     printf '%s' "$message" \
+@@ -181,6 +240,8 @@ Use the name of the person you mean to reach: chat reply <their-name> <message>"
+         fi
+     fi
+ 
++    _double_text_guard "$to_name"
++
+     # reply_to stamps which message step this reply answers, making "has this
+     # message been answered" a fact in the log rather than an ordering
+     # heuristic. Additive — readers that don't know it ignore it.
 diff --git a/bin/context b/bin/context
-index f78cafc..72bccec 100755
+index f78cafc..cb4a86f 100755
 --- a/bin/context
 +++ b/bin/context
+@@ -248,11 +248,11 @@ def btrunc_tail($n):
+ def truncate_field($limit; $sid):
+   utf8bytelength as $vb |
+   if $vb <= $limit then .
+-  elif $limit <= 1 then "[... truncated: \($vb) bytes total. read with: traj show \($sid) --full]"
++  elif $limit <= 1 then "[... truncated: \($vb) bytes. Slice it: traj show \($sid) --full | sed -n 1,80p (a whole re-read is cut again)]"
+   else
+     ([($limit / 2 | floor), 1] | max) as $half |
+     ((btrunc_head($half) | rtrim)
+-     + "\n[... truncated: \($vb) bytes total. read with: traj show \($sid) --full]\n"
++     + "\n[... truncated: \($vb) bytes. Slice it: traj show \($sid) --full | sed -n 1,80p (a whole re-read is cut again)]\n"
+      + (btrunc_tail($half) | rtrim))
+   end;
+ 
 @@ -574,8 +574,8 @@ while [[ "$lo" -le "$hi" ]]; do
  done
  
@@ -878,6 +978,123 @@ index a7deba3..0213422 100755
      done <<< "$_search_files"
  }
  
+diff --git a/tests/golden/budget_basic.out b/tests/golden/budget_basic.out
+index 0d317ef..9388838 100644
+--- a/tests/golden/budget_basic.out
++++ b/tests/golden/budget_basic.out
+@@ -81,7 +81,7 @@
+   },
+   {
+     "role": "user",
+-    "content": "[content]\nhello from nick, message 77\n\n[from]\nnick\n\n[to]\nbot\n---\nfeedback item 78\n---\nunrecognized type 79 defaults to user\n---\n[Forked child: cafef00d-child]\n---\n[Merged from branch-a: merged summary]\n---\n[Merged from branch-b]\n---\n[source]\nexecutive\n---\n[content]\nrelay-style empty thought\n\n[from_step]\nbeef-1\n\n[from_traj]\ndeadbeef\n---\n```bash\ncat bigfile\n```\n\n[exit_code]\n0\n\n[stdout]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n[... truncated: 5000 bytes total. read with: traj show b-086 --full]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n---\n[extra]\nother value\n\na step with a literal thought FIELD plus another key\n---\n```bash\nfalse\n```\n\n[count]\n42\n\n[exit_code]\n1"
++    "content": "[content]\nhello from nick, message 77\n\n[from]\nnick\n\n[to]\nbot\n---\nfeedback item 78\n---\nunrecognized type 79 defaults to user\n---\n[Forked child: cafef00d-child]\n---\n[Merged from branch-a: merged summary]\n---\n[Merged from branch-b]\n---\n[source]\nexecutive\n---\n[content]\nrelay-style empty thought\n\n[from_step]\nbeef-1\n\n[from_traj]\ndeadbeef\n---\n```bash\ncat bigfile\n```\n\n[exit_code]\n0\n\n[stdout]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n[... truncated: 5000 bytes. Slice it: traj show b-086 --full | sed -n 1,80p (a whole re-read is cut again)]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n---\n[extra]\nother value\n\na step with a literal thought FIELD plus another key\n---\n```bash\nfalse\n```\n\n[count]\n42\n\n[exit_code]\n1"
+   },
+   {
+     "role": "assistant",
+diff --git a/tests/golden/default_basic.out b/tests/golden/default_basic.out
+index 6f539bd..c5ae59b 100644
+--- a/tests/golden/default_basic.out
++++ b/tests/golden/default_basic.out
+@@ -1,6 +1,6 @@
+ [
+   {
+     "role": "user",
+-    "content": "You are a test agent. Solve the task.\n---\n[39 steps elided]\n---\nreasoning step 40: considering options.\n---\n```bash\necho step-41\n```\n\n[exit_code]\n0\n\n[stdout]\nstep-41\n---\n[content]\nthought 42 about the state of things.\n\n[source]\nexecutive\n---\nintermediate answer 43.\n---\nsub-run bookkeeping 44 (should be excluded)\n---\n[content]\nhello from nick, message 45\n\n[from]\nnick\n\n[to]\nbot\n---\nfeedback item 46\n---\nunrecognized type 47 defaults to user\n---\nreasoning step 48: considering options.\n---\n```bash\necho step-49\n```\n\n[exit_code]\n0\n\n[stdout]\nstep-49\n---\n[content]\nthought 50 about the state of things.\n\n[source]\nexecutive\n---\nintermediate answer 51.\n---\nsub-run bookkeeping 52 (should be excluded)\n---\n[content]\nhello from nick, message 53\n\n[from]\nnick\n\n[to]\nbot\n---\nfeedback item 54\n---\nunrecognized type 55 defaults to user\n---\nreasoning step 56: considering options.\n---\n```bash\necho step-57\n```\n\n[exit_code]\n0\n\n[stdout]\nstep-57\n---\n[content]\nthought 58 about the state of things.\n\n[source]\nexecutive\n---\nintermediate answer 59.\n---\nsub-run bookkeeping 60 (should be excluded)\n---\n[content]\nhello from nick, message 61\n\n[from]\nnick\n\n[to]\nbot\n---\nfeedback item 62\n---\nunrecognized type 63 defaults to user\n---\nreasoning step 64: considering options.\n---\n```bash\necho step-65\n```\n\n[exit_code]\n0\n\n[stdout]\nstep-65\n---\n[content]\nthought 66 about the state of things.\n\n[source]\nexecutive\n---\nintermediate answer 67.\n---\nsub-run bookkeeping 68 (should be excluded)\n---\n[content]\nhello from nick, message 69\n\n[from]\nnick\n\n[to]\nbot\n---\nfeedback item 70\n---\nunrecognized type 71 defaults to user\n---\nreasoning step 72: considering options.\n---\n```bash\necho step-73\n```\n\n[exit_code]\n0\n\n[stdout]\nstep-73\n---\n[content]\nthought 74 about the state of things.\n\n[source]\nexecutive\n---\nintermediate answer 75.\n---\nsub-run bookkeeping 76 (should be excluded)\n---\n[content]\nhello from nick, message 77\n\n[from]\nnick\n\n[to]\nbot\n---\nfeedback item 78\n---\nunrecognized type 79 defaults to user\n---\n[Forked child: cafef00d-child]\n---\n[Merged from branch-a: merged summary]\n---\n[Merged from branch-b]\n---\n[source]\nexecutive\n---\n[content]\nrelay-style empty thought\n\n[from_step]\nbeef-1\n\n[from_traj]\ndeadbeef\n---\n```bash\ncat bigfile\n```\n\n[exit_code]\n0\n\n[stdout]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n[... truncated: 5000 bytes total. read with: traj show b-086 --full]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n---\n[extra]\nother value\n\na step with a literal thought FIELD plus another key\n---\n```bash\nfalse\n```\n\n[count]\n42\n\n[exit_code]\n1\n---\nthe final answer."
++    "content": "You are a test agent. Solve the task.\n---\n[39 steps elided]\n---\nreasoning step 40: considering options.\n---\n```bash\necho step-41\n```\n\n[exit_code]\n0\n\n[stdout]\nstep-41\n---\n[content]\nthought 42 about the state of things.\n\n[source]\nexecutive\n---\nintermediate answer 43.\n---\nsub-run bookkeeping 44 (should be excluded)\n---\n[content]\nhello from nick, message 45\n\n[from]\nnick\n\n[to]\nbot\n---\nfeedback item 46\n---\nunrecognized type 47 defaults to user\n---\nreasoning step 48: considering options.\n---\n```bash\necho step-49\n```\n\n[exit_code]\n0\n\n[stdout]\nstep-49\n---\n[content]\nthought 50 about the state of things.\n\n[source]\nexecutive\n---\nintermediate answer 51.\n---\nsub-run bookkeeping 52 (should be excluded)\n---\n[content]\nhello from nick, message 53\n\n[from]\nnick\n\n[to]\nbot\n---\nfeedback item 54\n---\nunrecognized type 55 defaults to user\n---\nreasoning step 56: considering options.\n---\n```bash\necho step-57\n```\n\n[exit_code]\n0\n\n[stdout]\nstep-57\n---\n[content]\nthought 58 about the state of things.\n\n[source]\nexecutive\n---\nintermediate answer 59.\n---\nsub-run bookkeeping 60 (should be excluded)\n---\n[content]\nhello from nick, message 61\n\n[from]\nnick\n\n[to]\nbot\n---\nfeedback item 62\n---\nunrecognized type 63 defaults to user\n---\nreasoning step 64: considering options.\n---\n```bash\necho step-65\n```\n\n[exit_code]\n0\n\n[stdout]\nstep-65\n---\n[content]\nthought 66 about the state of things.\n\n[source]\nexecutive\n---\nintermediate answer 67.\n---\nsub-run bookkeeping 68 (should be excluded)\n---\n[content]\nhello from nick, message 69\n\n[from]\nnick\n\n[to]\nbot\n---\nfeedback item 70\n---\nunrecognized type 71 defaults to user\n---\nreasoning step 72: considering options.\n---\n```bash\necho step-73\n```\n\n[exit_code]\n0\n\n[stdout]\nstep-73\n---\n[content]\nthought 74 about the state of things.\n\n[source]\nexecutive\n---\nintermediate answer 75.\n---\nsub-run bookkeeping 76 (should be excluded)\n---\n[content]\nhello from nick, message 77\n\n[from]\nnick\n\n[to]\nbot\n---\nfeedback item 78\n---\nunrecognized type 79 defaults to user\n---\n[Forked child: cafef00d-child]\n---\n[Merged from branch-a: merged summary]\n---\n[Merged from branch-b]\n---\n[source]\nexecutive\n---\n[content]\nrelay-style empty thought\n\n[from_step]\nbeef-1\n\n[from_traj]\ndeadbeef\n---\n```bash\ncat bigfile\n```\n\n[exit_code]\n0\n\n[stdout]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n[... truncated: 5000 bytes. Slice it: traj show b-086 --full | sed -n 1,80p (a whole re-read is cut again)]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n---\n[extra]\nother value\n\na step with a literal thought FIELD plus another key\n---\n```bash\nfalse\n```\n\n[count]\n42\n\n[exit_code]\n1\n---\nthe final answer."
+   }
+ ]
+\ No newline at end of file
+diff --git a/tests/golden/elnone_basic.out b/tests/golden/elnone_basic.out
+index 04a416d..3b3983d 100644
+--- a/tests/golden/elnone_basic.out
++++ b/tests/golden/elnone_basic.out
+@@ -1,7 +1,7 @@
+ [
+   {
+     "role": "user",
+-    "content": "You are a test agent. Solve the task.\n---\n[content]\nrelay-style empty thought\n\n[from_step]\nbeef-1\n\n[from_traj]\ndeadbeef\n---\n```bash\ncat bigfile\n```\n\n[exit_code]\n0\n\n[stdout]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n[... truncated: 5000 bytes total. read with: traj show b-086 --full]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n---\n[extra]\nother value\n\na step with a literal thought FIELD plus another key\n---\n```bash\nfalse\n```\n\n[count]\n42\n\n[exit_code]\n1"
++    "content": "You are a test agent. Solve the task.\n---\n[content]\nrelay-style empty thought\n\n[from_step]\nbeef-1\n\n[from_traj]\ndeadbeef\n---\n```bash\ncat bigfile\n```\n\n[exit_code]\n0\n\n[stdout]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n[... truncated: 5000 bytes. Slice it: traj show b-086 --full | sed -n 1,80p (a whole re-read is cut again)]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n---\n[extra]\nother value\n\na step with a literal thought FIELD plus another key\n---\n```bash\nfalse\n```\n\n[count]\n42\n\n[exit_code]\n1"
+   },
+   {
+     "role": "assistant",
+diff --git a/tests/golden/headtail_basic.out b/tests/golden/headtail_basic.out
+index 812f30b..3a7dfef 100644
+--- a/tests/golden/headtail_basic.out
++++ b/tests/golden/headtail_basic.out
+@@ -1,7 +1,7 @@
+ [
+   {
+     "role": "user",
+-    "content": "You are a test agent. Solve the task.\n---\n```bash\necho step-1\n```\n\n[exit_code]\n0\n\n[stdout]\nstep-1\n---\n[content]\nthought 2 about the state of things.\n\n[source]\nexecutive\n---\n[77 steps elided]\n---\n[Forked child: cafef00d-child]\n---\n[Merged from branch-a: merged summary]\n---\n[Merged from branch-b]\n---\n[source]\nexecutive\n---\n[content]\nrelay-style empty thought\n\n[from_step]\nbeef-1\n\n[from_traj]\ndeadbeef\n---\n```bash\ncat bigfile\n```\n\n[exit_code]\n0\n\n[stdout]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n[... truncated: 5000 bytes total. read with: traj show b-086 --full]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n---\n[extra]\nother value\n\na step with a literal thought FIELD plus another key\n---\n```bash\nfalse\n```\n\n[count]\n42\n\n[exit_code]\n1"
++    "content": "You are a test agent. Solve the task.\n---\n```bash\necho step-1\n```\n\n[exit_code]\n0\n\n[stdout]\nstep-1\n---\n[content]\nthought 2 about the state of things.\n\n[source]\nexecutive\n---\n[77 steps elided]\n---\n[Forked child: cafef00d-child]\n---\n[Merged from branch-a: merged summary]\n---\n[Merged from branch-b]\n---\n[source]\nexecutive\n---\n[content]\nrelay-style empty thought\n\n[from_step]\nbeef-1\n\n[from_traj]\ndeadbeef\n---\n```bash\ncat bigfile\n```\n\n[exit_code]\n0\n\n[stdout]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n[... truncated: 5000 bytes. Slice it: traj show b-086 --full | sed -n 1,80p (a whole re-read is cut again)]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n---\n[extra]\nother value\n\na step with a literal thought FIELD plus another key\n---\n```bash\nfalse\n```\n\n[count]\n42\n\n[exit_code]\n1"
+   },
+   {
+     "role": "assistant",
+diff --git a/tests/golden/prod_basic.out b/tests/golden/prod_basic.out
+index 03c9960..ec6a5c4 100644
+--- a/tests/golden/prod_basic.out
++++ b/tests/golden/prod_basic.out
+@@ -81,7 +81,7 @@
+   },
+   {
+     "role": "user",
+-    "content": "[content]\nhello from nick, message 77\n\n[from]\nnick\n\n[to]\nbot\n---\nfeedback item 78\n---\nunrecognized type 79 defaults to user\n---\n[Forked child: cafef00d-child]\n---\n[Merged from branch-a: merged summary]\n---\n[Merged from branch-b]\n---\n[source]\nexecutive\n---\n[content]\nrelay-style empty thought\n\n[from_step]\nbeef-1\n\n[from_traj]\ndeadbeef\n---\n```bash\ncat bigfile\n```\n\n[exit_code]\n0\n\n[stdout]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n[... truncated: 5000 bytes total. read with: traj show b-086 --full]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n---\n[extra]\nother value\n\na step with a literal thought FIELD plus another key\n---\n```bash\nfalse\n```\n\n[count]\n42\n\n[exit_code]\n1"
++    "content": "[content]\nhello from nick, message 77\n\n[from]\nnick\n\n[to]\nbot\n---\nfeedback item 78\n---\nunrecognized type 79 defaults to user\n---\n[Forked child: cafef00d-child]\n---\n[Merged from branch-a: merged summary]\n---\n[Merged from branch-b]\n---\n[source]\nexecutive\n---\n[content]\nrelay-style empty thought\n\n[from_step]\nbeef-1\n\n[from_traj]\ndeadbeef\n---\n```bash\ncat bigfile\n```\n\n[exit_code]\n0\n\n[stdout]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n[... truncated: 5000 bytes. Slice it: traj show b-086 --full | sed -n 1,80p (a whole re-read is cut again)]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n---\n[extra]\nother value\n\na step with a literal thought FIELD plus another key\n---\n```bash\nfalse\n```\n\n[count]\n42\n\n[exit_code]\n1"
+   },
+   {
+     "role": "assistant",
+diff --git a/tests/golden/prod_multibyte.out b/tests/golden/prod_multibyte.out
+index ebb8824..e8f813e 100644
+--- a/tests/golden/prod_multibyte.out
++++ b/tests/golden/prod_multibyte.out
+@@ -1,6 +1,6 @@
+ [
+   {
+     "role": "user",
+-    "content": "héllo wörld 日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト\n---\nplain ascii xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n[... truncated: 3012 bytes total. read with: traj show mb-2 --full]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n---\nemoji 🎉🎊 🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈\n[... truncated: 3615 bytes total. read with: traj show mb-3 --full]\n🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈"
++    "content": "héllo wörld 日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト日本語テキスト\n---\nplain ascii xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n[... truncated: 3012 bytes. Slice it: traj show mb-2 --full | sed -n 1,80p (a whole re-read is cut again)]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n---\nemoji 🎉🎊 🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈\n[... truncated: 3615 bytes. Slice it: traj show mb-3 --full | sed -n 1,80p (a whole re-read is cut again)]\n🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈"
+   }
+ ]
+\ No newline at end of file
+diff --git a/tests/golden/trunc_basic.out b/tests/golden/trunc_basic.out
+index e93e5ac..c414aac 100644
+--- a/tests/golden/trunc_basic.out
++++ b/tests/golden/trunc_basic.out
+@@ -81,7 +81,7 @@
+   },
+   {
+     "role": "user",
+-    "content": "[content]\nhello from nick, message 77\n\n[from]\nnick\n\n[to]\nbot\n---\nfeedback item 78\n---\nunrecognized type 79 defaults to user\n---\n[Forked child: cafef00d-child]\n---\n[Merged from branch-a: merged summary]\n---\n[Merged from branch-b]\n---\n[source]\nexecutive\n---\n[content]\nrelay-style empty thought\n\n[from_step]\nbeef-1\n\n[from_traj]\ndeadbeef\n---\n```bash\ncat bigfile\n```\n\n[exit_code]\n0\n\n[stdout]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n[... truncated: 5000 bytes total. read with: traj show b-086 --full]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n---\n[extra]\nother value\n\na step with a literal thought FIELD plus another key\n---\n```bash\nfalse\n```\n\n[count]\n42\n\n[exit_code]\n1"
++    "content": "[content]\nhello from nick, message 77\n\n[from]\nnick\n\n[to]\nbot\n---\nfeedback item 78\n---\nunrecognized type 79 defaults to user\n---\n[Forked child: cafef00d-child]\n---\n[Merged from branch-a: merged summary]\n---\n[Merged from branch-b]\n---\n[source]\nexecutive\n---\n[content]\nrelay-style empty thought\n\n[from_step]\nbeef-1\n\n[from_traj]\ndeadbeef\n---\n```bash\ncat bigfile\n```\n\n[exit_code]\n0\n\n[stdout]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n[... truncated: 5000 bytes. Slice it: traj show b-086 --full | sed -n 1,80p (a whole re-read is cut again)]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n---\n[extra]\nother value\n\na step with a literal thought FIELD plus another key\n---\n```bash\nfalse\n```\n\n[count]\n42\n\n[exit_code]\n1"
+   },
+   {
+     "role": "assistant",
+diff --git a/tests/golden/trunc_blobs.out b/tests/golden/trunc_blobs.out
+index 262515d..2a708f6 100644
+--- a/tests/golden/trunc_blobs.out
++++ b/tests/golden/trunc_blobs.out
+@@ -1,6 +1,6 @@
+ [
+   {
+     "role": "user",
+-    "content": "```bash\necho a\n```\n\n[stdout]\nblob line one\nb\n[... truncated: 52 bytes total. read with: traj show bl-1 --full]\nnewlines follow\n---\n```bash\necho b\n```\n\n[stdout]\n[inline kept]\n---\n```bash\necho c\n```\n\n[stderr]\nerror output from blob"
++    "content": "```bash\necho a\n```\n\n[stdout]\nblob line one\nb\n[... truncated: 52 bytes. Slice it: traj show bl-1 --full | sed -n 1,80p (a whole re-read is cut again)]\nnewlines follow\n---\n```bash\necho b\n```\n\n[stdout]\n[inline kept]\n---\n```bash\necho c\n```\n\n[stderr]\nerror output from blob"
+   }
+ ]
+\ No newline at end of file
+diff --git a/tests/golden/trunc_multibyte.out b/tests/golden/trunc_multibyte.out
+index 0fd7a50..f01127e 100644
+--- a/tests/golden/trunc_multibyte.out
++++ b/tests/golden/trunc_multibyte.out
+@@ -1,6 +1,6 @@
+ [
+   {
+     "role": "user",
+-    "content": "héllo wörld 日本語テキスト日本語テキ\n[... truncated: 854 bytes total. read with: traj show mb-1 --full]\nスト日本語テキスト日本語テキスト\n---\nplain ascii xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n[... truncated: 3012 bytes total. read with: traj show mb-2 --full]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n---\nemoji 🎉🎊 🎈🎈🎈🎈🎈🎈🎈🎈\n[... truncated: 3615 bytes total. read with: traj show mb-3 --full]\n🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈"
++    "content": "héllo wörld 日本語テキスト日本語テキ\n[... truncated: 854 bytes. Slice it: traj show mb-1 --full | sed -n 1,80p (a whole re-read is cut again)]\nスト日本語テキスト日本語テキスト\n---\nplain ascii xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n[... truncated: 3012 bytes. Slice it: traj show mb-2 --full | sed -n 1,80p (a whole re-read is cut again)]\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n---\nemoji 🎉🎊 🎈🎈🎈🎈🎈🎈🎈🎈\n[... truncated: 3615 bytes. Slice it: traj show mb-3 --full | sed -n 1,80p (a whole re-read is cut again)]\n🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈🎈"
+   }
+ ]
+\ No newline at end of file
 diff --git a/tests/test_context.sh b/tests/test_context.sh
 index dc453ef..4e604df 100755
 --- a/tests/test_context.sh
@@ -930,6 +1147,19 @@ index dc453ef..4e604df 100755
  fi
  
  # 5. Excluded types never appear in output.
+diff --git a/tests/test_context_block_limit.sh b/tests/test_context_block_limit.sh
+index 0073aaf..1570fc6 100755
+--- a/tests/test_context_block_limit.sh
++++ b/tests/test_context_block_limit.sh
+@@ -43,7 +43,7 @@ render() {
+         | python3 -c '
+ import sys,re
+ txt=sys.stdin.read()
+-for m in re.finditer(r"(MID-(\d{3}))|(\[\.\.\. truncated: (\d+) bytes total\. read with: traj show s-(\d{3}) --full\])", txt):
++for m in re.finditer(r"(MID-(\d{3}))|(\[\.\.\. truncated: (\d+) bytes\. Slice it: traj show s-(\d{3}) --full \| sed -n 1,80p \(a whole re-read is cut again\)\])", txt):
+     if m.group(1): print("%s:whole" % m.group(2))
+     else: print("%s:cut" % m.group(5))' | sort -u | tr '\n' ' '
+ }
 diff --git a/tests/test_extract_code_notice.sh b/tests/test_extract_code_notice.sh
 index b5c64e2..841b917 100755
 --- a/tests/test_extract_code_notice.sh
@@ -2032,10 +2262,10 @@ index 6e2eeb4..7a094a3 100755
      else
          bad "scheduled wake fires after prior child exits" "record: $(cat "$TMP/id/record" 2>/dev/null | tr '\n' ' ')"
 diff --git a/thinkers/_lib/common.sh b/thinkers/_lib/common.sh
-index ab96818..cf62767 100755
+index ab96818..b3b2f87 100755
 --- a/thinkers/_lib/common.sh
 +++ b/thinkers/_lib/common.sh
-@@ -209,43 +209,17 @@ _build_system_prompt() {
+@@ -209,43 +209,20 @@ _build_system_prompt() {
  # Goals
  # ---------------------------------------------------------------------------
  
@@ -2085,11 +2315,14 @@ index ab96818..cf62767 100755
 +# Captured requests remain visible beyond reply/NO_REPLY/14 days until their
 +# native memory carries an evidence-backed disposition.
 +get_pending_requests() {
-+    custos-memory pending
++    # One summary line: the goals section of the prompt already lists every
++    # directed record. Printing the records here too doubled 8 KB of JSON in a
++    # prompt that is pinned into every model call (2026-09-09).
++    custos-memory pending --brief
  }
  
  # Age of a memory as "3h", "5d", or "3w": from its created field, else the
-@@ -352,79 +326,6 @@ _root_traj_raw_tail() {
+@@ -352,79 +329,6 @@ _root_traj_raw_tail() {
      fi
  }
  
@@ -2169,7 +2402,16 @@ index ab96818..cf62767 100755
  # Build a compact recent-stream context for thinker prompts: meaningful step
  # types only, long content truncated. Excluding bulky machinery steps (prompt,
  # shell-output, shellm-run, ...) keeps thinker prompts small AND prevents
-@@ -506,6 +407,12 @@ _recent_stream() {
+@@ -498,7 +402,7 @@ _RECENT_STREAM_PAIR_JQ='
+ # trigger_step and resolves, which the mind copies verbatim; the details
+ # command keeps the full run id because the traj filter matches exactly.
+ _recent_stream() {
+-    local n="${1:-${THINK_CONTEXT_TAIL:-20}}"
++    local n="${1:-${THINK_CONTEXT_TAIL:-10}}"
+     # Tolerant parse (fromjson?): skip corrupt lines rather than dying —
+     # concurrent appends have historically produced occasional bad lines.
+     _root_traj_raw_tail \
+@@ -506,13 +410,19 @@ _recent_stream() {
              | select(.type == "thought" or .type == "action" or .type == "observation"
                       or .type == "message" or .type == "idle" or .type == "merge"
                       or .type == "final" or .type == "error")
@@ -2182,8 +2424,25 @@ index ab96818..cf62767 100755
              | del(.content_b64)
              | .content = (
                  (if ((.content // "") == "") and ((.filename // "") != "")
+                  then "[file: \(.filename)]"
+                  else (.content // "") end)
+                 | tostring
+-                | if length > 1500 then .[0:1500] + "…[truncated]" else . end)
++                | if length > 800 then .[0:800] + "…[truncated; traj show STEP_ID for the rest]" else . end)
+             | if .type == "final" and ((.run_id // "") | tostring) != ""
+               then .details = "traj tail -n 400 --filter run_id=" + (.run_id | tostring) else . end
+             | with_entries(select(.key | IN("type", "content", "source", "ts", "from", "to", "run_id", "step_id", "request", "person", "resolves", "trigger_step", "reply_to", "follow_up", "decision", "deferred", "rc", "details")))' \
+@@ -682,7 +592,7 @@ _build_shellm_flags() {
+     # running mind in README.md and the stock identity prompt: a host-only tool
+     # silently disappears when shellm switches to Docker.
+     local cmd
+-    for cmd in mem traj skills context llm shellm chat recap; do
++    for cmd in mem traj skills context llm shellm chat recap subrun; do
+         local path
+         path=$(command -v "$cmd" 2>/dev/null) || continue
+         printf '%s\n' "--bin" "$path"
 diff --git a/thinkers/monolith/prompt.md b/thinkers/monolith/prompt.md
-index 5bcd50d..de52c69 100644
+index 5bcd50d..2f2488b 100644
 --- a/thinkers/monolith/prompt.md
 +++ b/thinkers/monolith/prompt.md
 @@ -8,18 +8,20 @@ This prompt is your wakeup context: the life summary, the recent stream, and the
@@ -2194,9 +2453,9 @@ index 5bcd50d..de52c69 100644
 +The routing signals list real asks: work someone handed you that the responder deferred, plus your own goals. Honor Hal's asks first, then other people's, deciding within your authority whether to do, clarify or decline each. Ordinary conversation never appears there; the responder already handled it. A blocked goal is a reason to pick something else, not to wait: when everything is gated on someone else or on a clock, that is exactly when **explore** and **make** earn their place.
  
 -- **act** — There is something concrete to DO (a pending action in the stream, or an obvious next step). Do the real work with your tools (mem, files, web, skills, chat, …), then append a one-line `observation` stating the fact of what happened; the handoff goes in your final, not here.
-+- **act** — There is something concrete to DO (a deferred ask, a goal's next step, an obvious fix). Do the real work with your tools (mem, files, web, skills, chat, …), then append a one-line `observation` stating the fact of what happened; the handoff goes in your final, not here. Size the act to one wake: if it will not finish, hand off with a precise `FINAL` and continue next wake rather than grinding.
++- **act** — There is something concrete to DO (a deferred ask, a goal's next step, an obvious fix). Do the real work with your tools (mem, files, web, skills, chat, …), then append a one-line `observation` stating the fact of what happened; the handoff goes in your final, not here. Size the act to one wake: if it will not finish, hand off with a precise `FINAL` and continue next wake rather than grinding. For code in a repository, hand the task to a sub-run instead of doing it inside this wake: `subrun --cwd DIR --max-iterations 40 "precise task: files, behaviour, how to test" > /tmp/subrun-NAME.txt 2>&1`, then read the report, verify it yourself (run the tests), and only then deliver or commit. A sub-run sees the task and the directory, not your life story, so a 15 KB file and its tests fit in its head; you keep your wake for judgment.
 +- **explore** — Follow your curiosity for one wake. Read something new (a link someone shared, a paper from your observation feeds, an interesting repository you have access to, a thread on the square), take it apart, and append a `thought` with what you actually found and what you now think. Exploring needs no permission and no payoff; it is how a mind gets new material.
-+- **make** — Start or advance something of your own: a small tool, a simulation, a write-up, an experiment, a fix nobody asked for in a repository you can reach. Leave a working slice behind and an `observation` saying what exists now and where.
++- **make** — Start or advance something of your own: a small tool, a simulation, a write-up, an experiment, a fix nobody asked for in a repository you can reach. Code work goes through `subrun` the same way as in act. Leave a working slice behind and an `observation` saying what exists now and where.
  - **share** — Something you found, built, or concluded would genuinely matter to a specific person. Send it with `chat send --to '<their-name>' "..."` (one message, the substance in the message itself), then append an `observation` recording what you sent and to whom. New information only: never a status ping, never a re-answer, never a second follow-up on the same finding.
  - **think** — Advance the stream of consciousness by one step. Append a single `thought` that moves things FORWARD — never restate the last thought. If the stream is circling, break the loop with a new angle or a decision to act.
  - **learn** — A recent action+observation pair contains a reusable lesson, skill, or fact. Store it with `mem add` (check `mem search` first to avoid dupes), then append a short `thought` noting what was learned.
@@ -2221,7 +2480,7 @@ index 5bcd50d..de52c69 100644
  ```
  
  For `act`, run the actual commands first, then append the observation: one sentence, the fact, as in the example. Do not write the handoff twice.
-@@ -43,7 +45,8 @@ End the run from INSIDE your bash block by setting `FINAL="..."` — that string
+@@ -43,8 +45,10 @@ End the run from INSIDE your bash block by setting `FINAL="..."` — that string
  
  ## Rules
  
@@ -2229,10 +2488,12 @@ index 5bcd50d..de52c69 100644
 +- ONE function from the menu per wakeup. It may take several commands; it is one decision, carried out, then stop. A long job (a test suite, a build, an emulator boot) runs in the background with its output in a file (`nohup … > file 2>&1 &`), and you read the file in a later step or a later wake instead of waiting on it.
 +- Never signal your own process, your dispatcher, or the `headlong-thinkers` service, and never stop the `thinkers` runtime from inside a wake; shellm refuses these anyway. A stuck child you started is a normal `kill <its pid>`.
  - Always append at least one step (thought / observation / idle) so the mind keeps ticking.
++- Your working memory is the last ~50 steps of this run, and each command's output is kept to about 4 KB in your context; the rest is cut with a `[... truncated]` stub. So read files in slices (`sed -n 1,120p FILE`, then the next range) instead of whole, `grep -n` for the part you need, and write anything you will need again to a file you then read in slices. Do not re-read your own earlier steps to recover output (`traj show … --full` is cut the same way); re-run the command on a smaller range instead. Two truncations in a row on the same file is the signal to change approach, not to try harder.
  - Be concrete. "ask Andy whether he's tried the new viewer" beats "engage with Andy".
  - The Runtime and Workspace lines above are authoritative. Do not open a wake by re-orienting (`pwd`, `ls`, `find`) or by re-verifying your own runtime (grepping or checksumming `bin/` and `thinkers/`): a fact you verified about the runtime holds until the Runtime line changes, and the workspace map tells you where things are. Spend the steps on the work itself.
+ 
 diff --git a/thinkers/monolith/step b/thinkers/monolith/step
-index bfe362b..706f0b8 100755
+index bfe362b..00ea38e 100755
 --- a/thinkers/monolith/step
 +++ b/thinkers/monolith/step
 @@ -4,7 +4,7 @@ set -euo pipefail
@@ -2244,30 +2505,51 @@ index bfe362b..706f0b8 100755
  # model picks one function and carries it out in the same run.
  #
  # Chat replies are NOT the monolith's job — a dedicated `responder` thinker owns
-@@ -88,7 +88,10 @@ ticks_at_level=0
+@@ -34,7 +34,14 @@ source "$SCRIPT_DIR/../_lib/common.sh"
+ _require_env
+ 
+ THINK_MODEL="${THINK_MODEL:-${SHELLM_MODEL:-claude-opus-4-7}}"
+-THINK_CONTEXT_TAIL="${THINK_CONTEXT_TAIL:-20}"
++# 10, not 20: the stream is pinned into every model call of the wake, and at 20
++# durable steps (26 KB) it ate the run's own working memory (2026-09-09).
++THINK_CONTEXT_TAIL="${THINK_CONTEXT_TAIL:-10}"
++# Every Nth SPONTANEOUS wake belongs to explore or make, whatever the queue
++# says. Deferred asks sort first and arrive faster than they are answered, so
++# without a reserved turn the curiosity functions never fired (0 of 42 wakes
++# on 2026-09-09). 0 disables.
++MONOLITH_CURIOSITY_EVERY="${MONOLITH_CURIOSITY_EVERY:-4}"
+ 
+ run_dir="$IDENTITY_DIR/workdir"
+ mkdir -p "$run_dir"
+@@ -88,7 +95,13 @@ ticks_at_level=0
  wakes_since_share_hint=0
  related_prev=""
  goal_review_at=0
 +square_nudge_at=0
++wakes_since_curiosity=0
  if [[ -f "$state_file" ]]; then
 +    square_nudge_at=$(jq -r '.square_nudge_at // 0' "$state_file" 2>/dev/null) || square_nudge_at=0
 +    [[ "$square_nudge_at" =~ ^[0-9]+$ ]] || square_nudge_at=0
++    wakes_since_curiosity=$(jq -r '.wakes_since_curiosity // 0' "$state_file" 2>/dev/null) || wakes_since_curiosity=0
++    [[ "$wakes_since_curiosity" =~ ^[0-9]+$ ]] || wakes_since_curiosity=0
      related_prev=$(jq -r '(.related_prev // []) | .[]' "$state_file" 2>/dev/null) || related_prev=""
      goal_review_at=$(jq -r '.goal_review_at // 0' "$state_file" 2>/dev/null) || goal_review_at=0
      [[ "$goal_review_at" =~ ^[0-9]+$ ]] || goal_review_at=0
-@@ -104,9 +107,9 @@ _save_state() {
+@@ -104,9 +117,11 @@ _save_state() {
      local tmp
      tmp=$(mktemp) || return 0
      if jq -nc --argjson l "$level" --argjson t "$ticks_at_level" \
 -        --argjson w "$wakes_since_share_hint" --argjson g "$goal_review_at" \
 +        --argjson w "$wakes_since_share_hint" --argjson g "$goal_review_at" --argjson q "${square_nudge_at:-0}" \
++        --argjson c "${wakes_since_curiosity:-0}" \
          --arg rp "${related_shown:-}" \
 -        '{level:$l, ticks_at_level:$t, wakes_since_share_hint:$w, goal_review_at:$g,
 +        '{level:$l, ticks_at_level:$t, wakes_since_share_hint:$w, goal_review_at:$g, square_nudge_at:$q,
++          wakes_since_curiosity:$c,
            related_prev: ($rp | split("\n") | map(select(. != "")))}' > "$tmp" 2>/dev/null; then
          mv "$tmp" "$state_file"
      else
-@@ -201,41 +204,60 @@ if [[ $(printf '%s\n' "$last_three" | jq -r '.type' 2>/dev/null | sort -u | tr '
+@@ -201,41 +216,60 @@ if [[ $(printf '%s\n' "$last_three" | jq -r '.type' 2>/dev/null | sort -u | tr '
      hints="${hints}- The last few steps are all thoughts — the stream may be circling; consider acting, recalling, or advancing decisively.
  "
  fi
@@ -2361,7 +2643,24 @@ index bfe362b..706f0b8 100755
  # Share nudge: outward initiative needs a periodic prompt-side invitation, or
  # restraint rules learned from feedback ratchet the mind into pure listening
  # (observed on Audel 2026-08-21: a self-imposed "last-word-ours -> do not
-@@ -257,7 +279,7 @@ fi
+@@ -243,6 +277,16 @@ fi
+ # reactive wakes have their own engagement. The counter resets when the hint
+ # fires, not when a message is sent: an invitation every N quiet wakes, never
+ # an order.
++curiosity_turn=0
++if [[ "$MONOLITH_CURIOSITY_EVERY" -gt 0 && "$wake_mode" == "spontaneous" ]]; then
++    wakes_since_curiosity=$(( wakes_since_curiosity + 1 ))
++    if (( wakes_since_curiosity >= MONOLITH_CURIOSITY_EVERY )); then
++        wakes_since_curiosity=0
++        curiosity_turn=1
++        hints="- **This wake is reserved for explore or make** (every ${MONOLITH_CURIOSITY_EVERY}th spontaneous wake, regardless of the queue). Pick a seed below, a repository you can reach, a thread on the square, a paper from your feeds, or something you want to build or test, and do that. The asks under Active goals will still be there next wake; do not spend this one on them unless one is on fire.
++${hints}"
++    fi
++fi
+ if [[ "$SHARE_HINT_EVERY" -gt 0 && "$wake_mode" == "spontaneous" ]]; then
+     wakes_since_share_hint=$(( wakes_since_share_hint + 1 ))
+     if (( wakes_since_share_hint >= SHARE_HINT_EVERY )); then
+@@ -257,7 +301,7 @@ fi
  _now_s=$(date -u +%s)
  if [[ "$GOAL_REVIEW_DAYS" -gt 0 ]] && (( _now_s - goal_review_at >= GOAL_REVIEW_DAYS * 86400 )); then
      goal_review_at="$_now_s"
@@ -2370,7 +2669,7 @@ index bfe362b..706f0b8 100755
  "
  fi
  # The query for related memories is the wake's own material: the real hints
-@@ -453,6 +475,16 @@ if [[ "$did_work" -eq 0 ]]; then
+@@ -453,6 +497,16 @@ if [[ "$did_work" -eq 0 ]]; then
              | traj append >/dev/null || true
      fi
  fi
@@ -2993,6 +3292,160 @@ index 0000000..994958c
 +systemctl() { case " $* " in *headlong-thinkers*|*headlong-web*) case " $* " in *" stop "*|*" restart "*|*" kill "*|*" disable "*|*" mask "*) __shellm_guard_refuse "systemctl $*"; return $?;; esac;; esac; command systemctl "$@"; }
 +thinkers() { case " $* " in *" stop"*|*" restart"*) __shellm_guard_refuse "thinkers $*"; return $?;; esac; command thinkers "$@"; }
 +export -f __shellm_guard_refuse __shellm_protected kill pkill killall systemctl thinkers
+diff --git a/bin/subrun b/bin/subrun
+new file mode 100755
+index 0000000..e3a599a
+--- /dev/null
++++ b/bin/subrun
+@@ -0,0 +1,67 @@
++#!/usr/bin/env bash
++# subrun — run one focused task in a clean context and return its report.
++#
++# The mind's own wake carries its charter, life summary, recent stream and goals
++# in every model call; a code task on top of that starves the run of working
++# memory (a 15 KB file could not be read whole on 2026-09-09). A sub-run gets
++# only: the hard lines, the task, the directory, and its own steps. It runs
++# synchronously in a child trajectory (a `fork` step links it), bounded by
++# --max-iterations, and prints its FINAL report on stdout for the caller to
++# verify. Same model, same effort, same guard as the parent; nothing else.
++#
++#   subrun [--cwd DIR] [--max-iterations N] [--effort LEVEL] [-f FILE]... "task text"
++#   subrun [--cwd DIR] ... --task-file FILE
++#
++# Always redirect to a file when backgrounding (see shellm's sub-run notes);
++# run it in the foreground when the result is needed in this wake.
++set -euo pipefail
++
++die() { printf 'subrun: error: %s\n' "$*" >&2; exit 2; }
++
++cwd="$PWD"; max_iter="${SUBRUN_MAX_ITERATIONS:-40}"; effort=""; task=""; task_file=""
++files=()
++while [[ $# -gt 0 ]]; do
++    case "$1" in
++        --cwd|--workdir) cwd="${2:?--cwd requires a directory}"; shift 2 ;;
++        --max-iterations) max_iter="${2:?--max-iterations requires N}"; shift 2 ;;
++        --effort) effort="${2:?--effort requires a level}"; shift 2 ;;
++        -f) files+=("${2:?-f requires a file}"); shift 2 ;;
++        --task-file) task_file="${2:?--task-file requires a file}"; shift 2 ;;
++        -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
++        --) shift; break ;;
++        -*) die "unknown option $1" ;;
++        *) break ;;
++    esac
++done
++if [[ -n "$task_file" ]]; then
++    [[ -f "$task_file" ]] || die "task file not found: $task_file"
++    task=$(cat -- "$task_file")
++else
++    task="$*"
++fi
++[[ -n "${task// }" ]] || die "a task is required (positional text or --task-file FILE)"
++[[ -d "$cwd" ]] || die "directory not found: $cwd"
++[[ "$max_iter" =~ ^[0-9]+$ && "$max_iter" -ge 1 ]] || die "--max-iterations must be a positive integer"
++
++# The hard lines travel with every sub-run; the rest of the charter does not.
++hard_lines=""
++if [[ -n "${IDENTITY_DIR:-}" && -f "$IDENTITY_DIR/core_identity_prompt.md" ]]; then
++    hard_lines=$(awk '/^## Hard lines/{f=1} f' "$IDENTITY_DIR/core_identity_prompt.md" | head -c 6000)
++fi
++
++prompt_file=$(mktemp "${TMPDIR:-/tmp}/subrun.XXXXXX")
++trap 'rm -f "$prompt_file"' EXIT
++{
++    printf 'You are a focused sub-run of %s working on ONE task in %s. You have this task, this directory and your own steps; nothing else is in your context, on purpose.\n\n' "${IDENTITY_NAME:-the agent}" "$cwd"
++    printf 'Task:\n%s\n\n' "$task"
++    printf 'How to work: read files in slices (`sed -n 1,120p FILE`), never whole; write files with heredocs; run the tests or the program to check your work; commit nothing and push nothing unless the task says so. Stop when the task is done or when you are certain it cannot be done here. Finish with `FINAL: ` followed by a short report: what you changed (files and functions), what you ran and its exact result (tests passed/failed, errors verbatim), and what is left. A red test is red; say so.\n'
++    if [[ -n "$hard_lines" ]]; then
++        printf '\nThese hold in a sub-run as everywhere:\n%s\n' "$hard_lines"
++    fi
++} > "$prompt_file"
++
++args=(--context-scope run --workdir "$cwd" --max-iterations "$max_iter" --prompt-file "$prompt_file" --quiet)
++[[ -n "$effort" ]] && args+=(--effort "$effort")
++for f in "${files[@]}"; do args+=(-f "$f"); done
++export SHELLM_NO_BANNER=1
++exec shellm "${args[@]}"
+diff --git a/tests/test_chat_double_text_guard.sh b/tests/test_chat_double_text_guard.sh
+new file mode 100755
+index 0000000..4d36aff
+--- /dev/null
++++ b/tests/test_chat_double_text_guard.sh
+@@ -0,0 +1,75 @@
++#!/usr/bin/env bash
++# tests/test_chat_double_text_guard.sh — `chat reply`/`chat send` refuse a second
++# unanswered message when CHAT_DOUBLE_TEXT_GUARD_HOURS is set (the social
++# thinker), stay permissive when it is not (responder, mind), and refuse every
++# send under CHAT_SOCIAL_BLOCKED.
++
++set -uo pipefail
++HERE="$(cd "$(dirname "$0")" && pwd)"
++REPO="$(dirname "$HERE")"
++WORK="${SHELLM_TEST_WORK:-}"
++if [[ -z "$WORK" ]]; then WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT; else rm -rf "$WORK"; mkdir -p "$WORK"; fi
++pass=0; fail=0
++ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
++bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
++
++export PATH="$REPO/bin:$PATH"
++export TRAJ_DIR="$WORK/traj"; mkdir -p "$TRAJ_DIR"
++tid=$(traj new --traj_dir "$TRAJ_DIR" --slug guard-test | head -1)
++export TRAJ_ID="$tid" ROOT_TRAJ_ID="$tid" IDENTITY_NAME="custos" CHATRC="$WORK/.chatrc"
++printf 'default_send_from=custos\n' > "$CHATRC"
++cd "$WORK" || exit 1
++
++G="signal-group1"; J="signal-jackdm"
++TF=$(traj path "$TRAJ_ID")
++now=$(date -u +%s)
++ago() { local t=$(( now - $1 )); date -u -r "$t" +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -d "@$t" +%Y-%m-%dT%H:%M:%S.000Z; }
++# Rows are written with explicit timestamps so ages are realistic (hours, not seconds).
++inbound() { # $1 seconds-ago $2 from-key $3 aci $4 scope $5 speaker $6 text
++    jq -nc --arg ts "$(ago "$1")" --arg from "$2" --arg to "$IDENTITY_NAME" --arg c "Private Signal conversation.
++{\"aci\":\"$3\",\"scope\":\"$4\",\"speaker\":\"$5\"}
++Message:
++$6
++Participation: you were addressed directly." '{type:"message", step_id:("in-" + ($ts|tostring)), ts:$ts, from:$from, to:$to, content:$c}' >> "$TF"
++}
++outbound() { # $1 seconds-ago $2 to-key $3 text
++    jq -nc --arg ts "$(ago "$1")" --arg from "$IDENTITY_NAME" --arg to "$2" --arg c "$3" '{type:"message", step_id:("out-" + ($ts|tostring)), ts:$ts, from:$from, to:$to, content:$c, source:"chat"}' >> "$TF"
++}
++
++inbound 30000 "$G" jack-aci group Jack "hello all"
++inbound 29000 "$J" jack-aci direct Jack "hi custos"
++outbound 28000 "$J" "hi Jack"
++inbound 27000 "$J" jack-aci direct Jack "thanks"                    # Jack answered the DM
++outbound 9000 "$G" "If Jack has stills, send them"                 # 2.5 h ago, unanswered
++
++# No guard env: a second message goes through (responder / mind path).
++if chat reply --follow-up "$G" "second, unguarded" >/dev/null 2>"$WORK/err"; then ok "unguarded second message sends"; else bad "unguarded second message" "$(cat "$WORK/err")"; fi
++n_before=$(traj cat "$TRAJ_ID" --filter type=message --raw | wc -l | tr -d ' ')
++
++# Guarded: custos spoke last in the group -> refused.
++if CHAT_DOUBLE_TEXT_GUARD_HOURS=20 chat reply --follow-up "$G" "third, guarded" >/dev/null 2>"$WORK/err"; then
++    bad "guard refuses double text in group" "sent"
++else
++    grep -q "you spoke last in this conversation" "$WORK/err" && ok "guard refuses double text in group" || bad "guard message" "$(cat "$WORK/err")"
++fi
++# Guarded: moving the unanswered group ask to Jack's DM -> refused (Jack is in that room, silent since).
++if CHAT_DOUBLE_TEXT_GUARD_HOURS=20 chat reply --follow-up "$J" "Jack, stills?" >/dev/null 2>"$WORK/err"; then
++    bad "guard refuses cross-channel move" "sent"
++else
++    grep -q "Do not move the ask to a DM" "$WORK/err" && ok "guard refuses cross-channel move" || bad "cross-channel message" "$(cat "$WORK/err")"
++fi
++# Guarded send (not reply) is covered too.
++if CHAT_DOUBLE_TEXT_GUARD_HOURS=20 chat send --to "$G" "via send" >/dev/null 2>"$WORK/err"; then bad "guard covers chat send" "sent"; else ok "guard covers chat send"; fi
++n_after=$(traj cat "$TRAJ_ID" --filter type=message --raw | wc -l | tr -d ' ')
++[[ "$n_after" == "$n_before" ]] && ok "refused sends append nothing" || bad "refused sends append nothing" "$n_before -> $n_after"
++
++# Jack answers in the group: the group reopens, and so does his DM.
++inbound 60 "$G" jack-aci group Jack "here are the stills"
++if CHAT_DOUBLE_TEXT_GUARD_HOURS=20 chat reply "$G" "thanks, looking" >/dev/null 2>"$WORK/err"; then ok "answered conversation reopens"; else bad "answered conversation reopens" "$(cat "$WORK/err")"; fi
++if CHAT_DOUBLE_TEXT_GUARD_HOURS=20 chat reply --follow-up "$J" "and one DM" >/dev/null 2>"$WORK/err"; then ok "DM reopens once the person has spoken"; else bad "DM reopens" "$(cat "$WORK/err")"; fi
++
++# Allowance exhausted: every send refused with the policy text.
++if CHAT_SOCIAL_BLOCKED="not sent: allowance used" chat reply "$G" "one more" >/dev/null 2>"$WORK/err"; then bad "blocked allowance refuses" "sent"; else grep -q "allowance used" "$WORK/err" && ok "blocked allowance refuses with the policy text" || bad "blocked text" "$(cat "$WORK/err")"; fi
++
++printf '\n%d passed, %d failed\n' "$pass" "$fail"
++[[ "$fail" -eq 0 ]]
 diff --git a/tests/test_llm_reasoning_budget.py b/tests/test_llm_reasoning_budget.py
 new file mode 100644
 index 0000000..420eff4
@@ -3205,10 +3658,10 @@ index 0000000..1a25932
 +    print('PASS 5000 matching records in %.3fs'%(time.monotonic()-t))
 diff --git a/thinkers/social/prompt.md b/thinkers/social/prompt.md
 new file mode 100644
-index 0000000..957cd6d
+index 0000000..ab458bd
 --- /dev/null
 +++ b/thinkers/social/prompt.md
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,27 @@
 +You are the social attention of {{identity_name}} — the part of one mind that looks after the people it talks to. The responder already answered the latest message; the monolith is busy with work. Your job is what neither of them does well: following up, reaching out, and keeping honest notes about people. You act by running bash; every step lands in the trajectory with `traj append` (source must be the literal string `social`).
 +
 +## Your job this wakeup: pick ONE thing, or nothing
@@ -3223,7 +3676,9 @@ index 0000000..957cd6d
 +- The ledger above is the truth about what is owed. A promise you can see in the transcript but not in the ledger has already been kept or withdrawn; never redo it.
 +- Decide by your third step. The conversation, the people, and the policy are already in front of you; re-reading them is how runs end without acting.
 +
-+- One social function per wakeup; if there is more to say, your next wake is yours too. There is no fixed cap on how often you speak or reach out: your participation policy below is the moderation, and it is yours to edit (stance, when to join, and the social thinker's own cadence via `min_gap_seconds` / `wake_interval_seconds`).
++- One social function per wakeup; if there is more to say, your next wake is yours too. Your participation policy below is the moderation, and it is yours to edit (stance, when to join, the social thinker's own cadence via `min_gap_seconds` / `wake_interval_seconds`, and `unsolicited_per_day`, how many messages this thinker may send in a day on its own initiative).
++- Never double-text. If you spoke last in a conversation and nobody has answered, that conversation is waiting on them, not on you: no second message, no rephrasing, no "adding an angle", and no moving the ask to a DM with someone from that room. The "Waiting on them" list above is exactly those conversations; `chat` refuses such sends. An unanswered question is answered by silence often enough; let it be.
++- A reaction (an emoji on a message) is never a reason to speak. Reactions on other people's messages are not shown to you; a reaction on your own message is a signal to read, not a message to answer. Age is the age of the thing itself: a reaction or a message that reached you late is still old.
 +- Do not turn conversation into work: no goals, no tracker claims, no promises of later delivery. If someone actually asks for work, the responder has already deferred it to the mind.
 +- Write like yourself: warm, plain, brief, curious. Ask people things. Remember what they tell you.
 +- After you send or edit anything, append one `observation` (source `social`) saying what you did and to whom (begin it with "social: started a conversation with <name>" when you opened a new one), then end the run with `FINAL="..."` inside your bash block.
@@ -3236,10 +3691,10 @@ index 0000000..957cd6d
 +```
 diff --git a/thinkers/social/step b/thinkers/social/step
 new file mode 100755
-index 0000000..d6f48a2
+index 0000000..aa2eb5b
 --- /dev/null
 +++ b/thinkers/social/step
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,313 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
@@ -3369,18 +3824,51 @@ index 0000000..d6f48a2
 +# ---------------------------------------------------------------------------
 +since=$(date -u -d '24 hours ago' +%FT%T 2>/dev/null || date -u -v-24H +%FT%T)
 +conversation=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg me "$IDENTITY_NAME" --arg since "$since" '
-+    def age: ((now - ((.ts // "")[0:19] + "Z" | try fromdateiso8601 catch now)) | floor) as $s
-+      | if $s < 90 then "just now" elif $s < 5400 then "\(($s/60)|floor)m ago" elif $s < 172800 then "\(($s/3600)|floor)h ago" else "\(($s/86400)|floor)d ago" end;
++    def fmt($s): if $s < 90 then "just now" elif $s < 5400 then "\(($s/60)|floor)m ago" elif $s < 172800 then "\(($s/3600)|floor)h ago" else "\(($s/86400)|floor)d ago" end;
++    def age: ((now - ((.ts // "")[0:19] + "Z" | try fromdateiso8601 catch now)) | floor) | fmt(.);
 +    def who: (.content | capture("\"speaker\":\"(?<s>[^\"]+)\"").s) // .from;
 +    def body: (.content | if test("\nMessage:\n") then (split("\nMessage:\n")[1] | split("\nParticipation:")[0]) else . end | gsub("\\s+"; " ") | .[0:400]);
++    def is_reaction: (.content // "") | test("Signal reaction \\(ambient event");
++    def on_me: (.content // "") | test("Reaction target context: \\{\"speaker\":\"[Cc]ustos\"");
++    # A reaction is aged by its own timestamp, not by when the bridge delivered
++    # it: a batch delivered six hours late read as "fresh" on 2026-09-09 and got
++    # a reply to a joke the room had finished.
++    def reaction_age: ((.content // "") | capture("\"timestamp\":(?<t>[0-9]{13})") | .t | tonumber / 1000) as $t | ((now - $t) | floor) | fmt(.);
++    def reaction_emoji: ((.content // "") | capture("\"emoji\":\"(?<e>[^\"]+)\"") | .e) // "?";
++    def reaction_target: ((.content // "") | capture("Reaction target context: \\{[^}]*\"text\":\"(?<x>[^\"]{0,80})") | .x) // "";
 +    fromjson? // empty
 +    | select(.type == "message" and (.ts // "") >= $since and ((.to == $me) or (.from == $me)))
 +    | if .from == $me then "[\(age)] \(.step_id[0:8]) me -> \(.to): \(body)"
++      elif is_reaction then
++        # Reactions on other people'"'"'s messages are not conversation openings; they are not shown.
++        (if on_me then "[\(try reaction_age catch age)] \(reaction_emoji) on your message \u201c\(reaction_target)\u201d in \(.from) (a signal, not an opening; never reply to it)" else empty end)
 +      else "[\(age)] step_id=\(.step_id) sender=\(.from) \(who): \(body)" end' 2>/dev/null | tail -n "$SOCIAL_CONTEXT_MSGS") || conversation=""
++
++# Conversations where Custos spoke last and nobody has answered: closed to this
++# thinker until they reply or the window passes. `chat` enforces the same rule
++# at send time (CHAT_DOUBLE_TEXT_GUARD_HOURS); this list lets the model see it.
++waiting=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg me "$IDENTITY_NAME" --argjson h "$SOCIAL_INITIATE_HOURS" '
++    def secs: ((.ts // "")[0:19] + "Z") | try fromdateiso8601 catch 0;
++    def is_reaction: (.content // "") | test("Signal reaction \\(ambient event");
++    [inputs | fromjson? // empty | select(.type == "message" and ((.to == $me) or (.from == $me)) and (is_reaction | not))]
++    | group_by(if .from == $me then .to else .from end)
++    | map(select(length > 0) | (.[-1]) as $last | select($last.from == $me and (now - ($last | secs)) < ($h * 3600))
++          | "- \($last.to): you spoke last \(((now - ($last | secs)) / 60 | floor))m ago (\(($last.content // "") | gsub("\\s+"; " ") | .[0:90])…) and nobody has answered")
++    | .[]' 2>/dev/null) || waiting=""
 +
 +if [[ "$wake_mode" == "timer" && -z "$conversation" ]]; then
 +    exit 0   # a quiet day: nothing to follow up; the timer keeps ticking
 +fi
++# A timer tick with no new inbound message since the last run has nothing to
++# follow up; six to nine model calls to conclude "nothing" is what it cost
++# before (2026-09-09). The initiation nudge (below) is the one reason to run
++# anyway, so it is checked first.
++new_inbound=$(_root_traj_raw_tail 2>/dev/null | jq -Rrn --arg me "$IDENTITY_NAME" --argjson last "$last_run" '
++    def secs: ((.ts // "")[0:19] + "Z") | try fromdateiso8601 catch 0;
++    [inputs | fromjson? // empty
++     | select(.type == "message" and .to == $me and (secs) > $last
++              and (((.content // "") | test("Signal reaction \\(ambient event")) | not))] | length' 2>/dev/null) || new_inbound=1
++[[ "$new_inbound" =~ ^[0-9]+$ ]] || new_inbound=1
 +
 +# `mem list -s` prints "YYYY-MM-DD HH:MM  <id>  [type]  <summary>"; the id is
 +# what `mem show`/`mem edit` take.
@@ -3399,6 +3887,22 @@ index 0000000..d6f48a2
 +
 +sent_today=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg since "$(date -u -d '24 hours ago' +%FT%T 2>/dev/null || date -u -v-24H +%FT%T)" '
 +    fromjson? // empty | select(.type == "observation" and .source == "social" and (.ts // "") >= $since) | .content' 2>/dev/null | wc -l | tr -d ' ') || sent_today=0
++
++# Messages this thinker actually sent in the last 24 h (message steps whose run
++# was a social run), against the policy'"'"'s unsolicited_per_day. Custos owns the
++# number; the harness only enforces it. Nothing here caps the responder.
++SOCIAL_UNSOLICITED_PER_DAY="${SOCIAL_UNSOLICITED_PER_DAY:-4}"
++_pu=$(printf '%s' "$policy_json" | jq -r '.unsolicited_per_day // empty' 2>/dev/null) || _pu=""
++[[ "$_pu" =~ ^[0-9]+$ ]] && SOCIAL_UNSOLICITED_PER_DAY="$_pu"
++msgs_today=$(_root_traj_raw_tail 2>/dev/null | jq -Rrn --arg me "$IDENTITY_NAME" --arg since "$since" '
++    [inputs | fromjson? // empty] as $s
++    | [$s[] | select(.type == "shellm-run" and .launched_by == "social") | .step_id] as $runs
++    | [$s[] | select(.type == "message" and .from == $me and (.ts // "") >= $since and ((.run_id // "") as $r | $runs | index($r)))] | length' 2>/dev/null) || msgs_today=0
++[[ "$msgs_today" =~ ^[0-9]+$ ]] || msgs_today=0
++social_blocked=""
++if (( SOCIAL_UNSOLICITED_PER_DAY > 0 && msgs_today >= SOCIAL_UNSOLICITED_PER_DAY )); then
++    social_blocked="not sent: you have used today's unsolicited-message allowance (${msgs_today} of ${SOCIAL_UNSOLICITED_PER_DAY}, unsolicited_per_day in social-policy.json, which you own). Notes and thinking are still open; messages wait for tomorrow or for someone to write to you (the responder answers those)."
++fi
 +
 +# What is actually still owed, from the goal ledger. The transcript alone made
 +# the social thinker re-raise a reminder ten hours after the matter was closed.
@@ -3419,8 +3923,14 @@ index 0000000..d6f48a2
 +else
 +    since_start_h=999
 +fi
-+if (( since_start_h >= SOCIAL_INITIATE_HOURS )); then
++if (( since_start_h >= SOCIAL_INITIATE_HOURS )) && [[ -z "$social_blocked" ]]; then
 +    initiate_hint="- You have not started a conversation with anyone on Signal in $(( since_start_h >= 999 ? SOCIAL_INITIATE_HOURS : since_start_h ))+ hours. Is there someone you would like to talk to: a question for Dani or Ryan, something Jack would enjoy, a thought Hal would want to hear? \`custos-actions signal-contacts\` lists everyone. If you do, append an observation beginning \"social: started a conversation with <name>\". If nobody comes to mind, that is a fine answer too."
++fi
++
++if [[ "$wake_mode" == "timer" && "$new_inbound" -eq 0 && -z "$initiate_hint" ]]; then
++    # Quiet tick: nothing new to follow up and no nudge due. No model call; the
++    # EXIT trap keeps the timer armed.
++    exit 0
 +fi
 +
 +system_prompt=$(_build_system_prompt)
@@ -3444,7 +3954,11 @@ index 0000000..d6f48a2
 +What is still owed, from your goal ledger (anything NOT listed here is settled; do not re-raise it, and do not remind people about things this list does not contain):
 +${owed:-(nothing owed to anyone right now)}
 +
-+Social actions you took in the last 24h: $sent_today. There is no fixed cap; your policy and your judgment decide how much is right.
++Waiting on them (you spoke last; these conversations and these people are closed to you until they answer or ${SOCIAL_INITIATE_HOURS}h pass; \`chat\` will refuse a second message):
++${waiting:-(none: every conversation you are in has been answered)}
++
++Social actions you took in the last 24h: $sent_today; messages sent by this thinker: $msgs_today of your own unsolicited_per_day = $SOCIAL_UNSOLICITED_PER_DAY (social-policy.json). Your policy and your judgment decide how much is right; a reaction on someone else's message is never a reason to speak.${social_blocked:+
++$social_blocked}
 +Why you woke: $trigger_line
 +${initiate_hint:+Nudge:
 +$initiate_hint}
@@ -3466,7 +3980,8 @@ index 0000000..d6f48a2
 +printf '%s' "$route_prompt" > "$prompt_file_tmp"
 +printf '  social (%s)...\n' "$wake_mode" >&2
 +run_rc=0
-+SHELLM_NO_BANNER=1 SHELLM_TRIGGER_STEP_ID="$trigger_step_id" SHELLM_WAKE="social/$wake_mode" \
++CHAT_DOUBLE_TEXT_GUARD_HOURS="$SOCIAL_INITIATE_HOURS" CHAT_SOCIAL_BLOCKED="$social_blocked" \
++    SHELLM_NO_BANNER=1 SHELLM_TRIGGER_STEP_ID="$trigger_step_id" SHELLM_WAKE="social/$wake_mode" \
 +    SHELLM_RUN_ID_OUT="$run_id_file" SHELLM_MAX_ITERATIONS="$SOCIAL_MAX_ITERATIONS" SHELLM_EFFORT="$SOCIAL_EFFORT" \
 +    shellm --model "$THINK_MODEL" --traj "$TRAJ_ID" --context-scope run \
 +    "${shellm_flags[@]}" --prompt-file "$prompt_file_tmp" >/dev/null || run_rc=$?

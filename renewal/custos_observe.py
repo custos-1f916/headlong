@@ -72,6 +72,118 @@ class Native:
         return state["step_id"]
 
 
+def self_metrics(path, now=None, hours=24, me="custos"):
+    """Custos's own numbers for the last `hours`, from the root trajectory: how
+    its wakes went, what its inference bought, what actually reached people.
+    A living benchmark it can read about itself (independent evaluation,
+    2026-09-09) instead of waiting for a human audit."""
+    now = time.time() if now is None else now
+    since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - hours * 3600))
+    runs = {}
+    reasoning = []
+    responder = {"replied": 0, "no-reply": 0, "deferred": 0, "failed": 0}
+    composed = delivered = signal_out = social_msgs = opened = closed = 0
+    with open(path, "rb") as f:
+        for line in f:
+            if b'"ts"' not in line:
+                continue
+            try:
+                s = json.loads(line)
+            except ValueError:
+                continue
+            ts = s.get("ts", "")
+            t = s.get("type")
+            if t == "shellm-run" and ts >= since:
+                runs[s["step_id"]] = {"by": s.get("launched_by", "?"), "n": 0, "llm": 0.0, "first_durable": None, "rc": None, "cap": False}
+                continue
+            rid = s.get("run_id")
+            r = runs.get(rid)
+            if t == "reasoning" and r is not None:
+                r["n"] += 1
+                r["llm"] += float(s.get("llm_s") or 0)
+                reasoning.append(((s.get("thought") or ""), (s.get("cmd") or ""), r["by"]))
+            elif t in ("thought", "observation", "message", "idle") and r is not None and r["first_durable"] is None:
+                r["first_durable"] = r["n"]
+            elif t == "run-end" and r is not None:
+                r["rc"] = s.get("rc")
+            if ts < since:
+                continue
+            if t == "observation" and s.get("source") == "responder" and s.get("decision"):
+                d = s["decision"]
+                if s.get("deferred"):
+                    responder["deferred"] += 1
+                if d in ("replied", "sent"):
+                    responder["replied"] += 1
+                elif d == "no-reply":
+                    responder["no-reply"] += 1
+                elif "fail" in d:
+                    responder["failed"] += 1
+            if t == "observation" and s.get("source") == "square-outbox" and "Public square reply delivered" in (s.get("content") or ""):
+                delivered += 1
+            if t == "message" and s.get("from") == me:
+                to = str(s.get("to", ""))
+                if to.startswith("square:"):
+                    composed += 1
+                elif to.startswith("signal"):
+                    signal_out += 1
+                    if r is not None and r["by"] == "social":
+                        social_msgs += 1
+            if t == "observation" and s.get("source") == "responder" and s.get("deferred"):
+                opened += 1
+            if str(s.get("request_id", "")).startswith("custos-resolve:"):
+                closed += 1
+    mono = [r for r in runs.values() if r["by"] == "monolith"]
+    def pct(a, b):
+        return int(round(100.0 * a / b)) if b else 0
+    def p(values, q):
+        values = sorted(values)
+        return values[min(len(values) - 1, int(q * len(values)))] if values else 0
+    mono_reason = [x for x in reasoning if x[2] == "monolith"]
+    trunc = sum(1 for th, cmd, _ in mono_reason if re.search(r"truncat|archaeolog|re-?read|lost (the )?(output|middle)", th, re.I))
+    selfread = sum(1 for th, cmd, _ in mono_reason if re.search(r"\btraj (show|tail|search|grep)\b", cmd))
+    cap = int(os.environ.get("SHELLM_MAX_ITERATIONS", "150") or 150)
+    metrics = {
+        "window_hours": hours, "at": time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(now)),
+        "monolith_wakes": len(mono), "monolith_rc_nonzero_pct": pct(sum(1 for r in mono if r["rc"] not in (None, 0)), len(mono)),
+        "monolith_iterations_p50": p([r["n"] for r in mono], 0.5), "monolith_iterations_p90": p([r["n"] for r in mono], 0.9),
+        "monolith_first_durable_p50": p([r["first_durable"] for r in mono if r["first_durable"] is not None], 0.5),
+        "monolith_no_durable_step": sum(1 for r in mono if r["first_durable"] is None),
+        "monolith_at_cap": sum(1 for r in mono if r["n"] >= cap),
+        "truncation_thought_pct": pct(trunc, len(mono_reason)), "self_read_cmd_pct": pct(selfread, len(mono_reason)),
+        "inference_hours": round(sum(r["llm"] for r in runs.values()) / 3600, 2),
+        "inference_hours_monolith": round(sum(r["llm"] for r in mono) / 3600, 2),
+        "social_runs": sum(1 for r in runs.values() if r["by"] == "social"),
+        "square_composed": composed, "square_delivered": delivered,
+        "signal_sent": signal_out, "signal_sent_by_social": social_msgs,
+        "responder": responder, "goals_opened": opened, "goals_closed": closed,
+    }
+    return metrics
+
+
+def metrics_text(m, previous=None):
+    def delta(key):
+        if not previous or key not in previous:
+            return ""
+        d = m[key] - previous[key]
+        return " (%s%d)" % ("+" if d >= 0 else "", d)
+    line = ("Daily self-metrics, last %d h: %d monolith wakes%s, %d%% ended rc≠0, iterations p50 %d / p90 %d, "
+            "first durable step at p50 %d, %d wakes with no durable step, %d at the iteration cap; %d%% of thoughts about lost "
+            "or re-read context, %d%% of commands traj self-reads; inference %.1f h (monolith %.1f h); square %d composed / %d delivered%s; "
+            "Signal %d sent (%d by the social thinker in %d social runs); responder %d replied / %d quiet / %d deferred / %d failed; "
+            "goals %d opened / %d closed."
+            % (m["window_hours"], m["monolith_wakes"], delta("monolith_wakes"), m["monolith_rc_nonzero_pct"],
+               m["monolith_iterations_p50"], m["monolith_iterations_p90"], m["monolith_first_durable_p50"],
+               m["monolith_no_durable_step"], m["monolith_at_cap"], m["truncation_thought_pct"], m["self_read_cmd_pct"],
+               m["inference_hours"], m["inference_hours_monolith"], m["square_composed"], m["square_delivered"],
+               delta("square_delivered"), m["signal_sent"], m["signal_sent_by_social"], m["social_runs"],
+               m["responder"]["replied"], m["responder"]["no-reply"], m["responder"]["deferred"], m["responder"]["failed"],
+               m["goals_opened"], m["goals_closed"]))
+    line += (" These are your numbers, not a verdict: a wake with no durable step is inference that bought nothing, "
+             "a composed reply is not a delivered one, and iterations before the first durable step is how long you take to "
+             "start. If one of them is going the wrong way, the goals function is where to act on it.")
+    return line
+
+
 class Observer:
     def __init__(self, config, store, square, native, now=None):
         self.config, self.store, self.square, self.native = config, store, square, native
@@ -326,6 +438,24 @@ class Observer:
                     continue
                 self.emit(identity, "Native goal " + reminder["goal_id"] + " " + reminder.get("kind", "review") + " due. Read custos-memory show; verify current state before acting. " + reminder.get("reason", ""))
 
+    def daily_metrics(self):
+        """Once a day: Custos's own numbers for the last 24 h as an observation,
+        with the previous day's beside them for the trend (custos-observe metrics)."""
+        metrics = self_metrics(self.native.path, self.now)
+        day = time.strftime("%Y-%m-%d", time.gmtime(self.now))
+        previous = self.store.get("metrics:latest")
+        self.store.put("metrics:" + day, metrics)
+        self.store.put("metrics:latest", metrics)
+        self.native.append("metrics:" + day, {"type": "observation", "source": "metrics", "content": metrics_text(metrics, previous)})
+
+    def expire_asks(self):
+        """Deferred asks from other agents that nobody touched for a day are
+        declined with evidence and announced to the mind (custos-memory expire-asks)."""
+        hours = str(int(self.config.get("agent_ask_expiry_hours", 24)))
+        result = subprocess.run(["custos-memory", "expire-asks", "--older-than", hours], capture_output=True, text=True, timeout=120)
+        if result.returncode:
+            raise APIError("ask_expiry_failed")
+
     def outbox(self):
         path = self.native.path
         cursor = self.store.get("outbox:cursor", {"path": str(path), "offset": 0})
@@ -522,6 +652,8 @@ class Observer:
 
     def run(self):
         self.source("square-outbox", 60, self.outbox)
+        self.source("ask-expiry", 3600, self.expire_asks)
+        self.source("self-metrics", 86400, self.daily_metrics)
         self.source("square-inbox", 300, self.inbox)
         if self.config.get("forum", {}).get("enabled"):
             self.source("forum-inbox", 300, lambda: self.forum_poll("inbox"))
@@ -632,7 +764,7 @@ def record_result(store, result):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("once", "status", "import-continuity", "record-result", "withdraw"))
+    parser.add_argument("command", choices=("once", "status", "import-continuity", "record-result", "withdraw", "metrics"))
     parser.add_argument("step_id", nargs="?", help="withdraw: the outgoing square message step id to skip")
     parser.add_argument("--config", type=Path, default=CONFIG)
     parser.add_argument("--file", type=Path)
@@ -644,6 +776,12 @@ def main(argv=None):
                          "square_pending": {"count": len(square_queue(store)), "items": square_queue(store)[:20]},
                          "square_allowance": allowance_summary(store),
                          "inbox_page_pending": store.get("inbox:page") is not None}))
+        return 0
+    if args.command == "metrics":
+        root = os.environ.get("ROOT_TRAJ_ID") or os.environ.get("TRAJ_ID")
+        traj_path = subprocess.run(["traj", "path", root], check=True, capture_output=True, text=True, timeout=20).stdout.strip()
+        metrics = self_metrics(Path(traj_path), time.time())
+        print(canonical(metrics) if args.file else metrics_text(metrics, store.get("metrics:latest")))
         return 0
     if args.command == "withdraw":
         if not args.step_id or not re.fullmatch(r"[0-9a-f-]{8,64}", args.step_id):

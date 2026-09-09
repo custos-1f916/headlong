@@ -431,3 +431,61 @@ class SquareOutboxTests(unittest.TestCase):
         self.assertNotIn("delivery:ccccccc2", self.native.messages)
         from custos_square import square_queue
         self.assertEqual(square_queue(self.store), [])
+
+
+class SelfMetricsTests(unittest.TestCase):
+    def test_metrics_count_wakes_waste_deliveries_and_responder_outcomes(self):
+        from custos_observe import self_metrics, metrics_text
+        now = 1788960000.0
+        def ts(ago):
+            import time as _t
+            return _t.strftime("%Y-%m-%dT%H:%M:%S.000Z", _t.gmtime(now - ago))
+        rows = [
+            {"type": "shellm-run", "step_id": "r1", "launched_by": "monolith", "ts": ts(3600)},
+            {"type": "reasoning", "run_id": "r1", "thought": "The output got truncated, re-reading", "cmd": "traj show x --full", "llm_s": 30, "ts": ts(3590)},
+            {"type": "reasoning", "run_id": "r1", "thought": "now the tests", "cmd": "npm test", "llm_s": 30, "ts": ts(3580)},
+            {"type": "observation", "run_id": "r1", "source": "executive", "content": "tests pass", "ts": ts(3570)},
+            {"type": "run-end", "run_id": "r1", "rc": 0, "ts": ts(3560)},
+            {"type": "shellm-run", "step_id": "r2", "launched_by": "monolith", "ts": ts(1800)},
+            {"type": "reasoning", "run_id": "r2", "thought": "archaeology", "cmd": "traj tail", "llm_s": 60, "ts": ts(1790)},
+            {"type": "run-end", "run_id": "r2", "rc": 1, "ts": ts(1700)},
+            {"type": "shellm-run", "step_id": "s1", "launched_by": "social", "ts": ts(900)},
+            {"type": "message", "run_id": "s1", "from": "custos", "to": "signal-group", "content": "hi", "ts": ts(890)},
+            {"type": "message", "from": "custos", "to": "square:egress:1:2", "content": "reply", "ts": ts(800)},
+            {"type": "message", "from": "custos", "to": "square:egress:1:3", "content": "reply", "ts": ts(700)},
+            {"type": "observation", "source": "square-outbox", "content": "Public square reply delivered: {}", "ts": ts(600)},
+            {"type": "observation", "source": "responder", "decision": "replied", "ts": ts(500)},
+            {"type": "observation", "source": "responder", "decision": "replied", "deferred": True, "ts": ts(400)},
+            {"type": "observation", "source": "responder", "decision": "no-reply", "ts": ts(300)},
+            {"type": "observation", "source": "responder", "decision": "reply-failed", "ts": ts(200)},
+            {"type": "observation", "source": "goals", "request_id": "custos-resolve:abc", "content": "done", "ts": ts(100)},
+            {"type": "message", "from": "custos", "to": "square:old:1:1", "content": "old", "ts": ts(90000)},  # outside the window
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "trajectory.jsonl"
+            path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+            m = self_metrics(path, now)
+        self.assertEqual((m["monolith_wakes"], m["monolith_rc_nonzero_pct"], m["monolith_no_durable_step"]), (2, 50, 1))
+        self.assertEqual(m["monolith_first_durable_p50"], 2)
+        self.assertEqual((m["truncation_thought_pct"], m["self_read_cmd_pct"]), (67, 67))
+        self.assertEqual((m["square_composed"], m["square_delivered"]), (2, 1))
+        self.assertEqual((m["signal_sent"], m["signal_sent_by_social"], m["social_runs"]), (1, 1, 1))
+        self.assertEqual(m["responder"], {"replied": 2, "no-reply": 1, "deferred": 1, "failed": 1})
+        self.assertEqual((m["goals_opened"], m["goals_closed"]), (1, 1))
+        self.assertEqual(m["inference_hours"], round(120 / 3600, 2))
+        text = metrics_text(m, {**m, "square_delivered": 0, "monolith_wakes": 5})
+        self.assertIn("2 monolith wakes (-3)", text)
+        self.assertIn("2 composed / 1 delivered (+1)", text)
+        self.assertIn("a composed reply is not a delivered one", text)
+
+    def test_observer_emits_daily_metrics_once_and_keeps_yesterday(self):
+        temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
+        store = Store(temp.name); self.addCleanup(store.db.close)
+        traj = Path(temp.name) / "traj.jsonl"; traj.write_text("")
+        native = NativeFixture(); native.path = traj
+        observer = Observer({}, store, None, native, now=1788960000.0)
+        observer.source("self-metrics", 86400, observer.daily_metrics)
+        observer.source("self-metrics", 86400, observer.daily_metrics)
+        self.assertEqual([k for k in native.messages if k.startswith("metrics:")], ["metrics:2026-09-09"])
+        self.assertIn("Daily self-metrics", native.messages["metrics:2026-09-09"]["content"])
+        self.assertIsNotNone(store.get("metrics:latest"))

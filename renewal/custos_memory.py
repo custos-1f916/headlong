@@ -507,6 +507,7 @@ class Store:
                                        "reply with chat reply --follow-up if it deserves one, or complete it with a reason.")
                     goals.append({"goal_id": fields["id"], "summary": record["goal"]["outcome"][:240],
                                   "directed": True, "kind": "task" if is_task(record) else "unanswered",
+                                  "who": speaker_of(origin["sender"], origin.get("content", "")),
                                   "request_id": origin["request_id"][:256],
                                   "sender": origin["sender"][:128], "source_url": origin["source_url"][:256],
                                   "authority": origin["authority"], "status": record["status"],
@@ -883,6 +884,11 @@ def lenient_json(raw):
     start, end = raw.find("{"), raw.rfind("}")
     if start != -1 and end > start:
         candidates.append(raw[start:end + 1])
+    # A trailing comma before a closing brace or bracket is the other common slip.
+    for candidate in list(candidates):
+        untrailed = re.sub(r",\s*([}\]])", r"\1", candidate)
+        if untrailed != candidate:
+            candidates.append(untrailed)
     last = None
     for candidate in candidates:
         for strict in (True, False):
@@ -1257,6 +1263,47 @@ def response(store, payload):
         return {"goal_id": goal_id, "decision": final_state, "replayed": bool(saved)}
 
 
+def expire_asks(store, older_than_hours=24, limit=10):
+    """Auto-decline deferred asks from other agents that nobody has touched for
+    older_than_hours. Operator and friends' asks never expire here. Nothing is
+    sent to the asker: the decline is recorded with evidence and announced to the
+    mind as an observation, so a still-worthy ask can be picked back up by hand."""
+    now_dt = dt.datetime.now(dt.timezone.utc)
+    expired = []
+    with store.lock():
+        candidates = []
+        for path, header, body, fields, record in store.files():
+            if not record or record["status"] != "active" or not is_task(record):
+                continue
+            if record["origin"].get("authority") != "agent":
+                continue
+            touched = record["received_at"]
+            for event in record.get("events", []):
+                if isinstance(event, dict) and event.get("at", "") > touched:
+                    touched = event["at"]
+            try:
+                age_h = (now_dt - dt.datetime.fromisoformat(touched)).total_seconds() / 3600
+            except ValueError:
+                continue
+            if age_h >= older_than_hours:
+                candidates.append((touched, fields.get("id"), record["goal"]["outcome"][:120], age_h))
+    for touched, goal_id, summary, age_h in sorted(candidates)[:limit]:
+        evidence = ("Expired by the harness: an ask from another agent went %.0f h without any action. "
+                    "Nothing was sent to the asker." % age_h)
+        try:
+            store.complete({"goal_id": goal_id, "disposition": "declined", "evidence": evidence})
+            expired.append({"goal_id": goal_id, "summary": summary, "age_hours": round(age_h, 1)})
+        except (MemoryError, OSError, KeyError, ValueError):
+            continue
+    if expired and os.environ.get("TRAJ_ID"):
+        append_step({"type": "observation", "source": "goals",
+                     "content": "Expired %d agent ask%s untouched for %d h (declined, asker not told): %s. "
+                                "If one still deserves an answer, reply in its thread and note it; otherwise let it go."
+                                % (len(expired), "" if len(expired) == 1 else "s", older_than_hours,
+                                   "; ".join("%s (%s)" % (e["goal_id"], e["summary"][:80]) for e in expired))})
+    return expired
+
+
 def replay_unanswered(store, older_than=900, limit=3):
     """Hand unanswered direct messages back to the responder.
 
@@ -1304,6 +1351,34 @@ def replay_unanswered(store, older_than=900, limit=3):
     return {"queued": queued}
 
 
+def goal_line(goal):
+    """A compact one-line rendering of a goal for the wake prompt."""
+    def clip(text, n):
+        text = " ".join(str(text or "").split())
+        return text if len(text) <= n else text[:n - 1].rstrip() + "…"
+    if goal.get("directed"):
+        age = goal.get("age_hours")
+        tags = [goal.get("kind", "task")]
+        if goal.get("who"):
+            tags.append("from " + clip(goal["who"], 32))
+        if age is not None:
+            tags.append(("%.0fh" % age) if age >= 1 else "new")
+        if goal.get("stale"):
+            tags.append("STALE")
+        if goal.get("possible_duplicate_of"):
+            tags.append("dup? " + goal["possible_duplicate_of"])
+        if goal.get("response_state") not in (None, "sent"):
+            tags.append(goal["response_state"])
+        line = "- %s [%s] %s" % (goal["goal_id"], ", ".join(tags), clip(goal.get("summary"), 160))
+        if goal.get("kind") == "task" and goal.get("next_action"):
+            line += " | next: " + clip(goal["next_action"], 140)
+        return line
+    tags = [goal.get("type", "goal")]
+    if goal.get("until"):
+        tags.append("until " + str(goal["until"]))
+    return "- %s [own, %s] %s" % (goal["goal_id"], ", ".join(tags), clip(goal.get("summary"), 200))
+
+
 def context_text(result):
     tasks = sum(1 for goal in result["goals"] if goal.get("kind") == "task")
     unanswered = sum(1 for goal in result["goals"] if goal.get("kind") == "unanswered")
@@ -1312,8 +1387,12 @@ def context_text(result):
              f"{tasks} deferred tasks, {unanswered} unanswered messages"
              + (f"; {own} your own" if own else "") + "). "
              f"Showing offset {result['offset']}, {len(result['goals'])} records, people's asks first."]
+    # One line per goal. The full record (request id, trigger step, completion
+    # criteria) is one `custos-memory show ID` away; printing it here for every
+    # goal cost ~1 KB each and, pinned inside the wake prompt, starved the run's
+    # own working memory (independent evaluation, 2026-09-09).
     for goal in result["goals"]:
-        lines.append(encode(goal))
+        lines.append(goal_line(goal))
     if result["next_offset"] is not None:
         lines.append("More goals: custos-memory context --offset " + str(result["next_offset"]) + " (use --json for IDs).")
     stale = [g["goal_id"] for g in result["goals"] if g.get("stale")]
@@ -1335,30 +1414,99 @@ def context_text(result):
     return "\n".join(lines)
 
 
+def write_payload(args):
+    """The payload for update/complete from whatever the caller managed to type.
+
+    Accepts the documented JSON on stdin, JSON wrapped in fences or with a
+    trailing comma, or a positional form: `custos-memory complete ID [declined]
+    evidence words…` and `custos-memory update ID next action words…`, with the
+    text on stdin when the words are absent. Two wakes were once spent fighting
+    the strict form (independent evaluation, 2026-09-09).
+    """
+    raw = ""
+    if not args.words and not sys.stdin.isatty():
+        # Only read stdin when nothing was typed on the command line, and never
+        # hang on an idle pipe (a bash block inside a wake inherits one).
+        import select
+        ready = True
+        if args.goal_id is not None:
+            try:
+                ready = bool(select.select([sys.stdin], [], [], 0.5)[0])
+            except (OSError, ValueError):
+                ready = True
+        if ready:
+            raw = sys.stdin.buffer.read(MAX_INPUT + 1)
+            if len(raw) > MAX_INPUT:
+                raise InvalidInput("input too large")
+            raw = raw.decode("utf-8", "replace")
+    if args.goal_id is None:
+        try:
+            return strict_json(raw)
+        except (ValueError, MemoryError):
+            payload = lenient_json(raw)
+            if not isinstance(payload, dict):
+                raise InvalidInput("expected a JSON object (or: custos-memory %s GOAL_ID text…)" % args.command)
+            return payload
+    words = list(args.words)
+    body = " ".join(words).strip() or raw.strip()
+    if body.startswith("{"):
+        try:
+            payload = lenient_json(body)
+            if isinstance(payload, dict):
+                payload.setdefault("goal_id", args.goal_id)
+                return payload
+        except (ValueError, MemoryError):
+            pass
+    if args.command == "complete":
+        disposition = "completed"
+        if words and words[0].lower().rstrip(":") in {"completed", "declined", "abandoned"}:
+            disposition = words[0].lower().rstrip(":")
+            body = " ".join(words[1:]).strip() or raw.strip()
+        if not body:
+            raise InvalidInput("evidence required: custos-memory complete GOAL_ID [completed|declined|abandoned] evidence…")
+        return {"goal_id": args.goal_id, "disposition": disposition, "evidence": body}
+    if not body:
+        raise InvalidInput("next action required: custos-memory update GOAL_ID next action…")
+    return {"goal_id": args.goal_id, "next_action": body}
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''Write commands consume one JSON object on stdin; no positional goal ID.
+        epilog='''Write commands take a JSON object on stdin, or a plain positional form.
 Examples (replace the sample ID and evidence with actual values):
+  custos-memory complete 0123abcd Verified the artifact and delivered the result to Hal
+  custos-memory complete 0123abcd declined The ask was moot: the thread was resolved by its author
+  custos-memory update 0123abcd Inspect the retained failure report next
   printf '%s\\n' '{"goal_id":"0123abcd","disposition":"completed","evidence":"Verified artifact and delivered result"}' | custos-memory complete
-  printf '%s\\n' '{"goal_id":"0123abcd","next_action":"Inspect the retained failure report"}' | custos-memory update
   custos-memory show 0123abcd
 An acknowledgment alone is not completion. Valid dispositions: completed, declined, abandoned.''')
     parser.add_argument("command", choices=["capture", "capture-envelope", "context", "pending", "show", "update", "complete", "respond",
-                                            "replay-unanswered", "archive-conversations"])
-    parser.add_argument("goal_id", nargs="?", help="Positional ID for show only; writes take JSON on stdin")
+                                            "replay-unanswered", "archive-conversations", "expire-asks"])
+    parser.add_argument("goal_id", nargs="?", help="Goal ID for show, update and complete (writes also take JSON on stdin)")
+    parser.add_argument("words", nargs="*", help="complete: [completed|declined|abandoned] evidence…; update: the next action")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--brief", action="store_true", help="pending: one summary line instead of the records")
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=32)
     parser.add_argument("--older-than", type=int, default=None,
-                        help="replay-unanswered: seconds (default 900); archive-conversations: days (default 2)")
+                        help="replay-unanswered: seconds (default 900); archive-conversations: days (default 2); expire-asks: hours (default 24)")
     args = parser.parse_args()
-    if args.goal_id is not None and args.command != "show":
-        parser.error("Only show takes a positional goal ID. Pipe JSON into write commands; see --help for examples.")
+    if args.goal_id is not None and args.command not in {"show", "update", "complete"}:
+        parser.error("Only show, update and complete take a positional goal ID; see --help for examples.")
     try:
         store = Store()
         if args.command in {"context", "pending"}:
             result = store.context(args.offset, args.limit, directed_only=args.command == "pending")
+            if args.command == "pending" and not args.json and args.brief:
+                # One line for the routing hints; the goals section carries the list.
+                if result["total"]:
+                    stale = sum(1 for g in result["goals"] if g.get("stale"))
+                    unanswered = sum(1 for g in result["goals"] if g.get("kind") == "unanswered")
+                    print("- Owed to people: %d deferred task%s%s%s (listed under Active goals below; custos-memory show ID for detail)."
+                          % (result["total"], "" if result["total"] == 1 else "s",
+                             (", %d stale" % stale) if stale else "", (", %d unanswered" % unanswered) if unanswered else ""))
+                return
             if args.command == "pending" and not args.json and result["total"] == 0:
                 return
             print(encode(result) if args.json else context_text(result))
@@ -1374,7 +1522,13 @@ An acknowledgment alone is not completion. Valid dispositions: completed, declin
         if args.command == "archive-conversations":
             print(encode({"archived": store.archive_conversations(args.older_than if args.older_than is not None else 2)}))
             return
-        payload = read_input(2097152 if args.command == "respond" else MAX_INPUT)
+        if args.command == "expire-asks":
+            print(encode({"expired": expire_asks(store, args.older_than if args.older_than is not None else 24, min(args.limit, 20))}))
+            return
+        if args.command in {"update", "complete"}:
+            payload = write_payload(args)
+        else:
+            payload = read_input(2097152 if args.command == "respond" else MAX_INPUT)
         if args.command == "capture-envelope":
             incoming, trigger = envelope_payload(payload)
             result = store.capture(incoming, trigger)
