@@ -393,7 +393,7 @@ class SquareOutboxTests(unittest.TestCase):
         self.assertEqual(summary["resets_at_utc"], "2026-09-10 00:00Z")
         # After the reset the day rolls over: a full allowance is assumed until the next sample.
         rolled = allowance_summary(self.store, now=self.reset_ms / 1000 + 5)
-        self.assertEqual((rolled["comments_remaining"], rolled["fresh"]), (12, False))
+        self.assertEqual((rolled["comments_remaining"], rolled["fresh"]), (20, False))
 
     def test_repeat_pass_before_reset_does_not_renotify_and_delivers_in_order_after(self):
         api = self.square(remaining=0)
@@ -405,7 +405,7 @@ class SquareOutboxTests(unittest.TestCase):
             observer.now += 600
             observer.source("square-outbox", 60, observer.outbox)  # still backing off: nothing happens
         self.assertEqual([k for k in self.native.messages if k.startswith("allowance-wait:")], ["allowance-wait:bbbbbbb1"])
-        api.remaining = 12
+        api.remaining = 20
         observer.now = self.reset_ms / 1000 + 31
         with patch("custos_square.time.time", return_value=observer.now):
             observer.source("square-outbox", 60, observer.outbox)
@@ -414,7 +414,7 @@ class SquareOutboxTests(unittest.TestCase):
         self.assertEqual(self.store.get("outbox:square_pending")["count"], 0)
 
     def test_withdrawn_reply_is_skipped_and_the_rest_still_deliver(self):
-        api = self.square(remaining=12)
+        api = self.square(remaining=20)
         self.compose("ccccccc1")
         self.compose("ccccccc2")
         self.compose("ccccccc3")

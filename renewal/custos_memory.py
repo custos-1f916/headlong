@@ -701,8 +701,8 @@ def square_budget_text(budget, for_reply=True):
     left, queued = budget["comments_remaining"], budget["queued"]
     if for_reply is False and left >= 4 and queued == 0:
         return ""
-    line = ("Square allowance (data): %d comment%s left today of 12, %d of your replies still queued behind the "
-            "allowance%s; it resets at %s." % (left, "" if left == 1 else "s", queued,
+    line = ("Square allowance (data): %d comment%s left today of %d, %d of your replies still queued behind the "
+            "allowance%s; it resets at %s." % (left, "" if left == 1 else "s", budget.get("daily_comments", 20), queued,
                                                 (" (oldest from " + str(budget["queued_oldest"])[:16] + "Z)") if budget.get("queued_oldest") else "",
                                                 budget["resets_at_utc"]))
     if not budget.get("fresh"):

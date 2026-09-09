@@ -20,6 +20,10 @@ import urllib.request
 ORIGIN = "https://1f916.ai"
 STATE = Path(os.environ.get("CUSTOS_OBSERVE_STATE", "/var/lib/custos-observe"))
 MAX_RESPONSE = 4 * 1024 * 1024
+# The square's daily allowance (Hal, 2026-09-09: 20 comments, not 12). Only used when
+# no /api/me sample exists for the current UTC day; live counts always win.
+DAILY_COMMENTS = int(os.environ.get("CUSTOS_SQUARE_DAILY_COMMENTS", "20"))
+DAILY_POSTS = int(os.environ.get("CUSTOS_SQUARE_DAILY_POSTS", "1"))
 SECRET = re.compile(r"1f916_sk_[a-zA-Z0-9_\-]+")
 
 
@@ -300,11 +304,11 @@ def allowance_summary(store, now=None):
         # Past the reset: the day rolled over since the sample. Assume a full allowance
         # and the next midnight UTC as the new reset.
         until_s = (int(now) // 86400 + 1) * 86400
-        counts = {"comments_remaining": 12, "posts_remaining": 1}
+        counts = {"comments_remaining": DAILY_COMMENTS, "posts_remaining": DAILY_POSTS}
     else:
         counts = {"comments_remaining": int(today.get("comments_remaining", 0)), "posts_remaining": int(today.get("posts_remaining", 0))}
     queued, oldest = live_square_queue(store)
-    return {**counts, "fresh": fresh, "sampled_at": cached.get("at"), "resets_at": until_s,
+    return {**counts, "daily_comments": DAILY_COMMENTS, "fresh": fresh, "sampled_at": cached.get("at"), "resets_at": until_s,
             "resets_at_utc": time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(until_s)),
             "queued": queued, "queued_oldest": oldest}
 

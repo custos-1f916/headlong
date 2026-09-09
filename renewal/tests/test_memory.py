@@ -721,7 +721,7 @@ class ResponderTests(MemoryFixture):
             cm.response(self.store, request)
             budget = cm.square_budget()
             hint = cm.context_text(self.store.context())
-        self.assertIn("Square allowance (data): 0 comments left today of 12, 2 of your replies still queued", seen["system"])
+        self.assertIn("Square allowance (data): 0 comments left today of 20, 2 of your replies still queued", seen["system"])
         self.assertIn("a queued reply is not a delivered one", seen["system"])
         self.assertEqual((budget["comments_remaining"], budget["queued"]), (0, 2))
         self.assertIn("2 of your replies still queued", hint)
