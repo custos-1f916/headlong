@@ -945,8 +945,10 @@ def response(store, payload):
 def context_text(result):
     tasks = sum(1 for goal in result["goals"] if goal.get("kind") == "task")
     unanswered = sum(1 for goal in result["goals"] if goal.get("kind") == "unanswered")
+    own = result['total'] - result['active_directed']
     lines = [f"Active goals: {result['total']} ({result['active_directed']} from other people: "
-             f"{tasks} deferred tasks, {unanswered} unanswered messages; the rest are your own). "
+             f"{tasks} deferred tasks, {unanswered} unanswered messages"
+             + (f"; {own} your own" if own else "") + "). "
              f"Showing offset {result['offset']}, {len(result['goals'])} records, people's asks first."]
     for goal in result["goals"]:
         lines.append(encode(goal))

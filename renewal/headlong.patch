@@ -2001,7 +2001,7 @@ index 5bcd50d..c1c2a17 100644
  - Be concrete. "ask Andy whether he's tried the new viewer" beats "engage with Andy".
  - The Runtime and Workspace lines above are authoritative. Do not open a wake by re-orienting (`pwd`, `ls`, `find`) or by re-verifying your own runtime (grepping or checksumming `bin/` and `thinkers/`): a fact you verified about the runtime holds until the Runtime line changes, and the workspace map tells you where things are. Spend the steps on the work itself.
 diff --git a/thinkers/monolith/step b/thinkers/monolith/step
-index bfe362b..9fa20cd 100755
+index bfe362b..76a70a6 100755
 --- a/thinkers/monolith/step
 +++ b/thinkers/monolith/step
 @@ -4,7 +4,7 @@ set -euo pipefail
@@ -2013,7 +2013,7 @@ index bfe362b..9fa20cd 100755
  # model picks one function and carries it out in the same run.
  #
  # Chat replies are NOT the monolith's job — a dedicated `responder` thinker owns
-@@ -201,41 +201,34 @@ if [[ $(printf '%s\n' "$last_three" | jq -r '.type' 2>/dev/null | sort -u | tr '
+@@ -201,41 +201,36 @@ if [[ $(printf '%s\n' "$last_three" | jq -r '.type' 2>/dev/null | sort -u | tr '
      hints="${hints}- The last few steps are all thoughts — the stream may be circling; consider acting, recalling, or advancing decisively.
  "
  fi
@@ -2070,7 +2070,9 @@ index bfe362b..9fa20cd 100755
 +    | if .type == "message" and .to == $me and .from != $me then
 +        (.content | [scan("https?://[^\\s)\"`>]+")] | .[] | select(test("^https?://(192\\.168\\.|127\\.|localhost)") | not)) as $u
 +        | "\($u) — shared by \(who) \(age)"
-+      elif .type == "observation" and .source == "custos-observe" and ((.source_url // "") | test("^https?://")) then
++      elif .type == "observation" and .source == "custos-observe"
++           and ((.source_url // "") | test("^https?://"))
++           and ((.source_url // "") | test("^https?://(192\\.168\\.|10\\.|127\\.|localhost)") | not) then
 +        "\(.source_url) — \(.content | sub("^[^:]*:\\s*"; "") | gsub("\\s+"; " ") | .[0:110])"
 +      else empty end' 2>/dev/null | awk '{a[NR]=$0} END{for(i=NR;i>0;i--) print a[i]}' | awk -F' — ' '!seen[$1]++' | head -n 4) || _seed_lines=""
 +if [[ -n "$_seed_lines" ]]; then
@@ -2081,7 +2083,7 @@ index bfe362b..9fa20cd 100755
  # Share nudge: outward initiative needs a periodic prompt-side invitation, or
  # restraint rules learned from feedback ratchet the mind into pure listening
  # (observed on Audel 2026-08-21: a self-imposed "last-word-ours -> do not
-@@ -257,7 +250,7 @@ fi
+@@ -257,7 +252,7 @@ fi
  _now_s=$(date -u +%s)
  if [[ "$GOAL_REVIEW_DAYS" -gt 0 ]] && (( _now_s - goal_review_at >= GOAL_REVIEW_DAYS * 86400 )); then
      goal_review_at="$_now_s"
@@ -2090,7 +2092,7 @@ index bfe362b..9fa20cd 100755
  "
  fi
  # The query for related memories is the wake's own material: the real hints
-@@ -453,6 +446,16 @@ if [[ "$did_work" -eq 0 ]]; then
+@@ -453,6 +448,16 @@ if [[ "$did_work" -eq 0 ]]; then
              | traj append >/dev/null || true
      fi
  fi
