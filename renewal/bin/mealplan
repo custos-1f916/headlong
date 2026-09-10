@@ -11,15 +11,18 @@
   mealplan plan engaged                  record that Hal or Dani replied about the plan
   mealplan plan skip [--note text]       they declined this week: no reminder, no cart (plan resume undoes it)
   mealplan plan finalize [--week W]      writes dinners into the catalog's meal planner
-  mealplan list build [--week W]         ingredients -> grocery lines (pantry staples set aside)
+  mealplan list build [--week W]         ingredients -> grocery lines (pantry set aside) + standing staples + this week's extras
   mealplan list preview [--week W]       print the current list
+  mealplan list add "item" [--note why]  one-off for this week ("grab butter") — survives rebuilds
+  mealplan list remove "item"            drop a one-off
   mealplan books                         every scanned cookbook: recipes imported, page flags, reviewed or not
   mealplan book flags "Title"            the digitizer's flagged pages with their transcripts (judge them, no vision needed)
   mealplan book reviewed "Title" --note "one paragraph about the book: character, weeknight picks, what to ask Hal/Dani"
   mealplan study [--n 10]                recipes nobody has studied yet (for a curiosity turn)
   mealplan studied SLUG --note "…"       record what you learned about a recipe (fit, constraints, who might like it)
   mealplan prefs                         constraints, rules, questions, likes/dislikes/brands (the family's knobs)
-  mealplan learn KIND "text" [--remove]  KIND: likes | dislikes | brands | pantry | rules | questions
+  mealplan learn KIND "text" [--remove]  KIND: likes | dislikes | brands | pantry | staples | rules | questions
+                                         (pantry = assumed on hand, skipped from lists; staples = bought EVERY week, e.g. milk)
   mealplan constraint KEY VALUE          dinners_per_week weeknight_max_minutes servings leftover_dinners no_repeat_weeks sale_picks_per_week budget_cap_usd pickup_day
   mealplan cooked SLUG [--date D] [--note text]
   mealplan search "text"                 Whole Foods products for a phrase (brand, size, bought-before flag)
@@ -78,7 +81,8 @@ def show_prefs(p):
     for k in ("rules", "questions", "likes", "dislikes", "brands"):
         if p.get(k):
             print(f"{k}:"); [print("  - " + x) for x in p[k]]
-    print(f"pantry: {len(p.get('pantry', []))} staples assumed on hand (`mealplan learn pantry \"item\"` / --remove)")
+    print("staples (bought every week): " + (", ".join(p.get("staples", [])) or "(none)") + "  (`mealplan learn staples \"item\"` / --remove)")
+    print(f"pantry: {len(p.get('pantry', []))} items assumed on hand, skipped from lists (`mealplan learn pantry \"item\"` / --remove)")
 
 
 def show_plan(p):
@@ -147,10 +151,15 @@ def main():
         else:
             sys.exit("plan show|set|proposed|engaged|skip|resume|finalize")
     elif a.cmd == "list":
-        p = call("POST", f"/plans/{wk}/list", {}) if a.sub == "build" else call("GET", f"/plans/{wk}")
+        if a.sub in ("add", "remove"):
+            p = call("POST", f"/plans/{wk}/extras", {"item": a.arg, "note": a.note, "remove": a.sub == "remove"})
+        else:
+            p = call("POST", f"/plans/{wk}/list", {}) if a.sub == "build" else call("GET", f"/plans/{wk}")
         show_plan(p)
         for x in p.get("list", []):
-            print(f"  [{x.get('status', '?'):9s}] {x['item']}  ({x['need']})  for {', '.join(x['for'])}")
+            print(f"  [{x.get('status', '?'):9s}] {x['item']}  ({x['need']})  for {', '.join(x['for'])}" + (f"  <{x['source']}>" if x.get('source') in ('staple', 'extra') else ""))
+        if p.get("extras"):
+            print("  this week's extras:", "; ".join(x["item"] + (f" ({x['note']})" if x.get("note") else "") for x in p["extras"]))
         if p.get("pantry_assumed"):
             print("  pantry assumed:", "; ".join(p["pantry_assumed"]))
     elif a.cmd == "books":

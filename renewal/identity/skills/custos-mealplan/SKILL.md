@@ -24,8 +24,8 @@ has replied, and how many dinners are drafted). Three scheduled wakes, all 17:00
   recency, each with its recipe **link**, and the sales as a hint. Pick candidates that satisfy the
   constraints and what you know about Hal and Dani (person notes), then send ONE message to the
   `Collette Haus` group (Hal, Dani and you; label from `signal-contacts`), else one each to Hal and
-  Dani: the candidates, one per line as **`Title — <link>`**, then the questions from `mealplan
-  prefs`, nothing else. Then `mealplan plan proposed`.
+  Dani: the candidates, one per line as **`Title — <link>`**, the staples line, then the questions from
+  `mealplan prefs`, nothing else. Then `mealplan plan proposed`.
 - **Replies.** Back and forth about meals and staples is normal and welcome — answer in the
   group, adjust the draft (`mealplan plan set --dinner DATE=SLUG …`, one dinner per day of the
   week they cook, dates from the pickup Saturday onward), record tastes in person notes, standing
@@ -48,6 +48,16 @@ has replied, and how many dinners are drafted). Three scheduled wakes, all 17:00
   the list, the subtotal, what could not be matched, and how the order gets placed (see Money:
   Hal places it from the Amazon app and picks the Saturday window). Keep the goal open until the
   order is placed.
+- **Staples and extras** (Hal, 2026-09-10: "We always need milk, etc. Sometimes need butter"). Two
+  lists, opposite meanings: **pantry** = assumed on hand, skipped when a recipe calls for it;
+  **staples** = bought every week no matter what is cooked (`mealplan prefs` shows both). "Add oat
+  milk to the staples" / "we don't need eggs every week" → `mealplan learn staples "oat milk"` /
+  `--remove`. A one-off — "grab butter this week", "we're out of coffee" — → `mealplan list add
+  "butter" --note "Dani asked Thu"`; it stays on that week's list through rebuilds and goes into the
+  cart with everything else. Staples and extras land on the list as `<staple>` / `<extra>` lines
+  when you `mealplan list build`. Show a short **"Staples: milk, eggs; extras: butter"** line in the
+  Wednesday message (so they can correct it in one reply) and in Friday's cart message. Never drop
+  a staple because a recipe happens to use it — the list merges them.
 - **The knobs are theirs.** Dani and Hal want to iterate on what you ask and how you optimize
   (2026-09-09). When either of them says "ask us X on Wednesdays" or "never plan more than N
   new recipes a week" — in the group or in a DM, Dani's word counts exactly like Hal's here —
