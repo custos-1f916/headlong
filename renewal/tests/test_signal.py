@@ -443,6 +443,77 @@ class SignalSpoolTests(unittest.TestCase):
         self.assertEqual((send['quoteTimestamp'], send['quoteAuthor'], send['quoteMessage']), (123456, HAL, 'Custos, look'))
         self.assertEqual(cs.quote_text('[Image attached]'), '[Image attached]')
 
+    def test_bot_thread_wraps_up_then_reacts_then_digests(self):
+        """Hal, 2026-09-10: after five replies to Kim the bridge tells Custos to wrap up, the next
+        text becomes one emoji, and anything after that is held for an ambient digest."""
+        KIM = '00000000-0000-4000-8000-00000000000b'
+        policy = copy.deepcopy(POLICY); policy['people'][KIM] = {'label': 'Kim', 'authority': 'external', 'bot': True}
+        self.policy_path.write_text(json.dumps(policy))
+        calls = []; bridge = self.bridge_with_rpc(calls)
+        sent = []
+        def fake_transport(args, content=''):
+            if args[0] == 'send':
+                sent.append((args, content)); return {'queued': True}
+            return {'events': [], 'trajectory': 'k', 'offset': 0}
+        def kim(n, stamp):
+            item = cs.classify(envelope(sender=KIM, message='ferment report %d' % n, timestamp=stamp), policy)
+            self.spool.receive(item)
+            with self.spool.db:
+                self.spool.db.execute('UPDATE inbox SET arrived=? WHERE id=?', (stamp / 1000, item['request_id']))
+            return item
+        def answered(item, text='sure', reaction=None):
+            with self.spool.db:
+                self.spool.db.execute("UPDATE inbox SET phase='queued' WHERE id=?", (item['request_id'],))
+                self.spool.db.execute("INSERT INTO outbox(id,request_id,content,created,reaction,phase) VALUES(?,?,?,?,?,'submitted')",
+                                      ('r' + item['request_id'][-8:], item['request_id'], text, 1.0, reaction))
+        base = 1_000_000_000_000
+        for n in range(4):  # four replies already sent
+            answered(kim(n, base + n * 240_000))
+        with mock.patch.object(cs, 'time') as clock, mock.patch.object(cs, 'paused', return_value=False), \
+                mock.patch.object(cs, 'transport', side_effect=fake_transport):
+            clock.time.return_value = base / 1000 + 4 * 240 + 100; clock.monotonic.return_value = 10_000; clock.gmtime = __import__('time').gmtime; clock.strftime = __import__('time').strftime
+            fifth = kim(4, base + 4 * 240_000)
+            bridge.deliver_pending(self.spool.db)
+            self.assertIn('Wrap it up politely now', sent[-1][1]); self.assertNotIn('--ambient', sent[-1][0])
+            answered(fifth, 'Lovely chatting, let us pick this up another time.')  # the wrap-up line
+            clock.time.return_value += 240
+            sixth = kim(5, base + 5 * 240_000)
+            bridge.deliver_pending(self.spool.db)
+            self.assertIn('React with one emoji at most', sent[-1][1]); self.assertIn('--ambient', sent[-1][0])
+            # Custos writes text anyway: the host sends his first emoji as a reaction, never the words.
+            with self.spool.db:
+                self.spool.db.execute("UPDATE inbox SET phase='queued' WHERE id=?", (sixth['request_id'],))
+            self.spool.batch(sixth['route'], {'trajectory': 'k', 'offset': 1, 'events': [
+                {'step_id': 'reply-6', 'request_id': sixth['request_id'], 'content': 'Ha, cheers 🥒 keep me posted'}]})
+            calls.clear(); bridge.tick()
+            self.assertEqual([m for m, p in calls if m in ('send', 'sendReaction')], ['sendReaction'])
+            self.assertEqual([p for m, p in calls if m == 'sendReaction'][0]['emoji'], '🥒')
+            receipt = json.loads(self.spool.db.execute("SELECT receipt FROM outbox WHERE id='reply-6'").fetchone()[0])
+            self.assertEqual(receipt['converted_to_reaction'], '🥒')
+            # Kim keeps going: nothing is delivered until she pauses half an hour, then one ambient digest.
+            clock.time.return_value += 240; kim(6, base + 6 * 240_000)
+            clock.time.return_value += 240; seventh = kim(7, base + 7 * 240_000)
+            before = len(sent); bridge.deliver_pending(self.spool.db)
+            self.assertEqual(len(sent), before)
+            clock.time.return_value += cs.DIGEST_QUIET
+            bridge.deliver_pending(self.spool.db)
+            self.assertEqual(len(sent), before + 1)
+            self.assertIn('sent 2 more messages after the exchange was wrapped up', sent[-1][1]); self.assertIn('--ambient', sent[-1][0])
+            # A text reply to the digest stays home; a reaction would still go.
+            carrier = [r for r in self.spool.db.execute("SELECT id,mode FROM inbox WHERE mode='digest'")]
+            self.assertEqual(len(carrier), 1)
+            self.spool.batch(seventh['route'], {'trajectory': 'k', 'offset': 2, 'events': [
+                {'step_id': 'reply-8', 'request_id': carrier[0][0], 'content': 'Noted!'}]})
+            calls.clear(); bridge.tick()
+            self.assertEqual([m for m, p in calls if m in ('send', 'sendReaction')], [])
+            self.assertEqual(self.spool.db.execute("SELECT phase FROM outbox WHERE id='reply-8'").fetchone()[0], 'suppressed')
+        # A person is never a bot thread, and the flag is validated.
+        self.assertEqual(cs.bot_turns(self.spool.db, cs.classify(envelope(), policy), policy), 0)
+        bad = copy.deepcopy(policy); bad['people'][HAL]['bot'] = True
+        path = self.root / 'bad.json'; path.write_text(json.dumps(bad))
+        with self.assertRaises(ValueError):
+            cs.load_policy(path)
+
     def test_intake_sends_read_receipt_and_keeps_typing_until_the_reply_is_sent(self):
         calls = []; bridge = self.bridge_with_rpc(calls)
         self.spool.receive(self.item)  # pending directed DM

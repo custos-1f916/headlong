@@ -35,6 +35,12 @@ BATCH_QUIET, BATCH_MAX_WAIT = 120, 300  # group
 DM_BATCH_QUIET, DM_BATCH_MAX_WAIT = 60, 180  # direct messages
 BATCH_MAX = 12  # messages per intake; the rest follow in the next batch
 BATCH_KNOBS = ('quiet_seconds', 'max_wait_seconds', 'dm_quiet_seconds', 'dm_max_wait_seconds')
+# Bot-to-bot threads (Hal, 2026-09-10): after BOT_TURNS_WRAP text replies to a bot with no human in
+# the thread, Custos is told to wrap up; at BOT_TURNS_EMOJI his text becomes a single reaction; from
+# BOT_TURNS_DIGEST the bot's messages are held and delivered later as one ambient digest.
+BOT_TURNS_WRAP, BOT_TURNS_EMOJI, BOT_TURNS_DIGEST = 4, 5, 6
+BOT_GAP = 7200  # seconds of quiet (or any human message) that ends a bot thread's streak
+DIGEST_QUIET, DIGEST_MAX_WAIT = 1800, 7200  # the held digest goes when the bot pauses, or at most this late
 
 
 def encoded(value):
@@ -64,6 +70,8 @@ def load_policy(path):
         if (not isinstance(aliases, list) or len(aliases) > 8 or
                 any(not isinstance(a, str) or not 1 < len(a) <= 48 for a in aliases)):
             raise ValueError('invalid person aliases')
+        if 'bot' in person and (type(person['bot']) is not bool or (person['bot'] and person['authority'] != 'external')):
+            raise ValueError('invalid person bot flag')
     if sum(p['authority'] == 'operator' for p in people.values()) > 2:
         raise ValueError('only verified Hal and Dani may be operators')
     groups = value.get('groups', [])
@@ -81,6 +89,41 @@ def load_policy(path):
             any(type(v) is not int or not 0 <= v <= 900 for v in batch.values())):
         raise ValueError('invalid batch window')
     return value
+
+
+def is_bot(policy, who):
+    return bool(policy['people'].get(who, {}).get('bot'))
+
+
+def bot_turns(db, item, policy):
+    """How many text replies Custos has sent in this thread to a bot, counting back from now
+    until a person speaks or the thread has been quiet for BOT_GAP. Reactions do not count;
+    a batch counts once (its carrier holds the reply)."""
+    if not is_bot(policy, item['sender_aci']):
+        return 0
+    rows = db.execute("SELECT id,payload FROM inbox WHERE json_extract(payload,'$.conversation')=? "
+                      "ORDER BY json_extract(payload,'$.timestamp') DESC", (item['conversation'],)).fetchall()
+    turns, newer = 0, None
+    for row in rows:
+        it = json.loads(row['payload'])
+        if it.get('reaction'):
+            continue
+        if newer is not None and newer - it['timestamp'] > BOT_GAP * 1000:
+            break
+        newer = it['timestamp']
+        if not is_bot(policy, it['sender_aci']):
+            break
+        if db.execute("SELECT 1 FROM outbox WHERE request_id=? AND reaction IS NULL AND "
+                      "phase IN ('pending','sending','submitted','uncertain')", (row['id'],)).fetchone():
+            turns += 1
+    return turns
+
+
+def first_emoji(text):
+    for ch in text or '':
+        if valid_emoji(ch):
+            return ch
+    return '👍'
 
 
 def group_label(policy, group):
@@ -315,6 +358,8 @@ class Spool:
             self.db.execute('ALTER TABLE inbox ADD COLUMN prepared TEXT')
         if 'arrived' not in {row[1] for row in self.db.execute('PRAGMA table_info(inbox)')}:
             self.db.execute('ALTER TABLE inbox ADD COLUMN arrived REAL')  # host clock at receipt; batching waits from here
+        if 'mode' not in {row[1] for row in self.db.execute('PRAGMA table_info(inbox)')}:
+            self.db.execute('ALTER TABLE inbox ADD COLUMN mode TEXT')  # bot-thread stage the carrier was delivered under
         # A crash after send started cannot safely be retried without reconciliation.
         with self.db:
             self.db.execute("UPDATE outbox SET phase='uncertain' WHERE phase='sending'")
@@ -639,10 +684,19 @@ class Bridge:
                 if item.get('reaction'):
                     self.deliver([(row, item)])
             texts = [(row, item) for row, item in batch if not item.get('reaction')]
-            if texts and self.batch_ready(texts, now):
-                self.deliver(texts[:BATCH_MAX])
+            if not texts:
+                continue
+            turns = bot_turns(db, texts[-1][1], self.policy)
+            if turns >= BOT_TURNS_DIGEST:
+                arrived = [row['arrived'] or 0.0 for row, item in texts]
+                if now - max(arrived) >= DIGEST_QUIET or now - min(arrived) >= DIGEST_MAX_WAIT:
+                    self.deliver(texts[:BATCH_MAX], mode='digest')
+                continue
+            if self.batch_ready(texts, now):
+                self.deliver(texts[:BATCH_MAX], mode='emoji_only' if turns >= BOT_TURNS_EMOJI else
+                             'wrap' if turns >= BOT_TURNS_WRAP else None)
 
-    def render(self, batch, carrier):
+    def render(self, batch, carrier, mode=None):
         """One intake for the batch: the carrier's verified identity in the wrapper, every
         message in order in the body, and one participation line for the lot."""
         content = ('Private Signal conversation. Reply only to this conversation; do not publish '
@@ -677,16 +731,29 @@ class Bridge:
                         'Nobody is asking you for work here.')
         else:
             content += '\nParticipation: you were addressed directly; answer the speaker.'
+        if mode == 'wrap':
+            content += ('\nBot thread: this is an exchange with ' + carrier['label'] + ' (a bot) with no person in it, and you '
+                        'have already replied ' + str(BOT_TURNS_WRAP) + ' times. Wrap it up politely now: one short closing '
+                        'line, then stop. Any further text you write in this thread will be sent as a single emoji reaction instead.')
+        elif mode == 'emoji_only':
+            content += ('\nBot thread: the exchange with ' + carrier['label'] + ' (a bot) is wrapped up. React with one emoji at '
+                        'most. Text replies to this message are not sent as text: the host turns them into a reaction.')
+            ambient = True
+        elif mode == 'digest':
+            content += ('\nBot thread digest (ambient): ' + carrier['label'] + ' (a bot) sent ' + str(len(batch)) + ' more message'
+                        + ('s' if len(batch) > 1 else '') + ' after the exchange was wrapped up. No reply expected; text replies '
+                        'are not sent. A reaction is fine.')
+            ambient = True
         return content, ambient
 
-    def deliver(self, batch):
+    def deliver(self, batch, mode=None):
         """Send one batch (or one reaction) into Custos and settle the spool rows."""
         db = self.spool.db
         carrier_row, carrier = next(((row, item) for row, item in reversed(batch) if item.get('directed')), batch[-1])
         if not self.group_ok(carrier):
             return
         members = [row['id'] for row, item in batch if row['id'] != carrier_row['id']]
-        content, ambient = self.render(batch, carrier)
+        content, ambient = self.render(batch, carrier, mode)
         if carrier_row['prepared']:
             prepared = json.loads(carrier_row['prepared'])
         else:
@@ -707,7 +774,7 @@ class Bridge:
             with db:
                 if db.execute('SELECT phase FROM inbox WHERE id=?', (carrier_row['id'],)).fetchone()[0] != 'pending':
                     return  # RPC reception can admit a remote delete while retrieving images.
-                db.execute('UPDATE inbox SET prepared=? WHERE id=?', (encoded(prepared), carrier_row['id']))
+                db.execute('UPDATE inbox SET prepared=?,mode=? WHERE id=?', (encoded(prepared), mode, carrier_row['id']))
                 for member in members:
                     db.execute("UPDATE inbox SET phase='batched',receipt=? WHERE id=? AND phase='pending'",
                                (encoded({'carrier': carrier_row['id']}), member))
@@ -742,10 +809,19 @@ class Bridge:
                                 '--trajectory', cursor['trajectory'] if cursor else ''])
             self.spool.batch(route, result)
         for row in db.execute("SELECT * FROM outbox WHERE phase='pending' ORDER BY created LIMIT 8").fetchall():
-            incoming = db.execute('SELECT payload,phase FROM inbox WHERE id=?', (row['request_id'],)).fetchone()
+            incoming = db.execute('SELECT payload,phase,mode FROM inbox WHERE id=?', (row['request_id'],)).fetchone()
             item = json.loads(incoming['payload'])
             if incoming['phase'] != 'queued' or not allowed(item, self.policy) or not self.group_ok(item):
                 continue
+            reaction = row['reaction']
+            if reaction is None and incoming['mode'] == 'digest':
+                with db:  # the bot kept talking after the wrap-up: Custos's text stays home
+                    db.execute("UPDATE outbox SET phase='suppressed',receipt=? WHERE id=?",
+                               (encoded({'suppressed': 'bot thread digest: no text reply'}), row['id']))
+                continue
+            converted = False
+            if reaction is None and incoming['mode'] == 'emoji_only' and not item.get('reaction'):
+                reaction, converted = first_emoji(row['content']), True
             # group_ok can receive a deletion while waiting for listGroups.
             if db.execute('SELECT phase FROM inbox WHERE id=?', (row['request_id'],)).fetchone()[0] != 'queued':
                 continue
@@ -755,13 +831,13 @@ class Bridge:
                 return
             params = {'message': row['content']}
             method = 'send'
-            if row['reaction'] is not None:
-                if not valid_emoji(row['reaction']) or item.get('reaction'):
+            if reaction is not None:
+                if not valid_emoji(reaction) or item.get('reaction'):
                     continue
                 method = 'sendReaction'
                 # The host selects the original message, never a model-supplied
                 # target or arbitrary recipient from native trajectory data.
-                params = {'emoji': row['reaction'], 'targetAuthor': item['sender_aci'],
+                params = {'emoji': reaction, 'targetAuthor': item['sender_aci'],
                           'targetTimestamp': item['timestamp']}
             elif threaded(item, db):
                 # Thread the reply onto the message it answers; the host picks the
@@ -781,6 +857,8 @@ class Bridge:
                 with db:
                     db.execute("UPDATE outbox SET phase='uncertain' WHERE id=?", (row['id'],))
                 raise
+            if converted:
+                receipt = dict(receipt, converted_to_reaction=reaction, unsent_text=row['content'][:400])
             with db:
                 db.execute("UPDATE outbox SET phase='submitted',receipt=? WHERE id=?",
                            (encoded(receipt), row['id']))
