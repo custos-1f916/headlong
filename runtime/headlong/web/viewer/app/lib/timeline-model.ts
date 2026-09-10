@@ -137,8 +137,11 @@ export function buildTimeline(mindlog: Pick<Mindlog, "steps" | "runs">): Timelin
   const laneFor = (id: string): number => {
     // Operator annotations share Dispatcher; original step/run provenance
     // remains available in details. Incoming transport messages use Chat.
-    if (id === "operator" || id.startsWith("operator-")) {
+    if (id === "operator" || id.startsWith("operator-") || id === "deployment-operator") {
       id = "dispatcher";
+    }
+    if (id === "custos-observe" || id === "custos-memory") {
+      id = "observations";
     }
     let idx = laneOf.get(id);
     if (idx === undefined) {
@@ -149,9 +152,10 @@ export function buildTimeline(mindlog: Pick<Mindlog, "steps" | "runs">): Timelin
     return idx;
   };
   const laneIdFor = (step: NormalizedStep): string => {
-    // Incoming bridge messages and native chat replies form one conversation.
-    // Group only in the view; preserve transport/authority on the original step.
-    if (step.source === "chat" || step.source === "operator-transport") return "chat";
+    // Conversation events belong together regardless of writer, including
+    // source-less square messages and replies/reactions from other components.
+    // Keep original transport/authority metadata on the step for details.
+    if (step.type === "message" || step.source === "chat" || step.source === "operator-transport") return "chat";
     if (step.source) return step.source;
     const assocRun = runsById.get(rawStr(step, "run_id") ?? "");
     return assocRun?.launched_by ?? "shellm";
