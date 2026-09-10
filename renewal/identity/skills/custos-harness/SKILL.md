@@ -57,12 +57,12 @@ custos-harness deploy ARTIFACT_SHA256 --expected-current CURRENT_SHA256 --reques
 Qualification runs fixed continuity contracts plus candidate tests under the seal.
 Read the receipt; acceptance is not qualification or deployment success. A stale
 expected-current value fails: inspect the new current version and decide afresh.
-Deployment is asynchronous. Once accepted, finish this wake normally so the host
-supervisor can drain the mind; do not wait forever inside a model tool call.
+Deployment is asynchronous. Once accepted, finish the current atomic operation; the native loop yields between steps so the
+host supervisor can drain the mind. Do not poll forever inside a model tool call.
 Inspect status on the next wake. A repeated request returns the original operation.
 
 The supervisor retains the exact artifact externally, drains writers, checkpoints
-state, switches code, and checks a successful real wake plus service health. It
+state, switches code, and checks fresh successful model/tool progress plus service health. It
 restores previous code after failure or interrupted promotion without rewinding
 memories or delivery receipts. Roll back a retained qualified artifact with
 `custos-harness rollback OLD_SHA --expected-current CURRENT_SHA --request-id ID`.
