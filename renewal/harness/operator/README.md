@@ -40,3 +40,9 @@ accepts an identity symlink but deliberately does not recurse through a symlinke
 parent. The existing `.web-push` state was copied from the original application
 backup into this view before restarting the dashboard. Health must check the
 identity/status APIs as well as the HTML page; HTTP 200 alone missed this defect.
+
+The fixed launcher is retained in the external actuator archive and reinstalled
+before operations. It validates/creates the persistent discovery view on startup.
+The original `.chatrc` was also retained in that view; no original root `.env`
+existed to migrate. The installed host health check now requires the expected
+Custos root trajectory, running dispatcher and working identity status API.

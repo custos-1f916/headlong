@@ -4,6 +4,14 @@ import uvicorn
 from headlong_web.server import create_app
 from headlong_web.push import PushWatcher
 root=Path('/var/lib/custos-harness/dashboard')
+identity=Path('/var/lib/custos-harness/identities/custos')
+if not (identity/'info.txt').is_file(): raise RuntimeError('Persistent Custos identity is missing')
+(root/'.identities').mkdir(parents=True,exist_ok=True,mode=0o700)
+link=root/'.identities/custos'
+if link.exists() or link.is_symlink():
+    if link.resolve()!=identity: raise RuntimeError('Unexpected dashboard identity link')
+else:
+    link.symlink_to(identity)
 static=Path('/opt/custos/current/runtime/headlong/web/viewer/build/client')
 if not (static/'index.html').is_file():raise RuntimeError('qualified dashboard assets are missing')
 PushWatcher(root).start()

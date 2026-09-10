@@ -15,6 +15,7 @@ class Adapter:
   command(['pct','push','122',str(CODE/'actuator.tar.gz'),'/tmp/custos-harness-actuator.tar.gz'])
   command(['pct','exec','122','--','mkdir','-p',GUEST])
   command(['pct','exec','122','--','tar','-xzf','/tmp/custos-harness-actuator.tar.gz','-C',GUEST])
+  command(['pct','exec','122','--','install','-m','0755',GUEST+'/dashboard-current.py','/usr/local/libexec/custos-dashboard-current.py'])
  def act(self,action,**fields):
   p=subprocess.run(['pct','exec','122','--','python3',GUEST+'/harness/guest_agent.py'],input=json.dumps({'action':action,**fields}).encode(),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=1500)
   try:result=json.loads(p.stdout)
