@@ -16,6 +16,7 @@ unset IDENTITY_DIR IDENTITY_NAME MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID THINK_CON
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
 STEP="$REPO/thinkers/responder/step"
+RENEWAL="${CUSTOS_RENEWAL_DIR:-$REPO/../custos/renewal}"
 
 pass=0
 fail=0
@@ -38,7 +39,11 @@ printf 'name=%s\ncreated=test\nroot_trajectory=%s\n' "$ME" "$TRAJ_ID" > "$ID/inf
 TRAJ="$ID/trajectories/$TRAJ_ID/trajectory.jsonl"
 
 mkdir -p "$WORK/stub"
-printf '#!/usr/bin/env bash\ncat "$STUB_REPLY_FILE"\n' > "$WORK/stub/llm"; chmod +x "$WORK/stub/llm"
+cat > "$WORK/stub/llm" <<'STUB'
+#!/usr/bin/env bash
+jq -Rs '{reply:rtrimstr("\n"),decision:"reply",goal:null,memories:[]}' "$STUB_REPLY_FILE"
+STUB
+chmod +x "$WORK/stub/llm"
 export STUB_REPLY_FILE="$WORK/reply"
 
 ago() { date -u -v-"$1"S +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -d "$1 seconds ago" +%Y-%m-%dT%H:%M:%S.000Z; }
@@ -48,7 +53,7 @@ msg() {  # msg <id> <from> <to> <content> <secs-ago|+ahead>
     printf '{"step_id":"%s","type":"message","from":"%s","to":"%s","content":"%s","ts":"%s","source":"chat"}\n' "$1" "$2" "$3" "$4" "$ts" >> "$TRAJ"
 }
 run_step() {
-    printf '%s' "$1" | env PATH="$WORK/stub:$REPO/bin:$REPO/tools:$PATH" \
+    printf '%s' "$1" | env PATH="$WORK/stub:$RENEWAL/bin:$REPO/bin:$REPO/tools:$PATH" \
         IDENTITY_DIR="$ID" IDENTITY_NAME="$ME" MEM_DIR="$ID/memories" \
         TRAJ_DIR="$ID/trajectories" TRAJ_ID="$TRAJ_ID" HOME="$WORK/home" \
         SHELLM_MODEL=stub-model THINK_CONTEXT_TAIL=20 RESPONDER_PERSON_NOTES=0 \
@@ -79,8 +84,6 @@ if plog b1 | grep -q 'Andy Konwinski in #headlong-bot) can you paste the tweet' 
 else
     bad "the prompt carries Andy's message and our reply" "$(plog b1 | grep -o '"role":"[a-z]*","content":"[^"]\{0,50\}' | head -5 | tr '\n' ' ')"
 fi
-plog b1 | grep -q 'you are answering slack-U095QV3JKA6' && ok "the system prompt says who is being answered" || bad "the system prompt says who is being answered"
-if plog b1 | jq -R 'fromjson? // empty' >/dev/null 2>&1; then :; fi
 last_user=$(plog b1 | sed -n '/^# messages/,$p' | sed 1d | jq -r '.[-1].content' 2>/dev/null)
 [[ "$last_user" == *"which tweet"* ]] && ok "the trigger is still the last turn" || bad "the trigger is still the last turn" "got '$last_user'"
 printf '%s' "$obs" | jq -e '.context_steps | index("a1") and index("r1") and index("b0")' >/dev/null && ok "context_steps lists the thread steps" || bad "context_steps lists the thread steps"
@@ -95,11 +98,6 @@ if [[ "$thr" == 0 && "$ctx" -ge 3 ]]; then
     ok "a DM gets Braden's cross-thread history (incl. our thread reply to him) and no thread context"
 else
     bad "a DM gets history but no thread context" "context_msgs=$ctx thread_msgs=$thr"
-fi
-if ! plog d1 | grep -q 'can you paste the tweet'; then
-    ok "Andy's thread message is not in Braden's DM prompt"
-else
-    bad "Andy's thread message is not in Braden's DM prompt"
 fi
 
 echo

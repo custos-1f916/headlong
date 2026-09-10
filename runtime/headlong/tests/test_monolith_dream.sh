@@ -45,29 +45,24 @@ run_step() {  # $1 = trigger json, then env overrides
 }
 WAKE='{"type":"monolith-wake","content":"wake","source":"monolith-timer"}'
 
-run_step "$WAKE"
-p=$(cat "$STUB_CAPTURE" 2>/dev/null)
-grep -q '^Related memories' <<<"$p" && ok "the related-memories section is in the wake prompt" || bad "related section present" "$(grep -c . <<<"$p") lines"
-grep -q '^Runtime: headlong [0-9a-f]\{7,\} (' <<<"$p" && ok "the runtime line names the checked-out commit" || bad "runtime line present"
-grep -q '^Workspace: ' <<<"$p" && ok "the workspace section is in the wake prompt" || bad "workspace section present"
-grep -q '^- notes/ 2 files' <<<"$p" && ok "the workspace section counts files per directory" || bad "workspace dir count" "$(grep '^- ' <<<"$p" | head -3)"
-grep -q 'No WORKSPACE.md yet' <<<"$p" && ok "the workspace section invites a WORKSPACE.md when none exists" || bad "workspace invite"
-grep -q 'a1_gh \[fact, ' <<<"$p" && ok "the memory matched to the stream is listed with its type" || bad "matched memory listed"
-grep -q '\[todo, ' <<<"$p" && ok "the active-goals section shows the todo with its type" || bad "goals section shows todo"
-[[ "$(jq -r '.related_prev[0]' "$STATE" 2>/dev/null)" == 2026-08-20-00-00-00_a1_gh ]] && ok "the names shown are saved in the state file" || bad "state file has related_prev" "$(cat "$STATE" 2>/dev/null)"
-[[ "$(jq -r '.goal_review_at' "$STATE" 2>/dev/null)" -gt 0 ]] && ok "the goal-review time is saved" || bad "goal_review_at saved"
-
-run_step "$WAKE"
-p2=$(cat "$STUB_CAPTURE")
-if grep -q '^Related memories' <<<"$p2"; then
-    grep -q 'a1_gh' <<<"$p2" && bad "a memory shown last wake is not shown again" || ok "a memory shown last wake is not shown again"
-else
-    ok "a memory shown last wake is not shown again (nothing else matched, section omitted)"
-fi
-
-rm -f "$STATE"; run_step "$WAKE" MONOLITH_RELATED_MEMORIES=0 MONOLITH_GOAL_REVIEW_DAYS=0
-p3=$(cat "$STUB_CAPTURE")
-grep -q '^Related memories' <<<"$p3" && bad "MONOLITH_RELATED_MEMORIES=0 removes the section" || ok "MONOLITH_RELATED_MEMORIES=0 removes the section"
-
+cat > "$WORK/stub/custos-dream" <<'STUB'
+#!/usr/bin/env python3
+import sys,os,datetime as dt
+sys.path.insert(0,os.environ['CUSTOS_RENEWAL_DIR'])
+from custos_dream import Dream
+print(Dream(clock=lambda:dt.datetime.fromisoformat(os.environ['DREAM_TEST_NOW'])).due())
+STUB
+chmod +x "$WORK/stub/custos-dream"
+export DREAM_TEST_NOW=2026-09-10T09:30:00+00:00
+run_step "$WAKE" MONOLITH_RELATED_MEMORIES=0
+p=$(cat "$STUB_CAPTURE")
+grep -q "^Hal's scheduled memory dream is due" <<<"$p" && ok "real due helper reaches captured model prompt" || bad "dream routing missing"
+grep -q 'skills show custos-dream' <<<"$p" && ok "skill is reachable from menu" || bad "skill routing missing"
+[[ -f "$ID/dream/2026-09-10/inventory.json" ]] && ok "live hook created inventory in temporary identity" || bad "inventory missing"
+export DREAM_TEST_NOW=2026-09-10T12:00:00+00:00
+run_step "$WAKE" MONOLITH_RELATED_MEMORIES=0
+p=$(cat "$STUB_CAPTURE")
+grep -q "^Hal's scheduled memory dream is due" <<<"$p" && bad "late catch-up incorrectly scheduled" || ok "no late catch-up"
+[[ -f "$ID/dream/2026-09-10/report.md" ]] && ok "missed window leaves private expired report" || bad "report missing"
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

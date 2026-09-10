@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from headlong_web import discovery
-from headlong_web.trajectory import load_trajectory, step_preview
+from headlong_web.trajectory import load_trajectory, step_preview, normalize
 
 REPO = Path(__file__).parents[2]
 GEN1 = REPO / "improve" / "generations" / "gen-001" / "identities"
@@ -33,7 +33,7 @@ def test_g001r1_legacy_log_run_header_only():
     assert len(result["runs"]) == 1
     run = result["runs"][0]
     assert run["step_ids"] == [run["run_id"]]
-    assert run["status"] == "running"
+    assert run["status"] == "unclosed"
     # the action -> run join must land
     assert run["trigger_step_id"] is not None
     action = next(s for s in result["steps"] if s["step_id"] == run["trigger_step_id"])
@@ -58,7 +58,7 @@ def test_g001r2_legacy_machinery_stays_ungrouped():
     assert machinery
     assert all(s["run_id"] is None for s in machinery)
     # without run_id-stamped finals, legacy runs never close
-    assert all(run["status"] == "running" for run in runs)
+    assert all(run["status"] == "unclosed" for run in runs)
     # thinker steps are never swallowed into runs
     thinker = [s for s in result["steps"] if s["source"] is not None]
     assert all(s["run_id"] is None for s in thinker)
@@ -270,3 +270,27 @@ def test_file_bytes_stripped_from_dashboard_raw():
     assert step["raw"]["filename"] == "note.txt"
     assert step["raw"]["content"] == "hello file"
     assert "content_b64" not in step["raw"]
+
+
+def test_launcher_terminal_failure_closes_run_without_hiding_error(tmp_path):
+    result = normalize([
+        _step("shellm-run", "r1"),
+        _step("shellm-run", "r2"),
+        _step("error", "e1", source="monolith", reason="run-failed", run_id="r1", rc=1, ts="end"),
+        _step("run-end", "e2", source="monolith", run_id="r2", rc=0, ts="end2"),
+    ], tmp_path)
+    assert [r["status"] for r in result["runs"]] == ["failed", "done"]
+    assert result["runs"][0]["ended_ts"] == "end"
+    assert result["runs"][0]["last_touch"] == 2
+    assert result["steps"][2]["run_id"] is None  # error remains separately visible
+
+
+def test_partial_work_failure_and_orphan_error(tmp_path):
+    result = normalize([
+        _step("shellm-run", "r1"),
+        _step("reasoning", "s1", run_id="r1"),
+        _step("run-end", "end", source="monolith", run_id="r1", rc=137),
+        _step("error", "orphan", source="monolith", reason="run-failed", run_id="missing"),
+        _step("shellm-run", "unclosed"),
+    ], tmp_path)
+    assert [r["status"] for r in result["runs"]] == ["failed", "unclosed"]

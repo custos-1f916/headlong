@@ -209,43 +209,20 @@ _build_system_prompt() {
 # Goals
 # ---------------------------------------------------------------------------
 
-# The active-goals section of the wake prompt. Every goal-family memory
-# (goal, intention, objective, todo) is shown, newest first, with its type
-# and age, capped at GOALS_MAX lines plus a count of the rest. A memory
-# with `until: YYYY-MM-DD` in its frontmatter drops out after that date
-# (`mem add --until`). Before 2026-09-04 only goal and intention were read,
-# so 10 of Audel's 13 goal memories were invisible, three were duplicates
-# of a finished objective, and two todos had expired weeks earlier.
+# Native directed requests never age out or hide behind the newest eight.
+# Context is bounded, oldest-directed first, with a count and durable paging.
 get_goals() {
-    local mem_dir="${1:-$MEM_DIR}" max="${GOALS_MAX:-8}"
-    [[ -d "$mem_dir" ]] || return 0
-    local today now f ftype until created body age shown=0 hidden=0 goals=""
-    today=$(date -u +%Y-%m-%d); now=$(date -u +%s)
-    local -a files=("$mem_dir"/*.md)
-    local i
-    for (( i = ${#files[@]} - 1; i >= 0; i-- )); do
-        f="${files[$i]}"
-        [[ -f "$f" ]] || continue
-        ftype=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f && /^type:/{sub(/^type:[[:space:]]*/, ""); print}' "$f")
-        case "$ftype" in goal|intention|objective|todo) ;; *) continue ;; esac
-        until=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f && /^until:/{sub(/^until:[[:space:]]*/, ""); print}' "$f")
-        [[ -n "$until" && "$until" < "$today" ]] && continue
-        body=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{f=0; next} !f{print}' "$f" | sed '/./,$!d' | head -3)
-        [[ -n "$body" ]] || continue
-        if (( shown >= max )); then hidden=$((hidden + 1)); continue; fi
-        created=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f && /^created:/{sub(/^created:[[:space:]]*/, ""); print}' "$f")
-        age=$(_mem_age "$created" "$f" "$now")
-        goals="${goals}- [${ftype}${age:+, $age}${until:+, until $until}] ${body}
-"
-        shown=$((shown + 1))
-    done
-    if [[ -z "$goals" ]]; then
-        printf '%s' "(no goals set)"
-    else
-        printf '%s' "$goals"
-        (( hidden > 0 )) && printf '%s' "- and $hidden more: mem list --type goal (also intention, objective, todo)"
-    fi
-    return 0   # the step runs under set -e; a false arithmetic test must not be the exit status
+    MEM_DIR="${1:-$MEM_DIR}" custos-memory context
+}
+
+# Native chat pending is a transport handoff, not a second goals ledger.
+# Captured requests remain visible beyond reply/NO_REPLY/14 days until their
+# native memory carries an evidence-backed disposition.
+get_pending_requests() {
+    # One summary line: the goals section of the prompt already lists every
+    # directed record. Printing the records here too doubled 8 KB of JSON in a
+    # prompt that is pinned into every model call (2026-09-09).
+    custos-memory pending --brief
 }
 
 # Age of a memory as "3h", "5d", or "3w": from its created field, else the
@@ -352,79 +329,6 @@ _root_traj_raw_tail() {
     fi
 }
 
-# Sentinel for "the trigger step was not in the stream", distinct from both a
-# verdict and an empty answer.
-_RESPONDER_TRIGGER_MISSING=$'\x01trigger-not-in-window'
-
-# Has this inbound message already been handled? Echoes the step id that says
-# so (or "handled"), empty when nothing has. Three layers keyed on the trigger
-# step, plus any later message from us to the same person; see the header in
-# thinkers/responder/step for why a STALE claim deliberately does not count.
-#
-# Lives here rather than in the step script so it can be tested: the step runs
-# top to bottom and cannot be sourced.
-# Reads the tail first (_root_traj_raw_tail), and only falls back to the full
-# `traj cat` when the trigger step is not in that window. Every record this
-# looks for can only be appended AFTER the trigger, so a window holding the
-# trigger holds the whole answer; a window that misses it could report an
-# already-answered message as unanswered and reply twice, which is the one case
-# worth paying the full scan for. Same argument fe2acd2 used moving the
-# monolith's work probe off traj cat, and the cost is the same: 7.4s over a
-# 308MB trajectory against 0.08s for the tail.
-_responder_already_handled() {
-    local trigger="$1" them="$2" cutoff="$3" out tf
-    tf=$(traj path "${ROOT_TRAJ_ID:-$TRAJ_ID}" 2>/dev/null) || tf=""
-    if [[ -z "$tf" || ! -f "$tf" ]]; then
-        # No bounded read available: _root_traj_raw_tail would itself degrade
-        # to a full traj cat, and a trigger missing from that stream would
-        # trigger a second one. One full scan, not two.
-        traj cat "${ROOT_TRAJ_ID:-$TRAJ_ID}" --raw 2>/dev/null \
-            | _responder_scan "$trigger" "$them" "$cutoff"
-        return
-    fi
-    out=$(_root_traj_raw_tail | _responder_scan "$trigger" "$them" "$cutoff" --require-trigger)
-    if [[ "$out" == "$_RESPONDER_TRIGGER_MISSING" ]]; then
-        traj cat "${ROOT_TRAJ_ID:-$TRAJ_ID}" --raw 2>/dev/null \
-            | _responder_scan "$trigger" "$them" "$cutoff"
-    else
-        printf '%s' "$out"
-    fi
-}
-
-
-# The scan itself, over whatever stream it is given. With --require-trigger it
-# emits the sentinel instead of a verdict when the trigger step is absent, so
-# the caller can tell "nothing has handled this" from "I could not see far
-# enough to know".
-_responder_scan() {
-    local require_trigger=0
-    [[ "${4:-}" == "--require-trigger" ]] && require_trigger=1
-    jq -Rrn --arg me "$IDENTITY_NAME" --arg them "$2" --arg t "$1" --arg cutoff "$3" \
-           --arg missing "$_RESPONDER_TRIGGER_MISSING" --argjson require "$require_trigger" '
-        [inputs | fromjson? // empty] as $steps
-        | ([$steps | to_entries[] | select(.value.step_id == $t)] | last) as $in
-        | if $require == 1 and $in == null then $missing else
-        [$steps[] | select(.type == "message" and .from == $me
-                             and (.reply_to // "") == $t)]
-          + [$steps[] | select(.type == "observation"
-                               and (.trigger_step // "") == $t
-                               and ((.decision // "") == "replied"
-                                    or (.decision // "") == "no-reply"))]
-          + [$steps[] | select(.type == "reply_claim"
-                               and (.trigger_step // "") == $t
-                               and $cutoff != ""
-                               and (.ts // "") > $cutoff)]
-          + (if $in == null then []
-             else [$steps[($in.key + 1):][]
-                   | select(.type == "message" and .from == $me and .to == $them
-                            and ((.reply_to // "") == "" or (.reply_to // "") == $t))]
-             end)
-        | if length == 0 then empty
-          else (.[0].step_id // "handled") end
-          end' 2>/dev/null \
-        | head -n 1
-}
-
 # Build a compact recent-stream context for thinker prompts: meaningful step
 # types only, long content truncated. Excluding bulky machinery steps (prompt,
 # shell-output, shellm-run, ...) keeps thinker prompts small AND prevents
@@ -498,7 +402,7 @@ _RECENT_STREAM_PAIR_JQ='
 # trigger_step and resolves, which the mind copies verbatim; the details
 # command keeps the full run id because the traj filter matches exactly.
 _recent_stream() {
-    local n="${1:-${THINK_CONTEXT_TAIL:-20}}"
+    local n="${1:-${THINK_CONTEXT_TAIL:-10}}"
     # Tolerant parse (fromjson?): skip corrupt lines rather than dying —
     # concurrent appends have historically produced occasional bad lines.
     _root_traj_raw_tail \
@@ -506,13 +410,19 @@ _recent_stream() {
             | select(.type == "thought" or .type == "action" or .type == "observation"
                      or .type == "message" or .type == "idle" or .type == "merge"
                      or .type == "final" or .type == "error")
+            # The responder per-reply bookkeeping observation ("Replied to X")
+            # repeats the reply that sits right above it in the stream; only a
+            # deferral (work handed to the mind) or a failure is news here.
+            | select(.type != "observation" or .source != "responder"
+                     or (.decision // "") == "" or (.deferred // false) == true
+                     or ((.decision // "") | test("fail")))
             | del(.content_b64)
             | .content = (
                 (if ((.content // "") == "") and ((.filename // "") != "")
                  then "[file: \(.filename)]"
                  else (.content // "") end)
                 | tostring
-                | if length > 1500 then .[0:1500] + "…[truncated]" else . end)
+                | if length > 800 then .[0:800] + "…[truncated; traj show STEP_ID for the rest]" else . end)
             | if .type == "final" and ((.run_id // "") | tostring) != ""
               then .details = "traj tail -n 400 --filter run_id=" + (.run_id | tostring) else . end
             | with_entries(select(.key | IN("type", "content", "source", "ts", "from", "to", "run_id", "step_id", "request", "person", "resolves", "trigger_step", "reply_to", "follow_up", "decision", "deferred", "rc", "details")))' \
@@ -682,7 +592,7 @@ _build_shellm_flags() {
     # running mind in README.md and the stock identity prompt: a host-only tool
     # silently disappears when shellm switches to Docker.
     local cmd
-    for cmd in mem traj skills context llm shellm chat recap; do
+    for cmd in mem traj skills context llm shellm chat recap subrun; do
         local path
         path=$(command -v "$cmd" 2>/dev/null) || continue
         printf '%s\n' "--bin" "$path"

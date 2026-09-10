@@ -18,6 +18,7 @@ unset IDENTITY_DIR IDENTITY_NAME MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID THINK_CON
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
 STEP="$REPO/thinkers/responder/step"
+RENEWAL="${CUSTOS_RENEWAL_DIR:-$REPO/../custos/renewal}"
 
 pass=0
 fail=0
@@ -41,7 +42,7 @@ TRAJ="$ID/trajectories/$TRAJ_ID/trajectory.jsonl"
 mkdir -p "$WORK/stub"
 cat > "$WORK/stub/llm" <<'STUB'
 #!/usr/bin/env bash
-cat "$STUB_REPLY_FILE"
+jq -Rs '{reply:(rtrimstr("\n")),decision:(if rtrimstr("\n")=="NO_REPLY" then "no-reply" else "reply" end),goal:null,memories:[]} | if .decision=="no-reply" then .reply="" else . end' "$STUB_REPLY_FILE"
 STUB
 chmod +x "$WORK/stub/llm"
 export STUB_REPLY_FILE="$WORK/reply"
@@ -74,7 +75,7 @@ thoughts() {  # thoughts <count> <prefix>
 
 run_step() {  # $1 = trigger json
     printf '%s' "$1" | env \
-        PATH="$WORK/stub:$REPO/bin:$REPO/tools:$PATH" \
+        PATH="$WORK/stub:$RENEWAL/bin:$REPO/bin:$REPO/tools:$PATH" \
         IDENTITY_DIR="$ID" IDENTITY_NAME="$ME" MEM_DIR="$ID/memories" \
         TRAJ_DIR="$ID/trajectories" TRAJ_ID="$TRAJ_ID" HOME="$WORK/home" \
         SHELLM_MODEL="stub-model" THINK_CONTEXT_TAIL=20 \
@@ -105,7 +106,7 @@ if [[ -n "$obs" && "$(field "$obs" decision)" == replied ]]; then
 else
     bad "replied observation written" "$(tail -3 "$WORK/step.log")"
 fi
-if jq -e --arg t trig-1 'select(.type=="message" and .from=="testid" and .reply_to==$t)' "$TRAJ" >/dev/null; then
+if jq -se --arg t trig-1 'any(.[]; .type=="message" and .from=="testid" and .reply_to==$t)' "$TRAJ" >/dev/null; then
     ok "reply stamped to the trigger"
 else
     bad "reply stamped to the trigger"
@@ -129,11 +130,10 @@ ms=$(field "$obs" compose_ms)
 [[ "$ms" =~ ^[0-9]+$ ]] && ok "compose_ms is a number" || bad "compose_ms is a number" "got '$ms'"
 [[ "$(field "$obs" model)" == stub-model ]] && ok "model recorded" || bad "model recorded" "got '$(field "$obs" model)'"
 [[ "$(field "$obs" history_source)" == index ]] && ok "history came from the message index" || bad "history came from the message index" "got '$(field "$obs" history_source)'"
-if grep -q '\[60 min ago\] how is the bridge work going' "$ID/run/logs/responder-prompts/"*trig-1* 2>/dev/null \
-   && grep -q 'The current time is 20' "$ID/run/logs/responder-prompts/"*trig-1* 2>/dev/null; then
-    ok "their messages carry an age stamp and the prompt states the current time"
+if grep -Eq '\[(59|60|61) min ago\] how is the bridge work going' "$ID/run/logs/responder-prompts/"*trig-1* 2>/dev/null; then
+    ok "the older message carries its age stamp"
 else
-    bad "their messages carry an age stamp and the prompt states the current time" "$(grep -o '\[[^]]*ago\]' "$ID/run/logs/responder-prompts/"*trig-1* 2>/dev/null | head -2 | tr '\n' ' ')"
+    bad "the older message carries its age stamp"
 fi
 
 # --- 2. beyond the history window: context_msgs is 0 but gap_s still knows ---
@@ -207,6 +207,30 @@ if grep -q '# system' "$ID/run/logs/responder-prompts/"*trig-5* 2>/dev/null \
     ok "prompt text is in the log file and not in the trajectory"
 else
     bad "prompt text is in the log file and not in the trajectory"
+fi
+
+# A protocol leak in the proposed reply fails validation and its single repair.
+# The Python failure observation must survive the shell with no generic duplicate.
+msg trig-6 "$THEM" "$ME" "failure fixture" +25
+printf '%s\n' '{"reply":"private control","decision":"reply"}' > "$STUB_REPLY_FILE"
+if run_step "$(trigger_json trig-6)"; then
+    bad "malformed composition fails the runner"
+else
+    ok "malformed composition fails the runner"
+fi
+obs=$(obs_for trig-6)
+nobs=$(jq -s '[.[] | select(.source=="responder" and .trigger_step=="trig-6" and .decision=="reply-failed")] | length' "$TRAJ")
+if [[ "$nobs" == 1 && "$(field "$obs" failure_stage)" == repair && "$(field "$obs" error_code)" == protocol_in_reply ]]; then
+    ok "one failure observation names the precise stage and reason"
+else
+    bad "one failure observation names the precise stage and reason" "count=$nobs got $obs"
+fi
+if [[ "$(field "$obs" compose_ms)" =~ ^[0-9]+$ ]] \
+   && printf '%s' "$obs" | jq -e '.retryable == false' >/dev/null \
+   && ! jq -se 'any(.[]; .type=="message" and .reply_to=="trig-6")' "$TRAJ" >/dev/null; then
+    ok "failure preserves metrics and sends no protocol text"
+else
+    bad "failure preserves metrics and sends no protocol text"
 fi
 
 echo

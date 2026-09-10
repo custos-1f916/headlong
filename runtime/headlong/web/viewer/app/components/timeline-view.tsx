@@ -757,7 +757,6 @@ export function TimelineView({
             {layout.blocks.map((block) => {
               const r = blockRect(block);
               if (!r) return null; // hidden lane
-              const running = block.open && live;
               const hot = hovered === block.run.run_id;
               return (
                 <button
@@ -769,7 +768,6 @@ export function TimelineView({
                   className={cn(
                     "absolute z-10 rounded-md border text-left",
                     "border-cyan-400/50 bg-cyan-400/[0.06] hover:bg-cyan-400/[0.12]",
-                    running && "animate-pulse",
                     hot && "ring-2 ring-cyan-300/70",
                     freshIds.has(block.run.run_id) && "tl-pop",
                     flashId === block.run.run_id && "tl-flash"
@@ -922,11 +920,7 @@ export function TimelineView({
                       {route && (
                         <span className="text-fuchsia-300/90">→ {route} · </span>
                       )}
-                      {block.open && !block.run.ended_ts
-                        ? live
-                          ? "running"
-                          : "incomplete"
-                        : duration ?? "done"}
+                      {block.run.status === "done" ? duration ?? "done" : block.run.status}
                       {iters > 0 && <> · {iters} iter</>}
                       {block.run.model && (
                         <> · {block.run.model.replace(/^claude-/, "")}</>

@@ -43,7 +43,7 @@ export interface TimelineBlock {
   startRow: number;
   endRow: number; // inclusive
   members: NormalizedStep[];
-  open: boolean; // still running (no final seen)
+  open: boolean; // no terminal evidence (does not establish process liveness)
 }
 
 export interface TimelineGapRow {
@@ -247,7 +247,7 @@ export function buildTimeline(mindlog: Pick<Mindlog, "steps" | "runs">): Timelin
         startRow: row,
         endRow: row,
         members: membersByRun.get(run.run_id) ?? [],
-        open: run.status !== "done",
+        open: run.status === "unclosed",
       };
       blocks.push(block);
       blockByRunId.set(run.run_id, block);

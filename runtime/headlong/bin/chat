@@ -45,6 +45,63 @@ case "${1:-}" in -h|--help|help) ;; *)
     ;; esac
 
 # ---------------------------------------------------------------------------
+# Double-text guard (design: a person who has not answered is not waiting for
+# a second message). Active only when the caller sets
+# CHAT_DOUBLE_TEXT_GUARD_HOURS (the social thinker does; the responder, which
+# only ever answers a fresh inbound message, and the mind delivering deferred
+# work do not). Refuses a send when our last message in that conversation is
+# still unanswered and younger than the window, and refuses moving an
+# unanswered group ask into a DM with someone from that room (unless that
+# person has spoken to us within the hour: a live exchange is not silence). On 2026-09-09
+# the social thinker asked for the same stills three times in three hours,
+# then took the ask to a DM. CHAT_SOCIAL_BLOCKED, when set, refuses every send
+# with its text (the day's unsolicited allowance from social-policy.json).
+# ---------------------------------------------------------------------------
+_DOUBLE_TEXT_JQ='
+  def secs: ((.ts // "")[0:19] + "Z") | try fromdateiso8601 catch 0;
+  def reaction: (.content // "") | test("Signal reaction \\(ambient event");
+  def aci: (((.content // "") | capture("\"aci\":\"(?<a>[^\"]+)\"") | .a) // "");
+  def scope: (((.content // "") | capture("\"scope\":\"(?<s>[^\"]+)\"") | .s) // "");
+  def ago($t; $n): (($n - $t) / 60 | floor) as $mi | if $mi < 90 then "\($mi)m" else "\(($mi / 60) | floor)h" end;
+  [inputs | fromjson? // empty] as $m
+  | now as $now
+  | [$m[] | select(((.from == $me and .to == $to) or (.from == $to and .to == $me)) and (reaction | not))] as $conv
+  | ($conv | last) as $last
+  | if $last != null and $last.from == $me and ($now - ($last | secs)) < ($h * 3600) then
+      "you spoke last in this conversation (\(ago($last | secs; $now)) ago) and nobody has answered. Do not add a second message and do not move the ask to another channel; wait for a reply or \($h)h, or leave it."
+    else
+      ([$m[] | select(.from == $to and .to == $me) | aci | select(. != "")] | last // "") as $to_aci
+      | if $to_aci == "" then empty else
+          ([$m[] | select(.to == $me and ((.from // "") | startswith("signal")) and scope == "group") | .from] | unique) as $groups
+          | [ $groups[] as $g
+              | ([$m[] | select(((.from == $me and .to == $g) or (.from == $g and .to == $me)) and (reaction | not))] | last) as $gl
+              | select($gl != null and $gl.from == $me and ($now - ($gl | secs)) < ($h * 3600))
+              | select(([$m[] | select(.from == $g and .to == $me and aci == $to_aci)] | length) > 0)
+              | select(([$m[] | select(.to == $me and aci == $to_aci and (secs) > ($gl | secs))] | length) == 0)
+              | select(([$m[] | select(.to == $me and aci == $to_aci and (secs) > ($now - 3600))] | length) == 0)
+              | "your last message in the group (\(ago($gl | secs; $now)) ago) is unanswered and this person is in that room. Do not move the ask to a DM; wait for a reply or \($h)h."
+            ] | first // empty
+        end
+    end'
+
+_double_text_guard() {
+    local to="$1" me="${IDENTITY_NAME:-}" hours="${CHAT_DOUBLE_TEXT_GUARD_HOURS:-}"
+    if [[ -n "${CHAT_SOCIAL_BLOCKED:-}" ]]; then
+        die "$CHAT_SOCIAL_BLOCKED"
+    fi
+    [[ "$hours" =~ ^[0-9]+$ && "$hours" -gt 0 && -n "$me" ]] || return 0
+    local tf idx verdict
+    tf=$(traj path "${ROOT_TRAJ_ID:-$TRAJ_ID}" 2>/dev/null) || return 0
+    [[ -n "$tf" && -f "$tf" ]] || return 0
+    idx="$(dirname "$tf")/messages.jsonl"
+    _index_update "$tf" "$idx" 2>/dev/null || true
+    [[ -f "$idx" ]] || return 0
+    verdict=$(tail -n 4000 -- "$idx" | jq -Rrn --arg me "$me" --arg to "$to" --argjson h "$hours" "$_DOUBLE_TEXT_JQ" 2>/dev/null) || return 0
+    [[ -n "$verdict" ]] && die "not sent: $verdict"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -90,6 +147,8 @@ cmd_send() {
     [[ "$from" == "$to" ]] && die "refusing to send a message from '$from' to itself.
 To message someone else: chat reply <their-name> <message>
 To keep a note for yourself, append a thought step instead of a message."
+
+    _double_text_guard "$to"
 
     # source_url records where a bridged message came from. It is optional
     # metadata for operators and never affects routing or model context.
@@ -180,6 +239,8 @@ Use the name of the person you mean to reach: chat reply <their-name> <message>"
             fi
         fi
     fi
+
+    _double_text_guard "$to_name"
 
     # reply_to stamps which message step this reply answers, making "has this
     # message been answered" a fact in the log rather than an ordering
@@ -714,6 +775,8 @@ case "${1:-}" in
     reply)     shift; cmd_reply "$@" ;;
     history) shift; cmd_history "$@" ;;
     pending)   shift; cmd_pending "$@" ;;
+    guard)     shift; [[ -n "${1:-}" ]] || die "Usage: chat guard <to_name>   (exit 1 with the reason when a send to <to_name> would double-text)"
+               _double_text_guard "$1"; printf 'ok\n' ;;
     person-key) shift; cmd_person_key "$@" ;;
     thread-key) shift; cmd_thread_key "$@" ;;
     repl)    shift; cmd_repl "$@" ;;

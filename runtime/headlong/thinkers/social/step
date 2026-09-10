@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# social/step — the mind's social attention, as its own thinker.
+#
+# The responder answers a message in seconds; the monolith does one function
+# per wake and a Voidle fix can hold it for an hour. Nothing in between owned
+# the follow-through: reading the link someone shared and coming back with a
+# thought, starting a conversation, keeping notes about people. This thinker
+# does that, cheaply and rarely:
+#
+#   - It wakes on the responder's per-reply observation (so it sees each
+#     conversation turn) but runs at most once per SOCIAL_MIN_GAP seconds; a
+#     burst of chat coalesces into one wake, armed for when the gap expires.
+#   - It also wakes on its own timer (SOCIAL_WAKE_INTERVAL, default one hour)
+#     but only spends inference when there was conversation in the last day.
+#   - Each run is one short shellm run (SOCIAL_MAX_ITERATIONS, default 8) that
+#     picks ONE social function from prompt.md or does nothing.
+#   - social-policy.json in the identity dir (Custos owns it) turns the
+#     thinker off (`"proactive": false`) and carries the participation stance
+#     the responder also reads.
+#
+# Steps it writes carry source `social`. Its scheduled wake is the dispatcher's
+# generic `<name>-wake` (bin/thinkers), so it never fires the monolith.
+
+THINKER_NAME="social"
+SCRIPT_DIR="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
+
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../_lib/common.sh"
+
+_require_env
+
+THINK_MODEL="${THINK_MODEL:-${SHELLM_MODEL:-}}"
+[[ -n "$THINK_MODEL" ]] || { printf 'social/step: no THINK_MODEL/SHELLM_MODEL\n' >&2; exit 0; }
+SOCIAL_MAX_ITERATIONS="${SOCIAL_MAX_ITERATIONS:-14}"
+# Social replies are short; medium reasoning is plenty and keeps the shared slot free.
+SOCIAL_EFFORT="${SOCIAL_EFFORT:-medium}"
+SOCIAL_MIN_GAP="${SOCIAL_MIN_GAP:-1800}"
+SOCIAL_WAKE_INTERVAL="${SOCIAL_WAKE_INTERVAL:-7200}"
+# Nudge to start a conversation with someone when none was started for this long (policy: initiate_after_hours).
+SOCIAL_INITIATE_HOURS="${SOCIAL_INITIATE_HOURS:-20}"
+SOCIAL_CONTEXT_MSGS="${SOCIAL_CONTEXT_MSGS:-40}"
+
+state_dir="$IDENTITY_DIR/run"
+mkdir -p "$state_dir"
+state_file="$state_dir/social_state.json"
+wake_at_file="$state_dir/$THINKER_NAME.wake_at"
+policy_file="$IDENTITY_DIR/social-policy.json"
+run_dir="$IDENTITY_DIR/workdir"
+mkdir -p "$run_dir"
+
+arm_wake() {
+    local delay="$1"
+    [[ -f "$state_dir/dispatcher.token" ]] || return 0
+    printf '%s' "$(( $(date +%s) + delay ))" > "$wake_at_file"
+}
+
+last_run=0
+if [[ -f "$state_file" ]]; then
+    last_run=$(jq -r '.last_run // 0' "$state_file" 2>/dev/null) || last_run=0
+    [[ "$last_run" =~ ^[0-9]+$ ]] || last_run=0
+fi
+_save_state() {
+    local tmp
+    tmp=$(mktemp) || return 0
+    jq -nc --argjson l "$1" '{last_run:$l}' > "$tmp" 2>/dev/null && mv "$tmp" "$state_file" || rm -f "$tmp"
+}
+
+# Policy: Custos's own file; a missing or unreadable one means the defaults.
+policy_json='{}'
+if [[ -f "$policy_file" ]]; then
+    policy_json=$(jq -c . "$policy_file" 2>/dev/null) || policy_json='{}'
+fi
+if [[ "$(printf '%s' "$policy_json" | jq -r '.proactive // true')" == "false" ]]; then
+    exit 0   # switched off; no re-arm — flipping it back on takes effect on the next responder wake
+fi
+# Cadence is Custos's to tune: the policy file overrides the environment defaults.
+_pg=$(printf '%s' "$policy_json" | jq -r '.min_gap_seconds // empty' 2>/dev/null) || _pg=""
+[[ "$_pg" =~ ^[0-9]+$ ]] && SOCIAL_MIN_GAP="$_pg"
+_pi=$(printf '%s' "$policy_json" | jq -r '.wake_interval_seconds // empty' 2>/dev/null) || _pi=""
+[[ "$_pi" =~ ^[0-9]+$ && "$_pi" -ge 60 ]] && SOCIAL_WAKE_INTERVAL="$_pi"
+_ph=$(printf '%s' "$policy_json" | jq -r '.initiate_after_hours // empty' 2>/dev/null) || _ph=""
+[[ "$_ph" =~ ^[0-9]+$ ]] && SOCIAL_INITIATE_HOURS="$_ph"
+
+# ---------------------------------------------------------------------------
+# Trigger
+# ---------------------------------------------------------------------------
+step_json=$(cat)
+[[ -z "$step_json" ]] && exit 0
+trigger_type=$(printf '%s' "$step_json" | jq -r '.type // empty' 2>/dev/null) || true
+trigger_source=$(printf '%s' "$step_json" | jq -r '.source // empty' 2>/dev/null) || true
+trigger_decision=$(printf '%s' "$step_json" | jq -r '.decision // empty' 2>/dev/null) || true
+trigger_step_id=$(printf '%s' "$step_json" | jq -r '.step_id // empty' 2>/dev/null) || true
+
+now=$(date +%s)
+next_delay=""
+trap '[[ -n "$next_delay" ]] && arm_wake "$next_delay"' EXIT
+
+case "$trigger_type" in
+    observation)
+        [[ "$trigger_source" == "responder" && -n "$trigger_decision" ]] || exit 0
+        wake_mode="reactive"
+        if (( now - last_run < SOCIAL_MIN_GAP )); then
+            # Coalesce the burst: wake once when the gap has passed.
+            next_delay=$(( last_run + SOCIAL_MIN_GAP - now ))
+            exit 0
+        fi
+        ;;
+    social-wake)
+        wake_mode="timer"
+        ;;
+    "")
+        # Service start: begin the clock, spend nothing now.
+        next_delay="$SOCIAL_WAKE_INTERVAL"
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+# From here on we run; whatever happens, keep the clock alive.
+next_delay="$SOCIAL_WAKE_INTERVAL"
+
+# ---------------------------------------------------------------------------
+# Context: recent conversation, people, seeds
+# ---------------------------------------------------------------------------
+since=$(date -u -d '24 hours ago' +%FT%T 2>/dev/null || date -u -v-24H +%FT%T)
+conversation=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg me "$IDENTITY_NAME" --arg since "$since" '
+    def fmt($s): if $s < 90 then "just now" elif $s < 5400 then "\(($s/60)|floor)m ago" elif $s < 172800 then "\(($s/3600)|floor)h ago" else "\(($s/86400)|floor)d ago" end;
+    def age: ((now - ((.ts // "")[0:19] + "Z" | try fromdateiso8601 catch now)) | floor) | fmt(.);
+    def who: (.content | capture("\"speaker\":\"(?<s>[^\"]+)\"").s) // .from;
+    def body: (.content | if test("\nMessage:\n") then (split("\nMessage:\n")[1] | split("\nParticipation:")[0]) else . end | gsub("\\s+"; " ") | .[0:400]);
+    def is_reaction: (.content // "") | test("Signal reaction \\(ambient event");
+    def on_me: (.content // "") | test("Reaction target context: \\{\"speaker\":\"[Cc]ustos\"");
+    # A reaction is aged by its own timestamp, not by when the bridge delivered
+    # it: a batch delivered six hours late read as "fresh" on 2026-09-09 and got
+    # a reply to a joke the room had finished.
+    def reaction_age: ((.content // "") | capture("\"timestamp\":(?<t>[0-9]{13})") | .t | tonumber / 1000) as $t | ((now - $t) | floor) | fmt(.);
+    def reaction_emoji: ((.content // "") | capture("\"emoji\":\"(?<e>[^\"]+)\"") | .e) // "?";
+    def reaction_target: ((.content // "") | capture("Reaction target context: \\{[^}]*\"text\":\"(?<x>[^\"]{0,80})") | .x) // "";
+    fromjson? // empty
+    | select(.type == "message" and (.ts // "") >= $since and ((.to == $me) or (.from == $me)))
+    | if .from == $me then "[\(age)] \(.step_id[0:8]) me -> \(.to): \(body)"
+      elif is_reaction then
+        # Reactions on other people'"'"'s messages are not conversation openings; they are not shown.
+        (if on_me then "[\(try reaction_age catch age)] \(reaction_emoji) on your message \u201c\(reaction_target)\u201d in \(.from) (a signal, not an opening; never reply to it)" else empty end)
+      else "[\(age)] step_id=\(.step_id) sender=\(.from) \(who): \(body)" end' 2>/dev/null | tail -n "$SOCIAL_CONTEXT_MSGS") || conversation=""
+
+# Conversations where Custos spoke last and nobody has answered: closed to this
+# thinker until they reply or the window passes. `chat` enforces the same rule
+# at send time (CHAT_DOUBLE_TEXT_GUARD_HOURS); this list lets the model see it.
+waiting=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg me "$IDENTITY_NAME" --argjson h "$SOCIAL_INITIATE_HOURS" '
+    def secs: ((.ts // "")[0:19] + "Z") | try fromdateiso8601 catch 0;
+    def is_reaction: (.content // "") | test("Signal reaction \\(ambient event");
+    [inputs | fromjson? // empty | select(.type == "message" and ((.to == $me) or (.from == $me)) and (is_reaction | not))]
+    | group_by(if .from == $me then .to else .from end)
+    | map(select(length > 0) | (.[-1]) as $last | select($last.from == $me and (now - ($last | secs)) < ($h * 3600))
+          | "- \($last.to): you spoke last \(((now - ($last | secs)) / 60 | floor))m ago (\(($last.content // "") | gsub("\\s+"; " ") | .[0:90])…) and nobody has answered")
+    | .[]' 2>/dev/null) || waiting=""
+
+if [[ "$wake_mode" == "timer" && -z "$conversation" ]]; then
+    exit 0   # a quiet day: nothing to follow up; the timer keeps ticking
+fi
+# A timer tick with no new inbound message since the last run has nothing to
+# follow up; six to nine model calls to conclude "nothing" is what it cost
+# before (2026-09-09). The initiation nudge (below) is the one reason to run
+# anyway, so it is checked first.
+new_inbound=$(_root_traj_raw_tail 2>/dev/null | jq -Rrn --arg me "$IDENTITY_NAME" --argjson last "$last_run" '
+    def secs: ((.ts // "")[0:19] + "Z") | try fromdateiso8601 catch 0;
+    [inputs | fromjson? // empty
+     | select(.type == "message" and .to == $me and (secs) > $last
+              and (((.content // "") | test("Signal reaction \\(ambient event")) | not))] | length' 2>/dev/null) || new_inbound=1
+[[ "$new_inbound" =~ ^[0-9]+$ ]] || new_inbound=1
+
+# `mem list -s` prints "YYYY-MM-DD HH:MM  <id>  [type]  <summary>"; the id is
+# what `mem show`/`mem edit` take.
+people=$(mem list --type person -s 2>/dev/null | head -n 20) || people=""
+people_notes=""
+if [[ -n "$people" ]]; then
+    while IFS= read -r pid; do
+        [[ -n "$pid" ]] || continue
+        note=$(mem show "$pid" 2>/dev/null | sed -n '/^---$/,/^---$/!p' | grep -v '^Custos person note v1:' | head -c 1500) || note=""
+        people_notes="${people_notes}
+### ${pid}
+${note}
+"
+    done <<<"$(printf '%s\n' "$people" | awk '{print $3}')"
+fi
+
+sent_today=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg since "$(date -u -d '24 hours ago' +%FT%T 2>/dev/null || date -u -v-24H +%FT%T)" '
+    fromjson? // empty | select(.type == "observation" and .source == "social" and (.ts // "") >= $since) | .content' 2>/dev/null | wc -l | tr -d ' ') || sent_today=0
+
+# Messages this thinker actually sent in the last 24 h (message steps whose run
+# was a social run), against the policy'"'"'s unsolicited_per_day. Custos owns the
+# number; the harness only enforces it. Nothing here caps the responder.
+# 0 = no allowance (Hal, 2026-09-09: judgment moderates, not counts; the day
+# it was tried at 4 it refused a legitimate message and the model went round it).
+# Custos may set a number in social-policy.json if it wants a ceiling of its own.
+SOCIAL_UNSOLICITED_PER_DAY="${SOCIAL_UNSOLICITED_PER_DAY:-0}"
+_pu=$(printf '%s' "$policy_json" | jq -r '.unsolicited_per_day // empty' 2>/dev/null) || _pu=""
+[[ "$_pu" =~ ^[0-9]+$ ]] && SOCIAL_UNSOLICITED_PER_DAY="$_pu"
+msgs_today=$(_root_traj_raw_tail 2>/dev/null | jq -Rrn --arg me "$IDENTITY_NAME" --arg since "$since" '
+    [inputs | fromjson? // empty] as $s
+    | [$s[] | select(.type == "shellm-run" and .launched_by == "social") | .step_id] as $runs
+    | [$s[] | select(.type == "message" and .from == $me and (.ts // "") >= $since and ((.run_id // "") as $r | $runs | index($r)))] | length' 2>/dev/null) || msgs_today=0
+[[ "$msgs_today" =~ ^[0-9]+$ ]] || msgs_today=0
+social_blocked=""
+if (( SOCIAL_UNSOLICITED_PER_DAY > 0 && msgs_today >= SOCIAL_UNSOLICITED_PER_DAY )); then
+    social_blocked="not sent: you have used today's unsolicited-message allowance (${msgs_today} of ${SOCIAL_UNSOLICITED_PER_DAY}, unsolicited_per_day in social-policy.json, which you own). Notes and thinking are still open; messages wait for tomorrow or for someone to write to you (the responder answers those)."
+fi
+
+# What is actually still owed, from the goal ledger. The transcript alone made
+# the social thinker re-raise a reminder ten hours after the matter was closed.
+owed=$(custos-memory pending 2>/dev/null | head -n 40) || owed=""
+
+# Hours since Custos last STARTED a conversation on Signal (a proactive send it
+# recorded as "social: started a conversation with …", or a message of its own
+# with no reply_to). Above SOCIAL_INITIATE_HOURS the prompt carries a nudge.
+last_start=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg me "$IDENTITY_NAME" '
+    fromjson? // empty
+    | select((.type == "observation" and .source == "social" and ((.content // "") | test("started a conversation")))
+             or (.type == "message" and .from == $me and ((.to // "") | startswith("signal-")) and ((.reply_to // "") == "")))
+    | .ts' 2>/dev/null | tail -n 1) || last_start=""
+initiate_hint=""
+if [[ -n "$last_start" ]]; then
+    _ls=$(date -u -d "${last_start%%.*}" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%S" "${last_start%%.*}" +%s 2>/dev/null || echo "")
+    [[ -n "$_ls" ]] && since_start_h=$(( (now - _ls) / 3600 )) || since_start_h=999
+else
+    since_start_h=999
+fi
+if (( since_start_h >= SOCIAL_INITIATE_HOURS )) && [[ -z "$social_blocked" ]]; then
+    initiate_hint="- You have not started a conversation with anyone on Signal in $(( since_start_h >= 999 ? SOCIAL_INITIATE_HOURS : since_start_h ))+ hours. Is there someone you would like to talk to: a question for Dani or Ryan, something Jack would enjoy, a thought Hal would want to hear? \`custos-actions signal-contacts\` lists everyone. If you do, append an observation beginning \"social: started a conversation with <name>\". If nobody comes to mind, that is a fine answer too."
+fi
+
+if [[ "$wake_mode" == "timer" && "$new_inbound" -eq 0 && -z "$initiate_hint" ]]; then
+    # Quiet tick: nothing new to follow up and no nudge due. No model call; the
+    # EXIT trap keeps the timer armed.
+    exit 0
+fi
+
+system_prompt=$(_build_system_prompt)
+prompt_body=$(load_prompt "$SCRIPT_DIR/prompt.md" "$IDENTITY_NAME" "")
+
+trigger_line="A conversation turn just finished (responder decision: ${trigger_decision:-?})."
+[[ "$wake_mode" == "timer" ]] && trigger_line="Hourly social check; nothing specific triggered it."
+
+route_prompt="<context>
+$system_prompt
+
+Your participation policy (you own $policy_file and may edit it):
+$policy_json
+
+What you know about people (person notes; \`mem show <name>\` for the whole note):
+${people_notes:-(no person notes yet)}
+
+Conversation in the last 24h (oldest first; use the step_id and sender when replying into a thread):
+${conversation:-(none)}
+
+What is still owed, from your goal ledger (anything NOT listed here is settled; do not re-raise it, and do not remind people about things this list does not contain):
+${owed:-(nothing owed to anyone right now)}
+
+Waiting on them (you spoke last; these conversations and these people are closed to you until they answer or ${SOCIAL_INITIATE_HOURS}h pass; \`chat\` will refuse a second message):
+${waiting:-(none: every conversation you are in has been answered)}
+
+Social actions you took in the last 24h: $sent_today; messages sent by this thinker: $msgs_today. There is no count that moderates you: your policy and your judgment decide how much is right (unsolicited_per_day in social-policy.json is 0 = off unless you set a ceiling of your own). The one rule is above: never a second unanswered message. A reaction on someone else's message is never a reason to speak.${social_blocked:+
+$social_blocked}
+Why you woke: $trigger_line
+${initiate_hint:+Nudge:
+$initiate_hint}
+
+$prompt_body
+</context>
+
+Pick ONE social function, or nothing, and carry it out now. Everything you need to decide is above: decide by your third step and act, or stop. Do not re-read person notes or history you can already see."
+
+_export_provider_keys
+_export_skill_vars "$IDENTITY_DIR"
+shellm_flags=()
+while IFS= read -r _flag; do
+    [[ -n "$_flag" ]] && shellm_flags+=("$_flag")
+done < <(_build_shellm_flags "$IDENTITY_DIR" "$run_dir")
+
+run_id_file=$(mktemp)
+prompt_file_tmp=$(mktemp "$state_dir/social_prompt.XXXXXX")
+printf '%s' "$route_prompt" > "$prompt_file_tmp"
+printf '  social (%s)...\n' "$wake_mode" >&2
+run_rc=0
+CHAT_DOUBLE_TEXT_GUARD_HOURS="$SOCIAL_INITIATE_HOURS" CHAT_SOCIAL_BLOCKED="$social_blocked" \
+    SHELLM_NO_BANNER=1 SHELLM_TRIGGER_STEP_ID="$trigger_step_id" SHELLM_WAKE="social/$wake_mode" \
+    SHELLM_RUN_ID_OUT="$run_id_file" SHELLM_MAX_ITERATIONS="$SOCIAL_MAX_ITERATIONS" SHELLM_EFFORT="$SOCIAL_EFFORT" \
+    shellm --model "$THINK_MODEL" --traj "$TRAJ_ID" --context-scope run \
+    "${shellm_flags[@]}" --prompt-file "$prompt_file_tmp" >/dev/null || run_rc=$?
+rm -f "$prompt_file_tmp"
+
+terminal_run_id=$(cat "$run_id_file" 2>/dev/null) || terminal_run_id=""
+rm -f "$run_id_file"
+# A run that ended without a social observation (out of steps, a dead model
+# call, a stall) is recorded as such, so the timeline never shows a silent
+# gap where the social thinker quietly failed.
+if [[ "$run_rc" -ne 0 ]]; then
+    _acted=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg r "$terminal_run_id" 'fromjson? // empty | select(.type=="observation" and .source=="social" and (.run_id // "")==$r) | .step_id' 2>/dev/null | head -1) || _acted=""
+    if [[ -z "$_acted" ]]; then
+        jq -nc --arg source "$THINKER_NAME" --arg run_id "$terminal_run_id" --argjson rc "$run_rc" \
+            '{type:"observation", source:$source, content:("social run ended without acting (rc=\($rc): out of steps, or the model call failed)")}
+             + (if $run_id == "" then {} else {run_id: $run_id} end)' | traj append >/dev/null || true
+    fi
+fi
+if [[ -n "$terminal_run_id" ]]; then
+    jq -nc --arg source "$THINKER_NAME" --arg run_id "$terminal_run_id" --argjson rc "$run_rc" \
+        '{type:"run-end", source:$source, run_id:$run_id, rc:$rc,
+          content:(if $rc == 0 then "social run exited successfully" else "social run exited with rc=\($rc)" end)}' \
+        | traj append >/dev/null || true
+fi
+_save_state "$now"
+exit 0

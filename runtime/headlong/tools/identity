@@ -373,13 +373,13 @@ else
 fi
 
 # Read identity name
-_id_name=$(grep '^name=' "$_id_dir/info.txt" 2>/dev/null | cut -d= -f2-)
+_id_name=$(sed -n 's/^name=//p' "$_id_dir/info.txt")
 [[ -z "$_id_name" ]] && _id_name=$(basename "$_id_dir")
 
 # Read model defaults
-_id_model=$(grep '^think_model=' "$_id_dir/info.txt" 2>/dev/null | cut -d= -f2-)
+_id_model=$(sed -n 's/^think_model=//p' "$_id_dir/info.txt")
 [[ -z "$_id_model" ]] && _id_model="${SHELLM_MODEL:-claude-opus-4-7}"
-_id_interval=$(grep '^interval=' "$_id_dir/info.txt" 2>/dev/null | cut -d= -f2-)
+_id_interval=$(sed -n 's/^interval=//p' "$_id_dir/info.txt")
 [[ -z "$_id_interval" ]] && _id_interval="0"
 
 # Save PS1 for deactivate
@@ -394,7 +394,7 @@ export SKILLS_KERNEL_DIR="$_id_dir/kernel"
 export TRAJ_DIR="$_id_dir/trajectories"
 
 # Resolve TRAJ_ID from info.txt root_trajectory
-_root_traj=$(grep '^root_trajectory=' "$_id_dir/info.txt" 2>/dev/null | cut -d= -f2-)
+_root_traj=$(sed -n 's/^root_trajectory=//p' "$_id_dir/info.txt")
 [[ -z "$_root_traj" ]] && _root_traj="trajectory.jsonl"
 export TRAJ_ID="$_root_traj"
 export ROOT_TRAJ_ID="$_root_traj"

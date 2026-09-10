@@ -384,3 +384,20 @@ def test_window_rehydrate_strips_content_b64(traj_dir: Path):
     assert file_step["raw"]["filename"] == "note.txt"
     assert file_step["raw"]["content"] == "hello file"
     assert "content_b64" not in file_step["raw"]
+
+
+def test_incremental_terminal_error_updates_previous_run(tmp_path):
+    from headlong_web.trajectory import TrajectoryCache
+    import json
+    path = tmp_path / "trajectory.jsonl"
+    path.write_text(json.dumps({"type":"shellm-run", "step_id":"r1", "ts":"start"}) + "\n")
+    cache = TrajectoryCache()
+    assert cache.load(tmp_path)["runs"][0]["status"] == "unclosed"
+    with path.open("a") as stream:
+        stream.write(json.dumps({"type":"error", "step_id":"err", "run_id":"r1",
+                                 "source":"monolith", "reason":"run-failed", "rc":1, "ts":"end"}) + "\n")
+    result = cache.load(tmp_path)
+    assert result["runs"][0]["status"] == "failed"
+    assert result["runs"][0]["last_touch"] == 1
+    assert result["steps"][1]["type"] == "error"
+    assert cache.load(tmp_path)["runs"] == result["runs"]

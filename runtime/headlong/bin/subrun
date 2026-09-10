@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# subrun — run one focused task in a clean context and return its report.
+#
+# The mind's own wake carries its charter, life summary, recent stream and goals
+# in every model call; a code task on top of that starves the run of working
+# memory (a 15 KB file could not be read whole on 2026-09-09). A sub-run gets
+# only: the hard lines, the task, the directory, and its own steps. It runs
+# synchronously in a child trajectory (a `fork` step links it), bounded by
+# --max-iterations, and prints its FINAL report on stdout for the caller to
+# verify. Same model, same effort, same guard as the parent; nothing else.
+#
+#   subrun [--cwd DIR] [--max-iterations N] [--effort LEVEL] [-f FILE]... "task text"
+#   subrun [--cwd DIR] ... --task-file FILE
+#
+# Always redirect to a file when backgrounding (see shellm's sub-run notes);
+# run it in the foreground when the result is needed in this wake.
+set -euo pipefail
+
+die() { printf 'subrun: error: %s\n' "$*" >&2; exit 2; }
+
+cwd="$PWD"; max_iter="${SUBRUN_MAX_ITERATIONS:-40}"; effort=""; task=""; task_file=""
+files=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cwd|--workdir) cwd="${2:?--cwd requires a directory}"; shift 2 ;;
+        --max-iterations) max_iter="${2:?--max-iterations requires N}"; shift 2 ;;
+        --effort) effort="${2:?--effort requires a level}"; shift 2 ;;
+        -f) files+=("${2:?-f requires a file}"); shift 2 ;;
+        --task-file) task_file="${2:?--task-file requires a file}"; shift 2 ;;
+        -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --) shift; break ;;
+        -*) die "unknown option $1" ;;
+        *) break ;;
+    esac
+done
+if [[ -n "$task_file" ]]; then
+    [[ -f "$task_file" ]] || die "task file not found: $task_file"
+    task=$(cat -- "$task_file")
+else
+    task="$*"
+fi
+[[ -n "${task// }" ]] || die "a task is required (positional text or --task-file FILE)"
+[[ -d "$cwd" ]] || die "directory not found: $cwd"
+[[ "$max_iter" =~ ^[0-9]+$ && "$max_iter" -ge 1 ]] || die "--max-iterations must be a positive integer"
+
+# The hard lines travel with every sub-run; the rest of the charter does not.
+hard_lines=""
+if [[ -n "${IDENTITY_DIR:-}" && -f "$IDENTITY_DIR/core_identity_prompt.md" ]]; then
+    hard_lines=$(awk '/^## Hard lines/{f=1} f' "$IDENTITY_DIR/core_identity_prompt.md" | head -c 6000)
+fi
+
+prompt_file=$(mktemp "${TMPDIR:-/tmp}/subrun.XXXXXX")
+trap 'rm -f "$prompt_file"' EXIT
+{
+    printf 'You are a focused sub-run of %s working on ONE task in %s. You have this task, this directory and your own steps; nothing else is in your context, on purpose.\n\n' "${IDENTITY_NAME:-the agent}" "$cwd"
+    printf 'Task:\n%s\n\n' "$task"
+    printf 'How to work: read files in slices (`sed -n 1,120p FILE`), never whole; write files with heredocs; run the tests or the program to check your work; commit nothing and push nothing unless the task says so. Stop when the task is done or when you are certain it cannot be done here. Finish with `FINAL: ` followed by a short report: what you changed (files and functions), what you ran and its exact result (tests passed/failed, errors verbatim), and what is left. A red test is red; say so.\n'
+    if [[ -n "$hard_lines" ]]; then
+        printf '\nThese hold in a sub-run as everywhere:\n%s\n' "$hard_lines"
+    fi
+} > "$prompt_file"
+
+args=(--context-scope run --workdir "$cwd" --max-iterations "$max_iter" --prompt-file "$prompt_file" --quiet)
+[[ -n "$effort" ]] && args+=(--effort "$effort")
+for f in "${files[@]}"; do args+=(-f "$f"); done
+export SHELLM_NO_BANNER=1
+exec shellm "${args[@]}"

@@ -81,12 +81,12 @@ export function RunGroupBlock({
               "text-[10px]",
               run.status === "done"
                 ? "text-muted-foreground"
-                : live
-                  ? "text-green-700 dark:text-green-400"
+                : run.status === "failed"
+                  ? "text-red-700 dark:text-red-400"
                   : "text-amber-700 dark:text-amber-400"
             )}
           >
-            {run.status === "done" ? "done" : live ? "running" : "incomplete"}
+            {run.status}
           </Badge>
           {duration && <span>{duration}</span>}
           <span>{steps.length} steps</span>

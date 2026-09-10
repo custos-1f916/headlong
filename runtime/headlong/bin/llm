@@ -47,7 +47,7 @@ LLM_PROVIDER="${LLM_PROVIDER:-}"
 _llm_provider_env="$LLM_PROVIDER"
 LLM_THINKING=0
 LLM_THINKING_LEVEL=""
-LLM_EFFORT=""
+LLM_EFFORT="${LLM_EFFORT:-}"
 LLM_RAW=0
 LLM_PROMPT=""
 # OpenRouter provider routing. OpenRouter fans a single model id out over
@@ -106,6 +106,15 @@ LLM_MAX_TIME="${LLM_MAX_TIME:-600}"
 LLM_STOP_AFTER_CODE_BLOCK="${LLM_STOP_AFTER_CODE_BLOCK:-0}"
 LLM_SPEED_LIMIT="${LLM_SPEED_LIMIT:-100}"
 LLM_SPEED_TIME="${LLM_SPEED_TIME:-60}"
+# Admission retries, separate from LLM_RETRIES: a gateway that admits one call
+# at a time can answer 503 busy BEFORE anything was generated. Nothing was
+# emitted, so retrying cannot duplicate output. Only explicit denials qualify;
+# a stalled or interrupted stream is never retried (it may have run). Default 3
+# extra attempts, waiting the denial's retry_after (else LLM_ADMISSION_WAIT s).
+# A call that merely waits in the gateway queue is protected by LLM_SPEED_TIME
+# (set it to cover the longest wait you accept), not by retries.
+LLM_ADMISSION_RETRIES="${LLM_ADMISSION_RETRIES:-3}"
+LLM_ADMISSION_WAIT="${LLM_ADMISSION_WAIT:-20}"
 
 # ---------------------------------------------------------------------------
 # Utility
@@ -332,6 +341,7 @@ Environment:
                            (same names as --provider); --provider takes
                            precedence, and a value that disagrees with the
                            name warns on stderr
+  LLM_MIN_OUTPUT_TOKENS    Optional floor for reasoning-heavy utility calls
   LLM_MAX_TOKENS           Override the per-model default output cap (same as -t)
   LLM_RETRIES              Retries for transient API failures (default: 2;
                            0 disables). Never retries after partial output.
@@ -487,6 +497,34 @@ if [[ -n "${LLM_API_URL:-}" && "$LLM_PROVIDER" != "openai-compatible" && "$LLM_P
     echo "llm: warning: LLM_API_URL overrides the default $LLM_PROVIDER endpoint (requests go to $_llm_url_host)" >&2
 fi
 
+# Served-model allowlist (LLM_MODEL_ALLOWLIST, comma separated; LLM_EFFORT_ALLOWLIST
+# likewise). A deployment that serves exactly one model behind an
+# openai-compatible gateway sets these so a request for a model or effort the
+# backend cannot serve is coerced to the configured one, out loud, instead of
+# failing a whole sub-run at its first call. Upstream defaults and skill text
+# still mention vendor model names and effort `high`; the coercion makes those
+# harmless. Unset means no coercion.
+if [[ -n "${LLM_MODEL_ALLOWLIST:-}" ]]; then
+    _llm_model_ok=0
+    IFS=',' read -r -a _llm_allowed <<<"$LLM_MODEL_ALLOWLIST"
+    for _m in "${_llm_allowed[@]}"; do [[ "$LLM_MODEL" == "$_m" ]] && _llm_model_ok=1; done
+    if [[ "$_llm_model_ok" -eq 0 ]]; then
+        _llm_fallback="${SHELLM_MODEL:-${_llm_allowed[0]}}"
+        echo "llm: model '$LLM_MODEL' is not served here; using '$_llm_fallback' (LLM_MODEL_ALLOWLIST=$LLM_MODEL_ALLOWLIST)" >&2
+        LLM_MODEL="$_llm_fallback"
+    fi
+fi
+if [[ -n "${LLM_EFFORT_ALLOWLIST:-}" && -n "$LLM_EFFORT" ]]; then
+    _llm_effort_ok=0
+    IFS=',' read -r -a _llm_efforts <<<"$LLM_EFFORT_ALLOWLIST"
+    for _e in "${_llm_efforts[@]}"; do [[ "$LLM_EFFORT" == "$_e" ]] && _llm_effort_ok=1; done
+    if [[ "$_llm_effort_ok" -eq 0 ]]; then
+        _llm_effort_fallback="${SHELLM_EFFORT:-${_llm_efforts[${#_llm_efforts[@]}-1]}}"
+        echo "llm: effort '$LLM_EFFORT' is not served here; using '$_llm_effort_fallback' (LLM_EFFORT_ALLOWLIST=$LLM_EFFORT_ALLOWLIST)" >&2
+        LLM_EFFORT="$_llm_effort_fallback"
+    fi
+fi
+
 # OpenCode routing prefixes hide the real catalog id from the API side;
 # strip once, up front, so the payload builders AND get_model_max_tokens see
 # the actual model name and its caps.
@@ -594,6 +632,15 @@ if [[ ! "$LLM_MAX_TOKENS" =~ ^[0-9]+$ ]]; then
     # Non-numeric would reach jq --argjson as invalid JSON; warn and fall back.
     [[ -n "$LLM_MAX_TOKENS" ]] && echo "llm: warning: ignoring non-numeric LLM_MAX_TOKENS='$LLM_MAX_TOKENS'" >&2
     LLM_MAX_TOKENS=$(get_model_max_tokens "$LLM_MODEL")
+fi
+
+# Opt-in budget for reasoning-heavy identities. Tiny utility-specific caps
+# otherwise spend all tokens in reasoning and return no usable JSON/answer.
+if [[ -n "${LLM_MIN_OUTPUT_TOKENS:-}" ]]; then
+    [[ "$LLM_MIN_OUTPUT_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "LLM_MIN_OUTPUT_TOKENS must be a positive integer"
+    if [[ "$LLM_MAX_TOKENS" -lt "$LLM_MIN_OUTPUT_TOKENS" ]]; then
+        LLM_MAX_TOKENS="$LLM_MIN_OUTPUT_TOKENS"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -709,6 +756,14 @@ build_payload_openai() {
     # chunk (OpenAI-compatible stream_options; OpenRouter supports it too).
     if [[ "$LLM_STREAM" -eq 1 ]]; then
         jq_filter="${jq_filter} + {stream_options: {include_usage: true}}"
+    fi
+
+    # NInfer and compatible local servers take effort at the top level.
+    # Explicit --effort overrides the inherited default used by direct
+    # responder, memory and recap calls outside shellm.
+    if [[ "$LLM_PROVIDER" == "openai-compatible" && -n "$LLM_EFFORT" ]]; then
+        jq_args+=(--arg compatible_effort "$LLM_EFFORT")
+        jq_filter="${jq_filter} + {reasoning_effort: \$compatible_effort}"
     fi
 
     # Map --thinking LEVEL to OpenAI reasoning.effort (only when an explicit
@@ -1122,11 +1177,24 @@ stream_openai() {
             # of "bash\n" would lose its newline. That silently reflows the
             # model's output onto one line, which turns a fenced code block
             # into an unparseable ```bash<first-line-of-code>.
-            _chunk=$(printf '%s' "$json" | jq -j '.choices[0].delta.content // empty'; printf X)
-            _chunk="${_chunk%X}"
-            if [[ -n "$_chunk" ]]; then
-                mark_emitted
-                _emit_text "$_chunk" || break
+            # Compatible reasoning models use reasoning_content; OpenRouter
+            # also uses reasoning. Keep it off stdout/execution, but preserve
+            # requested thinking so shellm can continue a reasoning-only turn.
+            if [[ "$LLM_THINKING" -eq 1 && ( "$json" == *'"reasoning_content"'* || "$json" == *'"reasoning"'* ) ]]; then
+                _chunk=$(printf '%s' "$json" | jq -j '(.choices[0].delta.reasoning_content // .choices[0].delta.reasoning // empty) | select(type == "string")'; printf X)
+                _chunk="${_chunk%X}"
+                if [[ -n "$_chunk" ]]; then
+                    mark_emitted
+                    printf '%s' "$_chunk" >&2
+                fi
+            fi
+            if [[ "$json" == *'"content"'* ]]; then
+                _chunk=$(printf '%s' "$json" | jq -j '.choices[0].delta.content // empty'; printf X)
+                _chunk="${_chunk%X}"
+                if [[ -n "$_chunk" ]]; then
+                    mark_emitted
+                    _emit_text "$_chunk" || break
+                fi
             fi
             # Only the final chunk carries a non-null finish_reason; the glob
             # keeps jq off the hot per-delta path.
@@ -1226,7 +1294,12 @@ if [[ -z "$LLM_USAGE_FILE" ]]; then
     LLM_USAGE_FILE=$(mktemp "${TMPDIR:-/tmp}/llm-usage.XXXXXX")
     _llm_usage_own=1
 fi
+_llm_beacon_pid=""
 _llm_cleanup() {
+    if [[ -n "$_llm_beacon_pid" ]]; then
+        kill "$_llm_beacon_pid" 2>/dev/null || true
+        wait "$_llm_beacon_pid" 2>/dev/null || true
+    fi
     rm -f "$payload_file"
     if [[ -n "${_llm_auth_file:-}" ]]; then rm -f "$_llm_auth_file"; fi
     if [[ -n "${_adapter_dir:-}" ]]; then rm -rf "$_adapter_dir"; fi
@@ -1234,6 +1307,26 @@ _llm_cleanup() {
     return 0
 }
 trap '_llm_cleanup' EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+# Nonstream recall/summary calls may legitimately think beyond shellm's 30s
+# output watchdog. Stamp its existing activity beacon without writing to the
+# result pipes. The owner's HTTP deadline and shellm's quiet ceiling still apply.
+if [[ -n "${SHELLM_ACTIVITY_FILE:-}" && -w "$(dirname "$SHELLM_ACTIVITY_FILE")" ]]; then
+    _llm_beacon_owner=$$
+    (
+        exec >/dev/null 2>&1
+        _llm_beacon_sleep=""
+        trap '[[ -z "$_llm_beacon_sleep" ]] || kill "$_llm_beacon_sleep" 2>/dev/null; exit 0' TERM INT
+        while kill -0 "$_llm_beacon_owner" 2>/dev/null; do
+            date +%s > "$SHELLM_ACTIVITY_FILE" || exit 0
+            sleep 1 &
+            _llm_beacon_sleep=$!
+            wait "$_llm_beacon_sleep" || exit 0
+        done
+    ) &
+    _llm_beacon_pid=$!
+fi
 
 # Adapter seam (design/providers.md): LLM_PROVIDER=adapter hands the whole
 # completion to the executable named by LLM_ADAPTER instead of the curl
@@ -1350,6 +1443,22 @@ get_url_headers
 
 [[ "$LLM_RETRIES" =~ ^[0-9]+$ ]] || LLM_RETRIES=0
 _max_attempts=$(( LLM_RETRIES + 1 ))
+[[ "$LLM_ADMISSION_RETRIES" =~ ^[0-9]+$ ]] || LLM_ADMISSION_RETRIES=0
+_admission_attempts=0
+# _admission_failure MSG -> 0 when MSG describes a not-yet-started call: the
+# gateway's busy/pause denials, an HTTP 503, or curl giving up on a silent queue.
+_admission_failure() {
+    case "$1" in
+        *backend_busy_or_unavailable*|*busy_observation_unavailable*|*custos_request_in_flight*|*"HTTP 503"*) return 0 ;;
+    esac
+    return 1
+}
+_admission_wait() {  # seconds to wait before an admission retry (denial retry_after when present)
+    local ra
+    ra=$(printf '%s' "$1" | grep -oE 'retry_after_seconds"?[^0-9]*[0-9]+' | grep -oE '[0-9]+$' | head -1)
+    [[ "$ra" =~ ^[0-9]+$ && "$ra" -gt 0 && "$ra" -le 120 ]] && { printf '%s' "$ra"; return; }
+    printf '%s' "$LLM_ADMISSION_WAIT"
+}
 
 # Network guard flags for curl (see the LLM_CONNECT_TIMEOUT block above).
 _net_args=()
@@ -1411,6 +1520,13 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
             _retry_msg="empty response: stream ended without emitting anything"
             _rc=1
         fi
+        if [[ "$_emitted" -eq 0 && "$_admission_attempts" -lt "$LLM_ADMISSION_RETRIES" ]] && _admission_failure "${_retry_msg}${_ce}"; then
+            _admission_attempts=$(( _admission_attempts + 1 ))
+            _aw=$(_admission_wait "${_retry_msg}${_ce}")
+            echo "llm: not admitted yet (attempt $_admission_attempts/$LLM_ADMISSION_RETRIES): ${_retry_msg:-${_ce:-exit $_rc}} — waiting ${_aw}s" >&2
+            sleep "$_aw"
+            continue
+        fi
         if [[ "$_emitted" -eq 0 && "$_attempt" -lt "$_max_attempts" ]]; then
             echo "llm: transient API failure (attempt $_attempt/$_max_attempts): ${_retry_msg:-${_ce:-exit $_rc}} — retrying" >&2
             sleep $(( LLM_RETRY_BACKOFF * _attempt ))
@@ -1431,6 +1547,17 @@ else
             ${_net_args[@]+"${_net_args[@]}"} \
             "${headers[@]}" -d @"$payload_file" "$url" 2>/dev/null) || http_code="000"
 
+        # Not admitted yet (gateway busy 503): nothing was consumed, retry on
+        # the admission budget.
+        if [[ "$http_code" == "503" && "$_admission_attempts" -lt "$LLM_ADMISSION_RETRIES" ]]; then
+            _body=$(head -c 600 "$local_resp" 2>/dev/null || true)
+            _admission_attempts=$(( _admission_attempts + 1 ))
+            _aw=$(_admission_wait "$_body")
+            echo "llm: not admitted yet (attempt $_admission_attempts/$LLM_ADMISSION_RETRIES): HTTP $http_code — waiting ${_aw}s" >&2
+            rm -f "$local_resp"
+            sleep "$_aw"
+            continue
+        fi
         # Transient: network failure, timeout, rate limit, server error
         if [[ "$http_code" =~ ^(000|408|429|5[0-9][0-9])$ && "$_attempt" -lt "$_max_attempts" ]]; then
             echo "llm: transient API failure (attempt $_attempt/$_max_attempts): HTTP $http_code — retrying" >&2

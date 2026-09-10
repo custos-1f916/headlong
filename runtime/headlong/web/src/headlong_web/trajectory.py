@@ -120,7 +120,7 @@ class RunGroup:
     step_ids: list[str] = field(default_factory=list)
     started_ts: str = ""
     ended_ts: str | None = None
-    status: str = "running"  # running | done
+    status: str = "unclosed"  # unclosed (liveness unknown) | done | failed
     # Stored TRUNCATED (commands embed the whole prompt; thousands of runs
     # times 100s of KB was a large share of the cache's memory). The full
     # text is rehydrated from header_span by TrajectoryCache.run_command.
@@ -275,6 +275,18 @@ class _Normalizer:
                 "from_step": raw.get("from_step"),
             }
 
+        # Launcher terminal records are separate visible events, but also close
+        # the explicitly linked run. Do not absorb them into machinery grouping.
+        terminal_run = self._runs_by_id.get(raw.get("run_id") or "")
+        if terminal_run is not None and (
+            (step_type == "error" and raw.get("reason") == "run-failed")
+            or (step_type == "run-end" and type(raw.get("rc")) is int)
+            or (step_type == "idle" and source == "monolith")
+        ):
+            terminal_run.status = "failed" if step_type == "error" or raw.get("rc", 0) != 0 else "done"
+            terminal_run.ended_ts = ts
+            terminal_run.last_touch = len(self.steps)
+
         # Inline-run grouping (machinery steps carry no source)
         if source is None and step_type in MACHINERY_TYPES:
             if step_type == "shellm-run":
@@ -330,8 +342,9 @@ class _Normalizer:
                     if step_type == "run-summary":
                         run.tldr = raw.get("tldr") or run.tldr
                     elif step_type == "final":
-                        run.status = "done"
-                        run.ended_ts = ts
+                        if run.status != "failed":
+                            run.status = "done"
+                            run.ended_ts = ts
         elif step_type == "action":
             self._unmatched_actions.append(normalized)
 

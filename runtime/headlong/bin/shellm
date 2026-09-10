@@ -130,6 +130,9 @@ SHELLM_CONTEXT_RUN_TAIL_BLOCK="${SHELLM_CONTEXT_RUN_TAIL_BLOCK:-50}"
 # so a row shrinks once, when the window start would move anyway.
 SHELLM_CONTEXT_BLOCK_LIMIT="${SHELLM_CONTEXT_BLOCK_LIMIT:-8192}"
 SHELLM_CONTEXT_WHOLE_BLOCKS="${SHELLM_CONTEXT_WHOLE_BLOCKS:-1}"
+# Cap serialized conversation bytes independently of the model's token window.
+# Full prompt instructions remain intact; historical fields are budgeted by context.
+SHELLM_CONTEXT_MAX_BYTES="${SHELLM_CONTEXT_MAX_BYTES:-}"
 # Whether the image was chosen for this run (environment here, --docker-image
 # below) rather than defaulted. A resume inherits the trajectory's image only
 # when it was not, so resuming never silently overrides what the caller asked
@@ -275,7 +278,7 @@ Options:
   -v, --verbose        Verbose/debug mode
   -q, --quiet          Suppress all progress/streaming output (stderr), keep only final answer
   -h, --help           Show this help
-  -m, --model MODEL    Model to use (default: claude-opus-4-7)
+  -m, --model MODEL    Model to use (default: the SHELLM_MODEL environment variable)
   --max-iterations N   Max loop iterations (default: unlimited)
   --max-tokens N       Max tokens per response (default: model's max output cap)
   --effort LEVEL       Thinking effort: low, medium, high, xhigh, max (default: high)
@@ -315,6 +318,8 @@ Environment:
                           1 (default): stop reading a response once its first
                           code block closes; only that block runs anyway.
                           0 reads to the end.
+  SHELLM_RUN_SUMMARY      1 (default): summarize new runs asynchronously.
+                          0 avoids a competing call on a single-slot server.
   SHELLM_CONTEXT_SCOPE    traj (default) or run; see --context-scope
   SHELLM_CONTEXT_RUN_TAIL Rows the run-scope window reads back (default 400)
   SHELLM_CONTEXT_RUN_TAIL_BLOCK
@@ -327,6 +332,9 @@ Environment:
   SHELLM_CONTEXT_WHOLE_BLOCKS
                           How many newest blocks get the larger limit (default
                           1); in traj scope, the newest N rows
+  SHELLM_CONTEXT_MAX_BYTES
+                          Cap serialized conversation bytes before the model call;
+                          full prompt instructions are never byte-cut (default unset)
   SHELLM_EMPTY_RESPONSE_RETRIES
                           Empty-response retries before the run dies
                           (default 8; set empty for unlimited)
@@ -1484,6 +1492,36 @@ make_env_name() {
 # Code execution
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Self-termination guard (SHELLM_GUARD=0 disables)
+# ---------------------------------------------------------------------------
+# A model debugging a stuck sub-run has twice mistaken its own shellm for the
+# child and killed its own run (rc=143), the way Audel stopped its own service.
+# Each executed block therefore starts with shell functions that shadow kill,
+# pkill, killall, systemctl and thinkers, refusing a target that is this run,
+# any ancestor of it (the step, the dispatcher, the service), its process
+# group, or the thinkers runtime. A child the block started is still an
+# ordinary `kill <pid>`. This guards accidents, not adversaries: `command
+# kill` bypasses it, and the refusal says so in the block's own output.
+_shellm_protected_pids() {
+    local p=$$ chain="" n=0
+    while [[ -n "$p" && "$p" != 0 && "$p" != 1 && $n -lt 12 ]]; do
+        chain="$chain $p"
+        p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+        n=$((n + 1))
+    done
+    printf '%s' "${chain# }"
+}
+_shellm_guard_preamble() {
+    [[ "${SHELLM_GUARD:-1}" == "0" ]] && return 0
+    local guard_file
+    guard_file="$(dirname "$_SHELLM_SCRIPT_PATH")/shellm-guard.sh"
+    # Sourced, not inlined: an inlined guard put ~3 KB into every block's
+    # `bash -c` argv, which then filled the ps output the model reads.
+    [[ -r "$guard_file" ]] || return 0
+    printf '. %q\n' "$guard_file"
+}
+
 # execute_code WORKSPACE CODE [NAME=VALUE ...]
 #
 # env_vars carries API keys (the nested-run key, `--var` forwards from the
@@ -1613,8 +1651,56 @@ call_llm() {
 # Code extraction from LLM response
 # ---------------------------------------------------------------------------
 
+# normalize_toolcall_markup RESPONSE — Qwen-family models sometimes answer in
+# their native tool-call markup instead of a fence:
+#   <tool_call>            <tool_call>              <tool_call>
+#   <function=bash>        <function=bash>          set -e
+#   set -e … code …        <parameter=command>      … code …
+#   </function>            … code …                 </tool_call>
+#   </tool_call>           </parameter> …
+# (also the hybrid "<function=bash> … </bash>"). Run as-is, the first line is a
+# bash syntax error and the whole turn is wasted (4 of 46 responses on Custos,
+# 2026-09-09). When a response has NO fence but does have this markup, lift
+# the code between the openers and the first closer into a ```bash fence so
+# it executes, and tell the model on stderr what happened so it learns the
+# fence. A response that has a real fence is left alone (fences win).
+normalize_toolcall_markup() {
+    local response="$1"
+    case "$response" in
+        *"<tool_call>"*|*"<function="*|*"<bash>"*) ;;
+        *) printf '%s' "$response"; return 1 ;;
+    esac
+    if printf '%s\n' "$response" | grep -qE '^```|```(bash|shell|sh)[[:space:]]*$'; then
+        printf '%s' "$response"; return 1
+    fi
+    local lifted
+    lifted=$(printf '%s\n' "$response" | awk '
+        BEGIN { started = 0 }
+        !started {
+            if ($0 ~ /^[[:space:]]*<(tool_call|function=[A-Za-z_]+|parameter=[A-Za-z_]+|bash)>[[:space:]]*$/) { started = 1 }
+            next
+        }
+        started {
+            if ($0 ~ /^[[:space:]]*<\/(tool_call|function|parameter|bash)>[[:space:]]*$/) { exit }
+            if ($0 ~ /^[[:space:]]*<(function=[A-Za-z_]+|parameter=[A-Za-z_]+|bash)>[[:space:]]*$/) { next }
+            print
+        }')
+    if [[ "$lifted" =~ [^[:space:]] ]]; then
+        printf '%s' $'```bash\n'"$lifted"$'\n```'
+        return 0
+    fi
+    printf '%s' "$response"
+    return 1
+}
+
 extract_code() {
     local response="$1"
+    local toolcall_lifted=0
+    local _normalized
+    if _normalized=$(normalize_toolcall_markup "$response"); then
+        response="$_normalized"
+        toolcall_lifted=1
+    fi
 
     # Extract the FIRST fenced code block (```bash, ```sh, or bare ```).
     # Heredoc-aware: lines like ``` inside an open heredoc do NOT close the
@@ -1737,6 +1823,14 @@ extract_code() {
     if [[ "$truncation_signal" == *TRUNCATED* ]]; then
         code=$'echo "[rest of model response truncated after first code block]" >&2\n'"$code"
     fi
+    if [[ "$toolcall_lifted" -eq 1 ]]; then
+        local toolcall_notice
+        toolcall_notice=$(cat <<'NOTICE'
+printf '%s\n' '[shellm: your reply used <tool_call>/<function=bash> markup. This runtime only reads ```bash fences; it lifted your code into one and ran it this time. Next time put the script inside a ```bash block, nothing else.]' >&2
+NOTICE
+)
+        code="$toolcall_notice"$'\n'"$code"
+    fi
     if [[ "$no_fence" -eq 1 ]]; then
         local nofence_notice
         nofence_notice=$(cat <<'NOTICE'
@@ -1744,6 +1838,17 @@ printf '%s\n' '[shellm: your reply had no ```bash code block, so your whole mess
 NOTICE
 )
         code="$nofence_notice"$'\n'"$code"
+    fi
+
+    # Validate the whole script before any command can have side effects.
+    # A stray XML closing tag can otherwise fail only after earlier commands
+    # have run, inviting duplicate actions when the model retries the script.
+    local syntax_error
+    if ! syntax_error=$(bash -n <<<"$code" 2>&1); then
+        local rejected_notice
+        rejected_notice='[shellm: rejected invalid bash syntax before execution; NONE of this script ran. Return one valid ```bash fenced script. Do not use XML <bash> or </bash> tags as code. Correct the syntax below before retrying.]'
+        printf 'printf %s %q %q >&2\nexit 2\n' "'%s\n'" "$rejected_notice" "$syntax_error"
+        return
     fi
 
     echo "$code"
@@ -1765,6 +1870,7 @@ build_system_prompt() {
 You are running in shellm, headlong's bash agent loop: you solve tasks by generating and executing bash code.
 
 IMPORTANT: End your response with exactly ONE ```bash code block. Your response is NOT streamed — code blocks are not executed until your entire response is complete. Combine multiple steps into a single script. Only the first code block is executed; all others are silently discarded.
+Never use <tool_call>, <function=bash>, <parameter=...> or <bash> tags: this runtime is not a tool-calling API and only reads ```bash fences.
 
 CRITICAL — the opening ```bash fence MUST start on its OWN new line. Put a
 newline after your prose, THEN the fence on a line by itself. Never append the
@@ -2409,7 +2515,7 @@ run_loop() {
     # alone can't tell whose header is whose when concurrent runs interleave.
     [[ -n "${SHELLM_RUN_ID_OUT:-}" ]] && printf '%s' "$_run_step_id" > "$SHELLM_RUN_ID_OUT" || true
 
-    if [[ -z "$_use_traj" ]]; then
+    if [[ -z "$_use_traj" && "${SHELLM_RUN_SUMMARY:-1}" == 1 ]]; then
         # New trajectory — kick off async run-summary generation
         local stdin_ctx_file=""
         if [[ -n "$stdin_context" ]]; then
@@ -2517,7 +2623,10 @@ run_loop() {
                 --tail "$SHELLM_CONTEXT_RUN_TAIL" --tail-block "$SHELLM_CONTEXT_RUN_TAIL_BLOCK")
             [[ -n "$_prompt_step_id" ]] && _ctx_args+=(--pin "$_prompt_step_id")
         fi
-        messages_json=$(context "${_ctx_args[@]}" 2>/dev/null) || messages_json='[]'
+        if [[ -n "$SHELLM_CONTEXT_MAX_BYTES" ]]; then
+            _ctx_args+=(--max-bytes "$SHELLM_CONTEXT_MAX_BYTES")
+        fi
+        messages_json=$(context "${_ctx_args[@]}") || die "context rendering failed; no model request sent"
 
         # Call Claude (capture thinking/reasoning to file)
         local thinking_file="$rundir/.last_thinking"
@@ -2543,9 +2652,8 @@ run_loop() {
         fi
         rm -f "$thinking_file"
 
-        # Retry on empty response: feed captured thinking back as assistant
-        # context so the model continues from where it left off (max_tokens
-        # gets hit during thinking before any visible output is emitted).
+        # Continue a reasoning-only response without treating it as completion.
+        # It can end at a stop token as well as at the output-token limit.
         # Default: 8 retries; SHELLM_EMPTY_RESPONSE_RETRIES overrides (set it
         # to the empty string for unlimited).
         local empty_retries=0
@@ -2569,9 +2677,22 @@ run_loop() {
                 local feedback_file
                 feedback_file=$(mktemp)
                 printf '%s' "$feedback" > "$feedback_file"
-                retry_messages_json=$(printf '%s' "$retry_messages_json" | jq \
-                    --rawfile t "$feedback_file" \
-                    '. + [{"role":"assistant","content":$t},{"role":"user","content":"Your previous response ran out of output tokens during the reasoning above before you could emit any visible text. Continue from where you left off and produce the bash code for the next step now."}]')
+                local retry_feedback="Your previous response contained reasoning but no visible executable response. Continue from the reasoning and produce one bash block for the next step, or explicitly finish with FINAL when the work is done."
+                if [[ -n "$SHELLM_CONTEXT_MAX_BYTES" ]]; then
+                    # Preserve the actual reasoning in native history, then use
+                    # the same byte-budgeted renderer as every normal iteration.
+                    jq -nc --rawfile thought "$feedback_file" --arg run "$_run_step_id" \
+                        '{type:"reasoning", thought:$thought, run_id:$run}' \
+                        | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
+                    jq -nc --arg content "$retry_feedback" --arg run "$_run_step_id" \
+                        '{type:"feedback", content:$content, run_id:$run}' \
+                        | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
+                    retry_messages_json=$(context "${_ctx_args[@]}") || die "continuation context rendering failed; no model request sent"
+                else
+                    retry_messages_json=$(printf '%s' "$retry_messages_json" | jq \
+                        --rawfile t "$feedback_file" --arg feedback "$retry_feedback" \
+                        '. + [{"role":"assistant","content":$t},{"role":"user","content":$feedback}]')
+                fi
                 rm -f "$feedback_file"
                 sleep 1
             else
@@ -2644,7 +2765,8 @@ run_loop() {
         # Build wrapped code that captures FINAL/FINAL_FILE after execution
         local wrapped_code
         # shellcheck disable=SC1078,SC1079  # one long double-quoted string, built across lines on purpose
-        wrapped_code="set -x
+        wrapped_code="$(_shellm_guard_preamble)
+set -x
 $code
 set +x"$'\n'"
 __shellm_rc=\$?
@@ -2662,6 +2784,9 @@ exit \$__shellm_rc
             execution_api_url=$(_shellm_container_api_url "$execution_api_url")
         fi
         local -a env_vars=(
+            SHELLM_GUARD="${SHELLM_GUARD:-1}"
+            SHELLM_PROTECTED_PIDS="$(_shellm_protected_pids)"
+            SHELLM_PROTECTED_PGID="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
             SHELLM_WORKDIR="$workdir"
             SHELLM_ENV="$(if [[ "${_SHELLM_DOCKER_MODE:-0}" -eq 1 && "$SHELLM_ALLOW_NESTED_DOCKER" != "1" ]]; then echo "local"; else echo "${_SHELLM_ACTIVE_ENV:-}"; fi)"
             _SHELLM_PARENT_CONTAINER="${_SHELLM_CONTAINER:-}"
@@ -2672,6 +2797,9 @@ exit \$__shellm_rc
             LLM_PROVIDER="${LLM_PROVIDER:-}"
             LLM_API_KEY="${LLM_API_KEY:-}"
             SHELLM_MODEL="$SHELLM_MODEL"
+            LLM_MODEL_ALLOWLIST="${LLM_MODEL_ALLOWLIST:-}"
+            LLM_EFFORT_ALLOWLIST="${LLM_EFFORT_ALLOWLIST:-}"
+            SHELLM_INACTIVITY_TIMEOUT="$SHELLM_INACTIVITY_TIMEOUT"
             SHELLM_MAX_TOKENS="$SHELLM_MAX_TOKENS"
             SHELLM_MAX_ITERATIONS="$SHELLM_MAX_ITERATIONS"
             SHELLM_EFFORT="$SHELLM_EFFORT"

@@ -675,8 +675,11 @@ _start_dispatcher() {
                 if [[ "$_active_step_count" -ge "$THINKERS_MAX_CONCURRENT" ]]; then continue; fi
                 rm -f "$_wf"
                 printf '%s [dispatcher]   scheduled wake -> %s (due %ss ago)\n' "$(date -u +%FT%TZ)" "$_wname" "$((_now - _wat))" >&2
-                _dispatch_step "$_wname" "$(jq -nc --arg source monolith-timer \
-                    '{type:"monolith-wake", content:"wake", source:$source}')"
+                # The wake step is typed per thinker (<name>-wake, source
+                # <name>-timer) so two thinkers with their own clocks never
+                # fire each other. The monolith keeps its historical names.
+                _dispatch_step "$_wname" "$(jq -nc --arg type "${_wname}-wake" --arg source "${_wname}-timer" \
+                    '{type:$type, content:"wake", source:$source}')"
             done
         }
 

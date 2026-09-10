@@ -58,6 +58,13 @@ esac
 exit 0
 STUB
 chmod +x "$WORK/stub/shellm"
+# The Custos runtime renders goals and pending asks through custos-memory and
+# the identity prompt through `identity prompt`; neither exists here. Stub
+# both so the step's prompt sections resolve and the run reaches its backoff
+# decision (without them every wake died with rc=127 and no state file).
+printf '#!/usr/bin/env bash\ncase "$1" in context|pending) echo "Active goals: 0 (0 from other people)." ;; *) exit 0 ;; esac\n' > "$WORK/stub/custos-memory"
+printf '#!/usr/bin/env bash\n[[ "$1" == prompt ]] && echo "# testid"\nexit 0\n' > "$WORK/stub/identity"
+chmod +x "$WORK/stub/custos-memory" "$WORK/stub/identity"
 
 export STUB_MODE_FILE="$WORK/mode"
 export STUB_TRAJ="$TRAJ"

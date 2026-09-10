@@ -4,7 +4,7 @@ set -euo pipefail
 # monolith/step — The whole mind in one thinker.
 #
 # Runs the router: every wakeup is one shellm agentic run whose prompt is a
-# function menu (think / act / learn / recall / goals / values / idle). The
+# function menu (act / explore / make / share / think / learn / recall / goals / values / idle). The
 # model picks one function and carries it out in the same run.
 #
 # Chat replies are NOT the monolith's job — a dedicated `responder` thinker owns
@@ -34,7 +34,16 @@ source "$SCRIPT_DIR/../_lib/common.sh"
 _require_env
 
 THINK_MODEL="${THINK_MODEL:-${SHELLM_MODEL:-claude-opus-4-7}}"
-THINK_CONTEXT_TAIL="${THINK_CONTEXT_TAIL:-20}"
+# 10, not 20: the stream is pinned into every model call of the wake, and at 20
+# durable steps (26 KB) it ate the run's own working memory (2026-09-09).
+THINK_CONTEXT_TAIL="${THINK_CONTEXT_TAIL:-10}"
+# Every Nth wake, spontaneous or reactive, belongs to explore or make, whatever
+# the queue says. Deferred asks sort first and arrive faster than they are
+# answered, so without a reserved turn the curiosity functions never fired (0 of
+# 42 wakes on 2026-09-09); counting spontaneous wakes only was not enough either,
+# because a busy mind wakes reactively every time it closes a goal (Hal, same
+# evening: count every wake). 0 disables.
+MONOLITH_CURIOSITY_EVERY="${MONOLITH_CURIOSITY_EVERY:-4}"
 
 run_dir="$IDENTITY_DIR/workdir"
 mkdir -p "$run_dir"
@@ -88,7 +97,13 @@ ticks_at_level=0
 wakes_since_share_hint=0
 related_prev=""
 goal_review_at=0
+square_nudge_at=0
+wakes_since_curiosity=0
 if [[ -f "$state_file" ]]; then
+    square_nudge_at=$(jq -r '.square_nudge_at // 0' "$state_file" 2>/dev/null) || square_nudge_at=0
+    [[ "$square_nudge_at" =~ ^[0-9]+$ ]] || square_nudge_at=0
+    wakes_since_curiosity=$(jq -r '.wakes_since_curiosity // 0' "$state_file" 2>/dev/null) || wakes_since_curiosity=0
+    [[ "$wakes_since_curiosity" =~ ^[0-9]+$ ]] || wakes_since_curiosity=0
     related_prev=$(jq -r '(.related_prev // []) | .[]' "$state_file" 2>/dev/null) || related_prev=""
     goal_review_at=$(jq -r '.goal_review_at // 0' "$state_file" 2>/dev/null) || goal_review_at=0
     [[ "$goal_review_at" =~ ^[0-9]+$ ]] || goal_review_at=0
@@ -104,9 +119,11 @@ _save_state() {
     local tmp
     tmp=$(mktemp) || return 0
     if jq -nc --argjson l "$level" --argjson t "$ticks_at_level" \
-        --argjson w "$wakes_since_share_hint" --argjson g "$goal_review_at" \
+        --argjson w "$wakes_since_share_hint" --argjson g "$goal_review_at" --argjson q "${square_nudge_at:-0}" \
+        --argjson c "${wakes_since_curiosity:-0}" \
         --arg rp "${related_shown:-}" \
-        '{level:$l, ticks_at_level:$t, wakes_since_share_hint:$w, goal_review_at:$g,
+        '{level:$l, ticks_at_level:$t, wakes_since_share_hint:$w, goal_review_at:$g, square_nudge_at:$q,
+          wakes_since_curiosity:$c,
           related_prev: ($rp | split("\n") | map(select(. != "")))}' > "$tmp" 2>/dev/null; then
         mv "$tmp" "$state_file"
     else
@@ -201,41 +218,60 @@ if [[ $(printf '%s\n' "$last_three" | jq -r '.type' 2>/dev/null | sort -u | tr '
     hints="${hints}- The last few steps are all thoughts — the stream may be circling; consider acting, recalling, or advancing decisively.
 "
 fi
-# Pending requests from the responder (design/conversation_memory.md, part 5):
-# the responder told someone "let me look into that" and appended an `action`
-# (source responder, trigger_step = their message) describing the work. It is
-# pending until an observation carries resolves=<that trigger_step>. `chat
-# pending` reads the deferrals index over the whole trajectory, so a request
-# stays visible however many steps or newer requests pile on top of it (the
-# old recent-stream scan showed only the newest one, inside a 20-step window:
-# on 2026-09-02 a request was masked by a newer one, then aged out unseen).
-# Every open request is listed, oldest first, with its age; past
-# PENDING_OVERDUE_S (4h) the hint says so. The hint gives the exact delivery
-# command so the reply lands on the right message. The wording is a strong
-# preference with a stated escape hatch, not an order: on 2026-09-03 two
-# timer wakes in a row read the hint and filed research notes instead,
-# under Audel's own "timer wakeups are for inner life" rule, and said
-# nothing about why. A declined request must now leave a thought behind.
-PENDING_MAX_AGE="${MONOLITH_PENDING_MAX_AGE:-14d}"
-PENDING_OVERDUE_S="${MONOLITH_PENDING_OVERDUE_S:-14400}"
-PENDING_LIST_MAX="${MONOLITH_PENDING_LIST_MAX:-5}"
-pending_req=""
-if command -v chat >/dev/null 2>&1; then
-    pending_req=$(chat pending --json --max-age "$PENDING_MAX_AGE" 2>/dev/null | jq -r \
-        --argjson overdue "$PENDING_OVERDUE_S" --argjson max "$PENDING_LIST_MAX" '
-        def age_text: if . < 3600 then "\(. / 60 | floor) min"
-                      elif . < 86400 then "\(. / 3600 | floor) h"
-                      else "\(. / 86400 | floor) d" end;
-        (length) as $n
-        | .[0:$max]
-        | (.[] | "- PENDING REQUEST from \(.person // "someone"): \(.request)"
-            + " (pending for \(.age_s | age_text)"
-            + (if .age_s > $overdue then ", OVERDUE: deliver what you have, or that it cannot be done, this wake" else "" end)
-            + "). The responder already told them you would get back to them, so they are waiting. Strongly prefer doing this work now (act), timer wake or not, over inner-life work; then deliver the result with exactly: chat reply --follow-up --reply-to \(.trigger_step) \(.person // "<their-name>") \"<result>\"  — and append an observation with --field resolves=\(.trigger_step) so this request stops showing here. If you have a good reason not to this wake, append a thought saying why and what would unblock it."),
-          (if $n > $max then "- \($n - $max) more pending requests: run `chat pending` to see them all." else empty end)' 2>/dev/null) || pending_req=""
-fi
+# Outstanding requests are projected from native memory, including captures
+# whose composition failed. No newest-five or fourteen-day disappearance.
+pending_req=$(_prompt_section pending get_pending_requests) || pending_req=""
 [[ -n "$pending_req" ]] && hints="${hints}${pending_req}
 "
+# Seeds: concrete things to explore or make, drawn from what the observer saw
+# and what people shared, so a wake with nothing directed has somewhere to go
+# other than idle. Two kinds, newest first, deduplicated by URL:
+#   - links people sent in the last 48h (Signal, square, chat), with who and when
+#   - the observer's recent findings (feeds, repositories, square changes)
+# An invitation, not an order: the hint says so.
+_seed_lines=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg me "$IDENTITY_NAME" --arg since "$(date -u -d '48 hours ago' +%FT%T 2>/dev/null || date -u -v-48H +%FT%T)" '
+    def age: ((now - ((.ts // "")[0:19] + "Z" | try fromdateiso8601 catch now)) | floor) as $s
+      | if $s < 3600 then "\(($s/60)|floor)m ago" elif $s < 86400 then "\(($s/3600)|floor)h ago" else "\(($s/86400)|floor)d ago" end;
+    def who: (.content | capture("\"speaker\":\"(?<s>[^\"]+)\"").s) // (.from // "someone");
+    fromjson? // empty
+    | select((.ts // "") >= $since)
+    | if .type == "message" and .to == $me and .from != $me then
+        (.content | [scan("https?://[^\\s)\"`>]+")] | .[] | select(test("^https?://(192\\.168\\.|127\\.|localhost)") | not)) as $u
+        | "\($u) — shared by \(who) \(age)"
+      elif .type == "observation" and .source == "custos-observe"
+           and ((.source_url // "") | test("^https?://"))
+           and ((.source_url // "") | test("^https?://(192\\.168\\.|10\\.|127\\.|localhost)") | not) then
+        "\(.source_url) — \(.content | sub("^[^:]*:\\s*"; "") | gsub("\\s+"; " ") | .[0:110])"
+      else empty end' 2>/dev/null | awk '{a[NR]=$0} END{for(i=NR;i>0;i--) print a[i]}' | awk -F' — ' '!seen[$1]++' | head -n 4) || _seed_lines=""
+if [[ -n "$_seed_lines" ]]; then
+    hints="${hints}- Seeds, if nothing above calls to you (pick one; explore it or make something from it):
+$(printf '%s\n' "$_seed_lines" | sed 's/^/    · /')
+"
+fi
+# Square initiation nudge: Custos answers every mention on the square within
+# minutes but had started nothing of its own in its first day back. If no
+# self-initiated square write (a message with no reply_to, or a custos-square
+# post/comment command) appears in the last SQUARE_INITIATE_HOURS, say so once
+# per day. An invitation, like the share hint.
+SQUARE_INITIATE_HOURS="${MONOLITH_SQUARE_INITIATE_HOURS:-24}"
+_now_s=$(date -u +%s)
+if [[ "$SQUARE_INITIATE_HOURS" -gt 0 ]]; then
+    _sq_last=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg me "$IDENTITY_NAME" '
+        fromjson? // empty
+        | select((.type == "message" and .from == $me and ((.to // "") | startswith("square:")) and ((.reply_to // "") == ""))
+                 or (.type == "reasoning" and ((.cmd // "") | test("custos-square (post|comment) "))))
+        | .ts' 2>/dev/null | tail -n 1) || _sq_last=""
+    _sq_age_h=999
+    if [[ -n "$_sq_last" ]]; then
+        _sq_ls=$(date -u -d "${_sq_last%%.*}" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%S" "${_sq_last%%.*}" +%s 2>/dev/null || echo "")
+        [[ -n "$_sq_ls" ]] && _sq_age_h=$(( (_now_s - _sq_ls) / 3600 ))
+    fi
+    if (( _sq_age_h >= SQUARE_INITIATE_HOURS )) && (( _now_s - square_nudge_at >= 86400 )); then
+        square_nudge_at="$_now_s"
+        hints="${hints}- You answer every mention on the square within minutes, but you have not started anything of your own there in ${SQUARE_INITIATE_HOURS}+ hours. If a result, a question, or something you built is worth a post, **share** or **make** it (\`skills show custos-square\`). If nothing is ready, ignore this.
+"
+    fi
+fi
 # Share nudge: outward initiative needs a periodic prompt-side invitation, or
 # restraint rules learned from feedback ratchet the mind into pure listening
 # (observed on Audel 2026-08-21: a self-imposed "last-word-ours -> do not
@@ -243,6 +279,16 @@ fi
 # reactive wakes have their own engagement. The counter resets when the hint
 # fires, not when a message is sent: an invitation every N quiet wakes, never
 # an order.
+curiosity_turn=0
+if [[ "$MONOLITH_CURIOSITY_EVERY" -gt 0 ]]; then
+    wakes_since_curiosity=$(( wakes_since_curiosity + 1 ))
+    if (( wakes_since_curiosity >= MONOLITH_CURIOSITY_EVERY )); then
+        wakes_since_curiosity=0
+        curiosity_turn=1
+        hints="- **This wake is reserved for explore or make** (every ${MONOLITH_CURIOSITY_EVERY}th wake, regardless of the queue or of what woke you). Pick a seed below, a repository you can reach, a thread on the square, a paper from your feeds, or something you want to build or test, and do that. The asks under Active goals will still be there next wake; do not spend this one on them unless one is on fire.
+${hints}"
+    fi
+fi
 if [[ "$SHARE_HINT_EVERY" -gt 0 && "$wake_mode" == "spontaneous" ]]; then
     wakes_since_share_hint=$(( wakes_since_share_hint + 1 ))
     if (( wakes_since_share_hint >= SHARE_HINT_EVERY )); then
@@ -257,7 +303,7 @@ fi
 _now_s=$(date -u +%s)
 if [[ "$GOAL_REVIEW_DAYS" -gt 0 ]] && (( _now_s - goal_review_at >= GOAL_REVIEW_DAYS * 86400 )); then
     goal_review_at="$_now_s"
-    hints="${hints}- GOAL REVIEW (about once a week): read your active goals below and tidy them this wake (goals). Retire what is done or stale with \`mem forget\`, merge duplicates with \`mem edit\`, and give open todos a date with \`mem add --type todo --until YYYY-MM-DD\` so they expire on their own.
+    hints="${hints}- GOAL REVIEW: reconcile accepted commitments and untriaged captures. Directed records use \`custos-memory update/complete\` with provenance and evidence retained; ordinary self-chosen goals use \`mem edit/forget\`. Retire stale obligations rather than adding contradictory ones. Todo expiry is not an action scheduler.
 "
 fi
 # The query for related memories is the wake's own material: the real hints
@@ -314,6 +360,12 @@ fi
 runtime_line=$(_prompt_section runtime _runtime_line) || runtime_line=""
 workspace_section=$(_prompt_section workspace _workspace_section "$run_dir") || workspace_section=""
 
+# A clock signal inside this existing mind; never a second inference worker.
+dream_section=""
+if command -v custos-dream >/dev/null 2>&1; then
+    dream_section=$(custos-dream due) || dream_section="Memory dream schedule check failed; inspect the helper before editing memories."
+fi
+
 route_prompt="<context>
 $system_prompt
 
@@ -326,6 +378,7 @@ $recent_context
 
 ${related_section}Routing signals:
 $hints
+$dream_section
 
 $think_prompt
 </context>
@@ -452,6 +505,16 @@ if [[ "$did_work" -eq 0 ]]; then
              + (if $run_id == "" then {} else {run_id: $run_id} end)' \
             | traj append >/dev/null || true
     fi
+fi
+# Always record launcher termination, including failures after durable work.
+# Missing records (e.g. SIGKILL) remain unclosed, never inferred successful/live.
+terminal_run_id=$(cat "$run_id_file" 2>/dev/null) || terminal_run_id=""
+if [[ -n "$terminal_run_id" ]]; then
+    jq -nc --arg source "$THINKER_NAME" --arg run_id "$terminal_run_id" \
+        --argjson rc "$run_rc" \
+        '{type:"run-end", source:$source, run_id:$run_id, rc:$rc,
+          content:(if $rc == 0 then "monolith run exited successfully" else "monolith run exited with rc=\($rc)" end)}' \
+        | traj append >/dev/null || true
 fi
 rm -f "$run_id_file"
 

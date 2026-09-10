@@ -5,7 +5,7 @@
 #   tests/test_thinkers_wake_at.sh
 #
 # A thinker asks to be woken later by writing a target epoch to
-# run/<name>.wake_at; the dispatcher tick fires a monolith-wake trigger when
+# run/<name>.wake_at; the dispatcher tick fires a <name>-wake trigger when
 # it comes due and consumes the file (design/monolith_backoff.md, Alternative
 # 3). No timer process is involved, so this works the same on macOS, where
 # setsid does not exist. Uses a fake thinker that records its stdin; no LLM
@@ -58,7 +58,7 @@ nap=$(cat "$IDENTITY_DIR/nap" 2>/dev/null || echo 0)
 exit 0
 EOF
     chmod +x "$TMP/id/thinkers/napper/step"
-    printf '{"types":["action","monolith-wake"],"trigger_self":false}\n' > "$TMP/id/thinkers/napper/subscriptions.jsonl"
+    printf '{"types":["action","napper-wake"],"trigger_self":false}\n' > "$TMP/id/thinkers/napper/subscriptions.jsonl"
 }
 
 append_step() {
@@ -89,7 +89,7 @@ wait_for_file_gone() {
 now() { date +%s; }
 
 # ---------------------------------------------------------------------------
-# Test 1: a due wake_at fires exactly one monolith-wake trigger, on stdin,
+# Test 1: a due wake_at fires exactly one <name>-wake trigger, on stdin,
 # and the file is consumed. Nothing lands in the trajectory.
 # ---------------------------------------------------------------------------
 test_due_wake_fires_once() {
@@ -98,10 +98,10 @@ test_due_wake_fires_once() {
 
     printf '%s' "$(( $(now) - 1 ))" > "$RUN/napper.wake_at"
     wait_for_record 1
-    if [[ "$(record_count)" -eq 1 ]] && grep -q '"type":"monolith-wake"' "$TMP/id/record" 2>/dev/null; then
-        ok "due wake_at fires a monolith-wake trigger"
+    if [[ "$(record_count)" -eq 1 ]] && grep -q '"type":"napper-wake"' "$TMP/id/record" 2>/dev/null; then
+        ok "due wake_at fires a <name>-wake trigger"
     else
-        bad "due wake_at fires a monolith-wake trigger" "record: $(cat "$TMP/id/record" 2>/dev/null | tr '\n' ' ')"
+        bad "due wake_at fires a <name>-wake trigger" "record: $(cat "$TMP/id/record" 2>/dev/null | tr '\n' ' ')"
     fi
 
     wait_for_file_gone "$RUN/napper.wake_at" 3
@@ -118,7 +118,7 @@ test_due_wake_fires_once() {
         bad "fires exactly once" "record count: $(record_count)"
     fi
 
-    if ! grep -q 'monolith-wake' "$TMP/id/trajectories/$TRAJ_ID/trajectory.jsonl"; then
+    if ! grep -q 'napper-wake' "$TMP/id/trajectories/$TRAJ_ID/trajectory.jsonl"; then
         ok "no machinery step appended to the trajectory"
     else
         bad "no machinery step appended to the trajectory"
@@ -180,7 +180,7 @@ test_busy_defers() {
 
     printf '0' > "$TMP/id/nap"
     wait_for_record 2 10
-    if [[ "$(record_count)" -eq 2 ]] && tail -1 "$TMP/id/record" | grep -q '"monolith-wake"'; then
+    if [[ "$(record_count)" -eq 2 ]] && tail -1 "$TMP/id/record" | grep -q '"napper-wake"'; then
         ok "deferred wake fires after thinker frees up"
     else
         bad "deferred wake fires after thinker frees up" "record: $(cat "$TMP/id/record" 2>/dev/null | tr '\n' ' ')"
@@ -215,7 +215,7 @@ test_finished_step_reaped() {
 
     printf '%s' "$(( $(now) - 1 ))" > "$RUN/napper.wake_at"
     wait_for_record 2 8
-    if [[ "$(record_count)" -eq 2 ]] && tail -1 "$TMP/id/record" | grep -q '"monolith-wake"'; then
+    if [[ "$(record_count)" -eq 2 ]] && tail -1 "$TMP/id/record" | grep -q '"napper-wake"'; then
         ok "scheduled wake fires after prior child exits"
     else
         bad "scheduled wake fires after prior child exits" "record: $(cat "$TMP/id/record" 2>/dev/null | tr '\n' ' ')"

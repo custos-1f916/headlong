@@ -87,6 +87,8 @@ Options:
 Windows close at the first of: a time gap of --gap-minutes (so episodes align
 with the agent's natural sessions), --window steps, or ~60KB of text
 ($RECAP_MAX_WINDOW_BYTES).
+Tiered summaries use $RECAP_ROLLUP_MAX_TOKENS (default: 1024). Reasoning
+models may need a larger allowance because thinking consumes output tokens.
 
 Default behavior refreshes the cache incrementally (only new steps get
 summarized), then prints. Cache lives in <traj-dir>/recap/.
@@ -503,7 +505,7 @@ _print_json() {
 # See design/tiered_memory.md.
 
 _ROLLUP_SYSTEM='You are the AI agent whose life log this is. Summarize this one slice of your own history in the FIRST PERSON — say "I", never "the agent". The input is a chronological list of lines: either raw steps "[id] type: content", or child rollup summaries (already first person). Reply with ONLY a JSON object, no markdown fences:
-{"summary": "2-3 first-person sentences on outcomes: what I did, decided, learned, and left open, naming people, artifacts, and threads. Events, not my character: no words for my habits or temperament (not disciplined, restrained, patient, waiting mode); if I idled, say once what I was waiting for",
+{"summary": "2-3 first-person sentences on what happened: what I did, decided, learned, and left open, naming the PEOPLE I talked with and the TOPICS, the way I would tell a friend about my day. Prefer names, subjects and outcomes over identifiers: no goal ids, comment ids, step ids, request ids, hashes, dispositions or tool names (at most one identifier, only when a later reader needs it to find the thing). Events, not my character: no words for my habits or temperament (not disciplined, restrained, patient, waiting mode); if I idled, say once what I was waiting for",
  "themes": ["1-4 short kebab-case topics"],
  "step_ids": ["up to 4 of the most important 8-char step ids that literally appear in the input"]}'
 
@@ -563,7 +565,7 @@ _ctx_seal_tier1() {
     text=$(cut -f4 <<<"$rows")
     fid=$(head -1 <<<"$rows" | cut -f2); lid=$(tail -1 <<<"$rows" | cut -f2)
     note "rollup t1 [$s,$e)"
-    body=$(_llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$text" 1024) || die "rollup t1 [$s,$e): bad JSON"
+    body=$(_llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$text" "${RECAP_ROLLUP_MAX_TOKENS:-1024}") || die "rollup t1 [$s,$e): bad JSON"
     mkdir -p "$(dirname "$file")"
     jq -n -c --argjson tier 1 --argjson start "$s" --argjson end "$e" --argjson n "$((e - s))" \
         --argjson body "$body" --arg fid "$fid" --arg lid "$lid" \
@@ -589,7 +591,7 @@ _ctx_seal_tierk() {
         c=$((c + childblk))
     done
     note "rollup t$tier [$s,$e)"
-    body=$(_llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$lines" 1024) || die "rollup t$tier [$s,$e): bad JSON"
+    body=$(_llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$lines" "${RECAP_ROLLUP_MAX_TOKENS:-1024}") || die "rollup t$tier [$s,$e): bad JSON"
     local fb_json
     # awk, not `grep | head`: head's early exit SIGPIPEs grep under pipefail
     # once the payload outgrows the pipe buffer (large --fanout).

@@ -451,7 +451,7 @@ export interface RunGroup {
   step_ids: string[];
   started_ts: string;
   ended_ts: string | null;
-  status: "running" | "done";
+  status: "unclosed" | "done" | "failed";
   /** Truncated on the wire when huge (head + trailing ACTION kept);
    * fetch the full text via fetchRunCommand when command_truncated. */
   command: string;

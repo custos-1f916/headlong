@@ -1231,43 +1231,58 @@ cmd_search() {
         local blob_base
         blob_base="$(dirname "$_sf")"
 
-        # Iterate over each row in the trajectory.
-        while IFS= read -r row; do
-            local step_id
-            step_id=$(printf '%s' "$row" | jq -r '.step_id // empty')
-            [[ -n "$step_id" ]] || continue
-
-            for f in $fields_to_search; do
-                local content=""
-
-                # For stdout/stderr, check if there's a blob and use that for full search.
-                local ref_key="${f}_ref"
-                local ref_val
-                ref_val=$(printf '%s' "$row" | jq -r ".${ref_key} // empty" 2>/dev/null)
-
-                if [[ -n "$ref_val" ]] && [[ -f "$blob_base/$ref_val" ]]; then
-                    content=$(cat "$blob_base/$ref_val")
-                else
-                    content=$(printf '%s' "$row" | jq -r ".${f} // empty")
-                fi
-
-                [[ -n "$content" ]] || continue
-
-                # Search the content.
-                local matches
-                matches=$(printf '%s\n' "$content" | grep "${grep_args[@]}" -- "$pattern" 2>/dev/null || true)
-                [[ -n "$matches" ]] || continue
-
-                # Format output: <traj_hex>:<step>:<field>:<match> or <step>:<field>:<match>
-                while IFS= read -r match_line; do
-                    if [[ "$recursive" -eq 1 ]]; then
-                        printf '%s:%s:%s:%s\n' "$_traj_hex" "$step_id" "$f" "$match_line"
-                    else
-                        printf '%s:%s:%s\n' "$step_id" "$f" "$match_line"
-                    fi
-                done <<< "$matches"
-            done
-        done < "$_sf"
+        # Parse JSON once and run grep once per file. The old loop spawned
+        # roughly fifteen jq/grep processes for every trajectory record.
+        python3 - "$_sf" "$pattern" "$field" "$use_regex" "$case_flag" "$context_lines" "$recursive" "$_traj_hex" <<'PYSEARCH'
+import json,sys,subprocess
+from pathlib import Path
+path,pattern,field,regex,case,context,recursive,trajhex=sys.argv[1:]
+context=int(context); groups=[]; all_lines=[]; offsets=[]; bad=[]
+fields=['content','thought','cmd','stdout','stderr'] if field=='all' else [field]
+with open(path,encoding='utf-8',errors='replace') as source:
+    for number,raw in enumerate(source,1):
+        try: row=json.loads(raw)
+        except ValueError: bad.append(number);continue
+        if not isinstance(row,dict) or not row.get('step_id'):continue
+        for name in fields:
+            value=row.get(name)
+            ref=row.get(name+'_ref')
+            blob=Path(path).parent/ref if isinstance(ref,str) else None
+            if blob and blob.is_file():value=blob.read_text(encoding='utf-8',errors='replace')
+            if value is None or value is False:continue
+            if not isinstance(value,str):value=json.dumps(value,ensure_ascii=False,indent=2)
+            lines=value.rstrip('\n').split('\n')
+            if lines==['']:continue
+            offsets.append(len(all_lines));groups.append((str(row['step_id']),name,lines));all_lines.extend(lines)
+args=['grep','-a','-n','-E' if regex=='1' else '-F']
+if case:args.append('-i')
+args.extend(['--',pattern])
+result=subprocess.run(args,input=('\n'.join(all_lines)+'\n' if all_lines else ''),text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+if result.returncode not in (0,1):
+    sys.stderr.write(result.stderr);sys.exit(result.returncode)
+hits={int(line.split(':',1)[0])-1 for line in result.stdout.split('\n') if line}
+from bisect import bisect_right
+by_group={}
+for hit in hits:
+    group=bisect_right(offsets,hit)-1
+    by_group.setdefault(group,set()).add(hit-offsets[group])
+try:
+    for index,(step,name,lines) in enumerate(groups):
+        local_hits=by_group.get(index,set())
+        selected=set()
+        for n in local_hits:selected.update(range(max(0,n-context),min(len(lines),n+context+1)))
+        prefix=(trajhex+':' if recursive=='1' else '')+step+':'+name+':'
+        previous=None
+        for n in sorted(selected):
+            if context and previous is not None and n>previous+1:print(prefix+'--')
+            print(prefix+str(n+1)+(':' if n in local_hits else '-')+lines[n]);previous=n
+    sys.stdout.flush()
+except BrokenPipeError:
+    # `traj search ... | head` is normal caller truncation, not a run failure.
+    import os
+    os.dup2(os.open(os.devnull,os.O_WRONLY),sys.stdout.fileno())
+if bad:print('traj search: skipped malformed JSON records in '+path+' at lines '+','.join(map(str,bad)),file=sys.stderr)
+PYSEARCH
     done <<< "$_search_files"
 }
 

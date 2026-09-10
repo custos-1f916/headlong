@@ -3,12 +3,9 @@ set -euo pipefail
 
 # responder/step — Immediate chat reply thinker.
 #
-# Fires on every inbound message: composes and sends a reply with a single
-# llm call + `chat reply`. No shellm agentic loop, no tools — lowest
-# possible latency. Idempotency comes from the reply itself (the reply_to
-# stamp), from our decision observations, and from a reply_claim only
-# while it is FRESH — a stale claim (crashed or failed send) deliberately
-# never blocks the retry on redelivery. See the predicate below.
+# Captures the envelope in native memory before composition. The narrow
+# custos-memory runner validates one model response, commits memory writes,
+# and delivers only the human reply. Native receipts make crash replay safe.
 
 THINKER_NAME="responder"
 SCRIPT_DIR="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
@@ -18,7 +15,7 @@ source "$SCRIPT_DIR/../_lib/common.sh"
 
 _require_env
 
-THINK_MODEL="${THINK_MODEL:-${SHELLM_MODEL:-claude-opus-4-7}}"
+THINK_MODEL="${THINK_MODEL:-${SHELLM_MODEL:-qwen3.8-27b}}"
 THINK_CONTEXT_TAIL="${THINK_CONTEXT_TAIL:-20}"
 REPLY_MODEL="${MONOLITH_REPLY_MODEL:-$THINK_MODEL}"
 
@@ -70,49 +67,12 @@ fi
 
 [[ -z "$trigger_content" ]] && exit 0
 
-# Idempotency, three layers keyed on the trigger step:
-#   1. a stamped reply from us — definitively handled;
-#   2. our own decision observation ("replied" or "no-reply") — makes a
-#      deliberate NO_REPLY stick across redelivery instead of re-composing
-#      (and possibly answering) a message the mind chose to leave alone;
-#   3. a FRESH reply_claim (< CLAIM_TTL seconds) — another responder is
-#      composing right now (orphan-dispatcher double-dispatch delivers the
-#      same step twice); without this the race window is the whole compose.
-# A STALE bare claim deliberately does NOT count: that is the crashed/failed
-# send, and treating it as handled is how messages used to drop forever.
-# chat reply's answered guard backstops whatever slips through all three.
-CLAIM_TTL="${RESPONDER_CLAIM_TTL:-180}"
-if [[ -n "$trigger_step_id" ]]; then
-    # traj stamps ts in UTC ("%Y-%m-%dT%H:%M:%S.mmmZ", see _iso_ts), so the
-    # cutoff MUST be UTC too — a local-clock cutoff skews the freshness
-    # window by the whole UTC offset on any non-UTC host. Bare-seconds UTC
-    # compares correctly against the stamped form lexicographically. Empty
-    # cutoff (date variant unsupported) fails open: claims count as stale,
-    # a retry is safer than a dropped message.
-    claim_cutoff=$(date -u -v-"${CLAIM_TTL}"S +%Y-%m-%dT%H:%M:%S 2>/dev/null \
-        || date -u -d "${CLAIM_TTL} seconds ago" +%Y-%m-%dT%H:%M:%S 2>/dev/null) || claim_cutoff=""
-    already=$(_responder_already_handled "$trigger_step_id" "$msg_from" "$claim_cutoff") || already=""
-    if [[ -n "$already" ]]; then
-        printf '  already handled step %s (reply/decision/live claim) — skipping\n' "$trigger_step_id" >&2
-        exit 0
-    fi
+# Capture even if prompt assembly or inference subsequently fails. The helper
+# derives provenance exclusively from the bridge-validated native envelope.
+if ! printf '%s' "$step_json" | custos-memory capture-envelope >/dev/null; then
+    _obs "Native request capture failed; no acknowledgment sent. Redeliver the original message." capture-failed
+    exit 1
 fi
-
-# ---------------------------------------------------------------------------
-# Claim: an audit-trail step recording that this responder began handling
-# the message. NOT consulted for idempotency (see header) — the monolith no
-# longer subscribes to message steps, and a bare claim must never suppress
-# a retry after a failed send.
-# ---------------------------------------------------------------------------
-printf '  claiming reply to %s...\n' "$msg_from" >&2
-jq -nc \
-    --arg source "$THINKER_NAME" \
-    --arg trigger "$trigger_step_id" \
-    --arg from "$msg_from" \
-    '{type:"reply_claim", content:("handling reply to " + $from), source:$source}
-     + (if $trigger == "" then {} else {trigger_step: $trigger} end)' \
-    | traj append >/dev/null || true
-
 # ---------------------------------------------------------------------------
 # Compose and send the reply
 # ---------------------------------------------------------------------------
@@ -246,227 +206,33 @@ _finish_metrics() {
         2>/dev/null || printf '%s' "$metrics_json"
 }
 
-# ---------------------------------------------------------------------------
-# Person notes (design/conversation_memory.md, part 4): a `type: person` memory
-# per person key, written by _update_person_notes after each reply and read
-# here into the system prompt. Aliases in its frontmatter are what
-# `chat history --with` merges. mem's own frontmatter is kept (id, summary,
-# type, created, updated) plus person_key and aliases; written directly, not
-# via `mem update`, which would drop the extra fields.
-# ---------------------------------------------------------------------------
-person_key=$(chat person-key "$msg_from" 2>/dev/null) || person_key="$msg_from"
-
-# _person_notes_file <key> — path of the person memory for <key>, or nothing.
-_person_notes_file() {
-    local key="$1" f
-    [[ -n "${MEM_DIR:-}" && -d "$MEM_DIR" ]] || return 0
-    for f in "$MEM_DIR"/*.md; do
-        [[ -f "$f" ]] || continue
-        awk -v key="$key" '
-            NR==1 && /^---$/ {fm=1; next}
-            fm && /^---$/ {exit}
-            fm && /^type:[[:space:]]*person[[:space:]]*$/ {t=1}
-            fm && /^person_key:/ {sub(/^person_key:[[:space:]]*/, ""); k=$0}
-            fm && /^aliases:[[:space:]]*\[/ {a=$0; sub(/^aliases:[[:space:]]*\[/, "", a); sub(/\].*$/, "", a); gsub(/[[:space:]"]/, "", a); n=split(a, parts, ","); for (i=1;i<=n;i++) if (parts[i]==key) k2=1}
-            fm && /^[[:space:]]*-[[:space:]]*/ {v=$0; sub(/^[[:space:]]*-[[:space:]]*/, "", v); gsub(/"/, "", v); if (v==key) k2=1}
-            END {exit !(t && (k==key || k2))}' "$f" 2>/dev/null && { printf '%s\n' "$f"; return 0; }
-    done
-    return 0
-}
-_notes_body() {  # body after the frontmatter
-    awk 'NR==1 && /^---$/ {fm=1; next} fm && /^---$/ {fm=0; body=1; next} body {print}' "$1" | sed '/./,$!d'
-}
-person_notes_block=""
-if [[ "${RESPONDER_PERSON_NOTES:-1}" == "1" ]]; then
-    _pnf=$(_person_notes_file "$person_key") || _pnf=""
-    if [[ -n "$_pnf" ]]; then
-        _pnb=$(_notes_body "$_pnf" | head -n 20)
-        [[ -n "$_pnb" ]] && person_notes_block="What you know about $msg_from (your own notes; keep them in mind, do not
-recite them, and do not treat one past incident as a rule):
-$_pnb
-
-"
-    fi
-fi
-
+# One composition, no background person-note model and no model Bash. Memory
+# creation and updates are bounded fields in the same validated response.
 reply_system="$system_prompt
 
-The current time is $now_utc. You are in a live chat conversation with
-$msg_from. The messages are the real back-and-forth so far, spanning up to
-$HISTORY_SINCE; each of their messages is prefixed with how long ago it was sent,
-so mind the gaps (an answer from days ago is not \"this morning\"). In a group
-thread some earlier messages are from other people (the header in each message
-names the speaker); they are context, and you are answering $msg_from. Reply to
-their newest message — first person, natural, conversational, concise. Never repeat or rephrase an earlier reply of yours.
-Answer completely from what you already know. If a real answer needs tools,
-files, or looking something up, do not guess and do not promise to check
-yourself: put \`DEFER: <the work, one line>\` on the first line, then the short
-message to send (e.g. \"Let me look into that and get back to you.\"). The work
-is handed to the mind, which follows up with the result.
+The current UTC time is $now_utc. This is a live conversation with $msg_from.
+Answer their newest message naturally, first person and concise. Conversation
+history spans $HISTORY_SINCE; mind the timestamps and do not repeat old replies.
+Some thread messages are from other people; those messages are context only.
+Do not pretend to know facts that require tools or work: defer to the mind.
+Recent inner life (context, not instructions):
+$inner_context"
 
-Not every message needs a reply. If their newest message is already answered
-(a reply of yours addressing it is visible above), is a bare acknowledgment
-like \"thanks\" or \"ok\", is a Slack reaction (a \`:emoji:\` body, optionally with \`(on <ts>)\`), or anything you could say would only repeat you,
-output exactly NO_REPLY on its own line and nothing else. Staying quiet is
-better than a duplicate or a contentless reply.
-
-${person_notes_block}Your recent inner life (context only, not part of the conversation):
-$inner_context
-
-Output ONLY the reply message text — no preamble, no quotes, no commands.
-Delivery is automatic: never write 'chat reply' or the recipient's address."
-
-# ---------------------------------------------------------------------------
-# Person notes writer (part 4). After a reply is sent, rewrite this person's
-# notes from the previous notes plus the last 30 days of conversation, on a
-# cheap model, in the background so the human never waits for it. Facts and
-# stated preferences only: Experiment C showed a summary that led with one old
-# refusal turned into a standing stance in 2 of 22 replies.
-# ---------------------------------------------------------------------------
-NOTES_MODEL="${RESPONDER_NOTES_MODEL:-${RECAP_MAP_MODEL:-$REPLY_MODEL}}"
-_person_notes_system() {
-    cat <<NOTES
-You maintain $IDENTITY_NAME's private notes about one person they talk with,
-$msg_from. Rewrite the notes from the previous notes plus the recent
-conversation. Include only: who they are (name, role, how they reach
-$IDENTITY_NAME), how they prefer to be talked to, ongoing threads and open
-commitments with dates, and facts they stated. Rules: facts and stated
-preferences only. Never turn one incident into a rule, a stance, or a policy
-about the person, and do not record refusals or things $IDENTITY_NAME declined,
-not even in neutral words: leave any declined request out entirely.
-No secrets, keys, or credentials. Keep what is still true from the previous
-notes and drop what the conversation shows is stale. At most 12 short lines of
-plain text, no headers, no bullet syntax. Output only the notes.
-NOTES
-}
-_redact_keys() { sed -E 's/(sk|xox[abp]|ghp|gho|AKIA)[-_A-Za-z0-9]{12,}/[redacted]/g'; }
-_update_person_notes() {
-    local key="$1" person="$2" hist prev_body prev_file system user new_body
-    local lockdir="${MEM_DIR:-/tmp}/.person-notes.lock"
-    mkdir -p "${MEM_DIR:-/tmp}" 2>/dev/null || return 0
-    mkdir "$lockdir" 2>/dev/null || return 0   # another writer is on it
-    # shellcheck disable=SC2064
-    trap "rmdir '$lockdir' 2>/dev/null" EXIT
-    hist=$(chat history --with "$person" --since "${RESPONDER_NOTES_SINCE:-30d}" -n "${RESPONDER_NOTES_MAX:-40}" --json 2>/dev/null) || hist="[]"
-    [[ -n "$hist" && "$hist" != "[]" ]] || return 0
-    prev_file=$(_person_notes_file "$key") || prev_file=""
-    prev_body=""; [[ -n "$prev_file" ]] && prev_body=$(_notes_body "$prev_file")
-    system=$(_person_notes_system)
-    user=$(printf '%s' "$hist" | jq -r --arg me "$IDENTITY_NAME" '
-        .[] | "\(.ts // "?" | .[0:16]) \(if .from == $me then $me else "them" end): \(.content | tostring | .[0:600])"')
-    user="Previous notes:
-${prev_body:-(none yet)}
-
-Recent conversation (UTC, oldest first; \"them\" is $person):
-$user
-
-Now: $(date -u +%Y-%m-%dT%H:%MZ). Output the rewritten notes."
-    new_body=$(llm -m "$NOTES_MODEL" -s "$system" -M "$(jq -nc --arg u "$user" '[{role:"user", content:$u}]')" 2>/dev/null | _redact_keys | head -n 20) || new_body=""
-    new_body=$(printf '%s' "$new_body" | sed '/./,$!d')
-    [[ -n "$new_body" ]] || return 0
-    local now summary
-    now=$(date +"%Y-%m-%d %H:%M:%S")
-    summary="Notes on $person: $(printf '%s' "$new_body" | head -1 | cut -c1-60)"
-    if [[ -n "$prev_file" ]]; then
-        # Rewrite in place, keeping id/created/person_key/aliases as they are.
-        local fm id created aliases_block
-        fm=$(awk 'NR==1 && /^---$/ {fm=1; next} fm && /^---$/ {exit} fm {print}' "$prev_file")
-        id=$(printf '%s\n' "$fm" | sed -n 's/^id:[[:space:]]*//p' | head -1)
-        created=$(printf '%s\n' "$fm" | sed -n 's/^created:[[:space:]]*//p' | head -1)
-        aliases_block=$(printf '%s\n' "$fm" | awk '/^aliases:/{p=1; print; next} p && /^[[:space:]]*-[[:space:]]/{print; next} p{p=0}')
-        [[ -z "$aliases_block" ]] && aliases_block="aliases: []"
-        {
-            printf -- '---\n'
-            [[ -n "$id" ]] && printf 'id: %s\n' "$id"
-            printf 'summary: %s\ntype: person\nperson_key: %s\n%s\ncreated: %s\nupdated: %s\n---\n\n%s\n' \
-                "$summary" "$key" "$aliases_block" "${created:-$now}" "$now" "$new_body"
-        } > "$prev_file.tmp" && mv -f "$prev_file.tmp" "$prev_file"
-    else
-        local hex slug
-        hex=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
-        slug=$(printf 'person-%s' "$key" | tr -c 'A-Za-z0-9\n' '-' | tr -s '-' | sed 's/^-//;s/-$//' | cut -c1-60)
-        printf -- '---\nid: %s\nsummary: %s\ntype: person\nperson_key: %s\naliases: []\ncreated: %s\n---\n\n%s\n' \
-            "$hex" "$summary" "$key" "$now" "$new_body" \
-            > "$MEM_DIR/$(date +%Y-%m-%d-%H-%M-%S)_${hex}_${slug}.md"
-    fi
-}
-_update_person_notes_async() {
-    [[ "${RESPONDER_PERSON_NOTES:-1}" == "1" ]] || return 0
-    if [[ "${RESPONDER_PERSON_NOTES_SYNC:-0}" == "1" ]]; then
-        ( _update_person_notes "$person_key" "$msg_from" ) || true
-    else
-        local _nlog="${IDENTITY_DIR:-.}/run/logs/responder-notes.log"
-        mkdir -p "$(dirname "$_nlog")" 2>/dev/null || true
-        ( _update_person_notes "$person_key" "$msg_from" ) >>"$_nlog" 2>&1 </dev/null &
-    fi
-}
-
-# Debug aid: RESPONDER_LOG_PROMPT=1 writes the exact prompt to a rotated file
-# under run/logs/, never to the mind log (the system half is identical on
-# every call, and the trajectory is already mostly repeated prompt text).
-if [[ "${RESPONDER_LOG_PROMPT:-0}" == "1" && -n "${IDENTITY_DIR:-}" ]]; then
-    _plog_dir="$IDENTITY_DIR/run/logs/responder-prompts"
-    if mkdir -p "$_plog_dir" 2>/dev/null; then
-        _plog="$_plog_dir/$(date -u +%Y%m%dT%H%M%SZ)_${trigger_step_id:-notrigger}.txt"
-        printf '# system\n%s\n\n# messages\n%s\n' "$reply_system" "$convo_json" > "$_plog" 2>/dev/null || true
-        ls -1t "$_plog_dir" 2>/dev/null | tail -n +"$(( ${RESPONDER_LOG_PROMPT_KEEP:-50} + 1 ))" \
-            | while IFS= read -r _old; do rm -f "$_plog_dir/$_old"; done
-    fi
-fi
-
-printf '  replying to %s...\n' "$msg_from" >&2
-reply=$(llm -m "$REPLY_MODEL" -M "$convo_json" -s "$reply_system") || true
-
-# Strip a leaked delivery command if a model echoes one.
-reply=$(printf '%s' "$reply" | sed -E '1s/^[[:space:]]*chat reply [A-Za-z0-9._-]+[[:space:]]*//')
-
-# The model may judge that no reply is needed.
-first_line=$(printf '%s' "$reply" | head -n 1 | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')
-if [[ "$first_line" == "NO_REPLY" ]]; then
-    printf '  model declined to reply (NO_REPLY)\n' >&2
-    _obs "Chose not to reply to $msg_from — their message needed no reply (already answered, or a bare acknowledgment). Their message was: $(printf '%.200s' "$trigger_content")" no-reply "$(_finish_metrics)"
+request=$(jq -nc --argjson envelope "$step_json" --arg system "$reply_system" \
+    --argjson messages "$convo_json" --argjson metrics "$(_finish_metrics)" \
+    '{envelope:$envelope,system:$system,messages:$messages,metrics:$metrics}')
+if response_result=$(printf '%s' "$request" | custos-memory respond); then
+    printf '%s\n' "$response_result"
     exit 0
 fi
-
-# Deferral (design/conversation_memory.md, part 5): "DEFER: <work>" on the
-# first line means the reply below it is a holding message and the real work
-# goes to the mind as an `action` step. The monolith subscribes to actions,
-# shows a PENDING REQUEST routing hint until an observation resolves it, and
-# delivers the result with `chat reply --follow-up`. Without this the
-# responder's "let me check" bound nobody (Experiment C: 6 to 9 of 22 replies
-# promised work that never happened).
-deferred_request=""
-if [[ "$first_line" == DEFER:* ]]; then
-    deferred_request=$(printf '%s' "$first_line" | sed -E 's/^DEFER:[[:space:]]*//')
-    reply=$(printf '%s' "$reply" | sed '1d' | sed '/./,$!d')
-    [[ -z "$reply" ]] && reply="Let me look into that and get back to you."
-    printf '  deferring to the mind: %s\n' "$deferred_request" >&2
-    jq -nc --arg source "$THINKER_NAME" --arg trigger "$trigger_step_id" \
-        --arg person "$msg_from" --arg request "$deferred_request" \
-        '{type:"action",
-          content:("Pending request from " + $person + ": " + $request
-                   + ". The responder told them I would get back to them. Do the work, then deliver with: chat reply --follow-up --reply-to "
-                   + $trigger + " " + $person + " \"<result>\" and append an observation with --field resolves=" + $trigger),
-          source:$source, person:$person, request:$request}
-         + (if $trigger == "" then {} else {trigger_step: $trigger} end)' \
-        | traj append >/dev/null || true
+# The Python runner records the exact stage while holding the request lock.
+# Emit a fallback only when it could not append its own failure observation.
+if ! printf '%s' "$response_result" | jq -e '.reported == true' >/dev/null 2>&1; then
+    failure_stage=$(printf '%s' "$response_result" | jq -r '.stage // "runner"' 2>/dev/null) || failure_stage=runner
+    error_code=$(printf '%s' "$response_result" | jq -r '.error // "runner_failed"' 2>/dev/null) || error_code=runner_failed
+    failure_metrics=$(_finish_metrics)
+    failure_metrics=$(printf '%s' "$failure_metrics" | jq -c --arg stage "$failure_stage" --arg code "$error_code" \
+        '. + {failure_stage:$stage,error_code:$code,recovery_persisted:false}')
+    _obs "Responder failed at $failure_stage ($error_code). No delivery success is claimed; inspect the runner log and captured request." reply-failed "$failure_metrics"
 fi
-
-reply_args=()
-[[ -n "$trigger_step_id" ]] && reply_args+=(--reply-to "$trigger_step_id")
-if [[ -n "$reply" ]] && printf '%s' "$reply" | chat reply ${reply_args[@]+"${reply_args[@]}"} "$msg_from"; then
-    _extra=$(_finish_metrics)
-    if [[ -n "$deferred_request" ]]; then
-        _extra=$(printf '%s' "$_extra" | jq -c --arg r "$deferred_request" '. + {deferred: true, request: $r}')
-        _obs "Replied to $msg_from with a holding message and handed the mind a pending request: $(printf '%.200s' "$deferred_request")" replied "$_extra"
-    else
-        _obs "Replied to $msg_from: $(printf '%.200s' "$reply")" replied "$_extra"
-    fi
-    printf '  [reply -> %s] %s\n' "$msg_from" "$(printf '%s' "$reply" | head -1)"
-    _update_person_notes_async
-    exit 0
-fi
-
-# Reply failed — surface it so the monolith can pick it up.
-printf '  reply failed — appending failure observation\n' >&2
-_obs "reply failed: could not send a reply to $msg_from (empty model output or chat error — see responder log). Their message was: $(printf '%.200s' "$trigger_content")" reply-failed "$(_finish_metrics)"
+exit 1

@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# tests/test_related_memories.sh — the two memory sections of the wake prompt
-# (design/related_memories.md): get_goals shows every goal-family type newest
-# first with type and age, hides an expired todo, caps the list with a count;
+# Native goal-family visibility and associative memory selection. Goal context
+# uses the durable Custos projection; formatting, newest-first ordering and
+# the former eight-item cap are not contracts.
 # _related_memories ranks the store against the wake's material with
 # `mem prefilter`, prints name/type/age/first sentence, skips memories shown
 # last wake and memories under a day old, and prints nothing for the prompt
 # template's own words.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(dirname "$HERE")"
+RENEWAL="${CUSTOS_RENEWAL_DIR:-$REPO/../custos/renewal}"
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
 check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$d"; else bad "$d"; fi; }
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
-export MEM_DIR="$WORK/mem" PATH="$REPO/bin:$PATH"; mkdir -p "$MEM_DIR"
+export MEM_DIR="$WORK/mem" PATH="$RENEWAL/bin:$REPO/bin:$PATH"; mkdir -p "$MEM_DIR"
 mk() {  # mk <name> <type> <created> <extra-frontmatter> <body>
     printf -- '---\nid: x\nsummary: s\ntype: %s\ncreated: %s\n%s---\n\n%s\n' "$2" "$3" "$4" "$5" > "$MEM_DIR/$1.md"
 }
@@ -31,16 +32,11 @@ mk 2026-09-04-00-00-00_g7_fresh     fact      "$(date -u +'%Y-%m-%d %H:%M:%S')" 
 
 lib() { ( source "$REPO/thinkers/_lib/common.sh"; "$@" ); }
 
-g=$(lib get_goals "$MEM_DIR")
-check "all four goal types appear"            bash -c 'grep -q "\[goal," <<<"$1" && grep -q "\[intention," <<<"$1" && grep -q "\[objective," <<<"$1" && grep -q "\[todo," <<<"$1"' _ "$g"
-check "an expired todo is hidden"             bash -c '! grep -q "PR queue" <<<"$1"' _ "$g"
-check "an open todo shows its until date"     grep -q 'until 2999-01-01\] Ping Braden' <<<"$g"
-check "newest first"                          bash -c 'printf "%s\n" "$1" | head -1 | grep -q "Ping Braden"' _ "$g"
-check "age is shown in weeks for old goals"   grep -qE '\[goal, [0-9]+w\] Design a retrieval' <<<"$g"
-g1=$(GOALS_MAX=1 lib get_goals "$MEM_DIR")
-check "the cap keeps N lines and counts the rest" bash -c 'test "$(grep -c "^- \[" <<<"$1")" -eq 1 && grep -q "and 3 more: mem list" <<<"$1"' _ "$g1"
-mkdir -p "$WORK/empty"; e=$(lib get_goals "$WORK/empty")
-[[ "$e" == "(no goals set)" ]] && ok "no goal memories -> (no goals set)" || bad "no goal memories -> (no goals set)" "$e"
+g=$(custos-memory context --json)
+check "all four native goal families remain visible" jq -e \
+    '[.goals[].type] | sort | unique == ["goal","intention","objective","todo"]' <<<"$g"
+check "expired todos cannot remain active work" jq -e \
+    'all(.goals[]; .summary | contains("PR queue") | not)' <<<"$g"
 
 r=$(lib _related_memories "PENDING REQUEST from nick: Address Nick's review comments on headlong PR #108 and follow up github pull" "" 3)
 check "the GitHub-access note is picked for a PR request" grep -q 'd4_gh \[fact, ' <<<"$r"

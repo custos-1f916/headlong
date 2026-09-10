@@ -248,11 +248,11 @@ def btrunc_tail($n):
 def truncate_field($limit; $sid):
   utf8bytelength as $vb |
   if $vb <= $limit then .
-  elif $limit <= 1 then "[... truncated: \($vb) bytes total. read with: traj show \($sid) --full]"
+  elif $limit <= 1 then "[... truncated: \($vb) bytes. Slice it: traj show \($sid) --full | sed -n 1,80p (a whole re-read is cut again)]"
   else
     ([($limit / 2 | floor), 1] | max) as $half |
     ((btrunc_head($half) | rtrim)
-     + "\n[... truncated: \($vb) bytes total. read with: traj show \($sid) --full]\n"
+     + "\n[... truncated: \($vb) bytes. Slice it: traj show \($sid) --full | sed -n 1,80p (a whole re-read is cut again)]\n"
      + (btrunc_tail($half) | rtrim))
   end;
 
@@ -574,8 +574,8 @@ while [[ "$lo" -le "$hi" ]]; do
 done
 
 if [[ "$best_bytes" -gt "$CTX_MAX_BYTES" ]]; then
-    printf '%s' "$best_result" | head -c "$CTX_MAX_BYTES"
-    printf '[budget exceeded: trajectory too dense]' >&2
+    printf 'context: full instructions and structural context exceed --max-bytes; no partial JSON emitted\n' >&2
+    exit 1
 else
     printf '%s' "$best_result"
 fi

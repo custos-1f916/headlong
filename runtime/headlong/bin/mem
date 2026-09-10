@@ -55,6 +55,16 @@ slugify() {
         | cut -c1-80
 }
 
+# Truncate characters, never UTF-8 bytes. Drain the input so a long body cannot
+# SIGPIPE its writer after we have read the first line.
+memory_summary() {
+    python3 -c 'import sys
+first = sys.stdin.buffer.readline()
+while sys.stdin.buffer.read(65536):
+    pass
+sys.stdout.buffer.write(first.rstrip(b"\r\n").decode("utf-8")[:80].encode("utf-8"))'
+}
+
 # Extract a field from YAML frontmatter.
 # Usage: frontmatter_field <file> <field>
 frontmatter_field() {
@@ -129,7 +139,7 @@ action_add() {
     hex=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
     slug=$(slugify "$text")
     filename="${timestamp}_${hex}_${slug}"
-    summary=$(printf '%s' "$text" | head -1 | cut -c1-80)
+    summary=$(printf '%s' "$text" | memory_summary)
     created=$(date +"%Y-%m-%d %H:%M:%S")
 
     cat > "$MEM_DIR/${filename}.md" << EOF
@@ -198,7 +208,7 @@ action_prefilter() {
     mem_prefilter "$query" "$top"
 }
 
-action_search() {
+action_search() (
     local query="$1"
 
     local count
@@ -215,14 +225,35 @@ action_search() {
     candidates=$(mem_prefilter "$query" "$top")
     [[ -n "$candidates" ]] || candidates=$(ls -1 "$MEM_DIR"/*.md | tail -n "$top")
 
-    local memories="" f
-    while IFS= read -r f; do
-        [[ -f "$f" ]] || continue
-        memories+="=== $(basename "$f") ===
-$(cat "$f")
-
-"
-    done <<< "$candidates"
+    local memories
+    memories=$(MEM_SEARCH_CANDIDATES="$candidates" python3 - "${MEM_SEARCH_MAX_BYTES:-65536}" <<'PYMEM'
+import json,os,sys
+from pathlib import Path
+limit=int(sys.argv[1])
+if limit<1024:raise SystemExit('MEM_SEARCH_MAX_BYTES must be at least 1024')
+parts=[];used=0;omitted=0;excerpts=0
+size=lambda s:len(json.dumps(s,ensure_ascii=False).encode('utf-8'))
+for name in os.environ['MEM_SEARCH_CANDIDATES'].splitlines():
+    p=Path(name)
+    if not p.is_file():continue
+    body=p.read_text(encoding='utf-8',errors='replace')
+    header='=== '+p.name+' ===\n'
+    text=header+body+'\n\n';cost=size(text)
+    if used+cost>limit:
+        if parts:omitted+=1;continue
+        suffix='\n[EXCERPT: remaining file was not searched; use mem show for the full memory.]\n\n'
+        lo,hi=0,len(body)
+        while lo<hi:
+            mid=(lo+hi+1)//2
+            if size(header+body[:mid]+suffix)<=limit:lo=mid
+            else:hi=mid-1
+        text=header+body[:lo]+suffix;cost=size(text);excerpts+=1
+    parts.append(text);used+=cost
+if omitted or excerpts:
+    print('mem search: bounded candidate coverage: %d included, %d omitted, %d excerpted; no-match is not an exhaustive search.'%(len(parts),omitted,excerpts),file=sys.stderr)
+print(''.join(parts),end='')
+PYMEM
+    )
 
     # Stage 2: the model ranks the candidates. Utility call: use the cheap
     # model class when one is configured. A reasoning model spends output
@@ -234,15 +265,33 @@ $(cat "$f")
     # before its first visible token (glm 5.3 flash: 31s on the box,
     # 2026-09-03). MEM_SEARCH_HEARTBEAT_S=0 disables it.
     local hb="${MEM_SEARCH_HEARTBEAT_S:-10}" _hb_pid=""
-    [[ "$hb" != 0 ]] && { ( while :; do sleep "$hb"; printf 'mem search: waiting for the model...\n' >&2; done ) & _hb_pid=$!; }
+    local search_pid="${BASHPID:-$$}"
+    # Isolate traps from callers and clean up on model failure or cancellation.
+    # The heartbeat must never own the search result pipe: a failed llm used
+    # to leave it alive forever, keeping `mem search | head` open.
+    trap 'if [[ -n "$_hb_pid" ]]; then kill "$_hb_pid" 2>/dev/null || true; wait "$_hb_pid" 2>/dev/null || true; fi' EXIT
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
+    if [[ "$hb" != 0 ]]; then
+        (
+            sleeper=""
+            trap '[[ -z "$sleeper" ]] || kill "$sleeper" 2>/dev/null || true; exit 0' TERM INT
+            while kill -0 "$search_pid" 2>/dev/null; do
+                sleep "$hb" & sleeper=$!
+                wait "$sleeper" || exit 0
+                kill -0 "$search_pid" 2>/dev/null || exit 0
+                printf 'mem search: waiting for the model...\n' >&2
+            done
+        ) >/dev/null &
+        _hb_pid=$!
+    fi
+    local rc=0
     # shellcheck disable=SC2086
     printf 'Search these memories for: %s\n\n%s' "$query" "$memories" | \
         llm ${SHELLM_FAST_MODEL:+-m "$SHELLM_FAST_MODEL"} -t "${MEM_SEARCH_MAX_TOKENS:-16000}" \
-            -s "You are a semantic search engine for memory files. Each memory has a filename header (=== filename ===), YAML frontmatter (summary, type), and a body. Return ONLY the filenames and summaries of semantically matching memories, one per line. If nothing matches, say 'No matches found.'"
-    local rc=$?
-    if [[ -n "$_hb_pid" ]]; then kill "$_hb_pid" 2>/dev/null || true; wait "$_hb_pid" 2>/dev/null || true; fi
-    return "$rc"
-}
+            -s "You are a semantic search engine for memory files. Each memory has a filename header (=== filename ===), YAML frontmatter (summary, type), and a body. Return ONLY the filenames and summaries of semantically matching memories, one per line. If nothing matches, say 'No matches found.'" || rc=$?
+    exit "$rc"
+)
 
 action_list() {
     local limit=0 short=0 filter_type="" filter_before="" filter_after=""
@@ -343,6 +392,30 @@ action_forget() {
     echo "Forgotten: $(basename "$file" .md)" >&2
 }
 
+# mem done <id> [reason] — retire a self-chosen goal/objective/todo/intention in
+# one step: the body gains a dated DONE line and the frontmatter type becomes
+# `memory`, which is what actually takes it out of the active-goal count. A
+# body that merely says "DONE" while the type stays `goal` keeps counting (two
+# such records on Custos, 2026-09-09).
+action_done() {
+    local name="$1"; shift
+    local file
+    file=$(find_memory "$name")
+    local type
+    type=$(frontmatter_field "$file" "type")
+    case "$type" in
+        goal|objective|todo|intention) ;;
+        *) die "mem done: $(basename "$file" .md) is type '$type', not an active goal type (goal|objective|todo|intention)" ;;
+    esac
+    local reason="$*"
+    [[ -n "$reason" ]] || reason="done"
+    local body
+    body=$(sed '1,/^---$/{/^---$/!d;};1d' "$file" | sed '1{/^---$/d;}')
+    body=$(printf '%s\n\nDONE %s: %s' "$body" "$(date +"%Y-%m-%d %H:%M")" "$reason")
+    MEM_DONE_TYPE=memory action_edit "$(basename "$file" .md)" "$body"
+    echo "Retired ($type -> memory): $(basename "$file" .md)" >&2
+}
+
 action_edit() {
     local name="$1"; shift
     local file
@@ -370,8 +443,9 @@ action_edit() {
     # edit: a todo shortlist that is appended to during the day must still
     # expire that night.
     local summary type created id until
-    summary=$(printf '%s' "$text" | head -1 | head -c 80)
+    summary=$(printf '%s' "$text" | memory_summary)
     type=$(frontmatter_field "$file" "type")
+    [[ -n "${MEM_DONE_TYPE:-}" ]] && type="$MEM_DONE_TYPE"   # set only by action_done
     created=$(frontmatter_field "$file" "created")
     id=$(frontmatter_field "$file" "id")
     until=$(frontmatter_field "$file" "until")
@@ -454,6 +528,7 @@ Usage:
   mem types                      List memory types with counts
   mem show <id>                  Show a memory's full contents
   mem forget <id>                Delete a memory by hex ID
+  mem done <id> [reason]         Retire a goal/objective/todo: dated DONE line, type -> memory
   mem edit <id> [--slug SLUG] <text>  Update body (or pipe via stdin)
 
 List options:
@@ -474,6 +549,7 @@ Options:
 Environment:
   MEM_DIR   Override memory directory (default: ./.memories)
   MEM_SEARCH_TOP         Candidates the keyword prefilter sends the model (40)
+  MEM_SEARCH_MAX_BYTES   Encoded candidate budget (65536); omissions/excerpts are reported
   MEM_SEARCH_MAX_TOKENS  Output cap for the search call (16000; a reasoning
                          model thinks against it, so keep it roomy)
   MEM_SEARCH_HEARTBEAT_S Seconds between "waiting" lines on stderr while the
@@ -516,6 +592,18 @@ main() {
     local cmd="${1:-}"
     [[ -n "$cmd" ]] && shift
 
+    # Serialize native mutations with Custos's CAS reviewer and responder.
+    # Staged writes lock their staging directory, so Store.commit does not
+    # recursively acquire the canonical store lock.
+    case "$cmd" in
+        add|edit|done|forget)
+            mkdir -p "$MEM_DIR"
+            local memory_lock_fd
+            exec {memory_lock_fd}>"$MEM_DIR/.custos-lock-824d80d71985f082a26997a8db88b5d1dd45b777d73585d03d236303e21bde97"
+            flock -x "$memory_lock_fd"
+            ;;
+    esac
+
     case "$cmd" in
         add)
             # Parse --type flag
@@ -529,6 +617,19 @@ main() {
                         MEM_UNTIL="${2:?--until requires YYYY-MM-DD}"
                         [[ "$MEM_UNTIL" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die "--until takes a date, YYYY-MM-DD"
                         shift 2
+                        ;;
+                    -h|--help)
+                        # `mem add --help` used to store a memory whose text was
+                        # "--help" (seven of them on Custos, 2026-09-08).
+                        usage
+                        exit 0
+                        ;;
+                    --)
+                        shift
+                        break
+                        ;;
+                    -*)
+                        die "mem add: unknown option '$1' (use -- before text that starts with a dash)"
                         ;;
                     *)
                         break
@@ -557,6 +658,11 @@ main() {
         forget)
             [[ $# -lt 1 ]] && die "Usage: mem forget <id>"
             action_forget "$1"
+            ;;
+        done)
+            [[ $# -lt 1 ]] && die "Usage: mem done <id> [reason]"
+            local done_name="$1"; shift
+            action_done "$done_name" "$@"
             ;;
         edit)
             [[ $# -lt 1 ]] && die "Usage: mem edit <id> [--slug SLUG] [text]"
