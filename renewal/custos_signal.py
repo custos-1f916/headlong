@@ -23,6 +23,7 @@ from custos_images import MAX_IMAGES, MAX_RAW, MAX_TOTAL_RAW
 
 MAX_FRAME = 12 * 1024 * 1024  # one bounded attachment RPC response
 MAX_TEXT = 12000
+MAX_PEOPLE = 8  # operators + consenting friends/bots; every one is an explicit host-policy entry
 
 
 def encoded(value):
@@ -41,8 +42,8 @@ def load_policy(path):
     if value.get('version') != 1 or not aci(value.get('self_aci')):
         raise ValueError('invalid policy identity')
     people = value.get('people', {})
-    if not isinstance(people, dict) or len(people) > 4:
-        raise ValueError('policy allows Hal, his wife and two friends')
+    if not isinstance(people, dict) or len(people) > MAX_PEOPLE:
+        raise ValueError('policy allows at most %d people: Hal, Dani and a few consenting friends or their bots' % MAX_PEOPLE)
     for key, person in people.items():
         if aci(key) != key or person.get('authority') not in ('operator', 'external'):
             raise ValueError('invalid policy person')
@@ -160,10 +161,16 @@ def allowed(item, policy):
 
 
 def safe_group(group, policy):
-    """Do not send private answers into a group with unapproved/new members."""
+    """Do not send private answers into a group with unapproved/new members.
+
+    Only full members can read a Signal group: invited (pending) and requesting
+    members receive no messages until they join, and joiners get no history.
+    So the roster of *members* is what this checks, live, on every delivery and
+    every send. A pending invitation used to fail this closed too, which let any
+    member switch Custos off by inviting an unresolvable number (2026-09-10: a
+    stale PNI-only invite left behind when Jack's bot joined). Once an invitee
+    accepts they are a member and block until allowlisted."""
     if not group.get('isMember') or group.get('isBlocked'):
-        return False
-    if group.get('pendingMembers') or group.get('requestingMembers'):
         return False
     members = group.get('members', [])
     identities = []

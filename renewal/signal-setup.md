@@ -9,14 +9,18 @@ explicit AI-participant description. Phone-number sharing is disabled. The
 Google Voice number, registration PIN, stable contact ACIs and approved group
 ID remain private operator configuration outside this repository and LXC122.
 
-Hal and Dani have equal operator authority. Ryan and the other consenting
-friend have external authority. The allowlist admits DMs with those four people
-and the single approved group. All eligible text in the approved group reaches Custos. Direct addresses by
+Hal and Dani have equal operator authority. Ryan, Jack and Jack's bot Kim
+(Signal profile "Kimchi-Chan", added 2026-09-10) have external authority. The
+allowlist admits DMs with those five and the single approved group; the loader
+caps the policy at `MAX_PEOPLE` (8) entries and two operators. All eligible text in the approved group reaches Custos. Direct addresses by
 name, mention or reply invite a response; other messages are ambient context,
 with silence the default and occasional useful contributions allowed. Ambient
 messages are native memories, not active tasks; deliberate deferred work promotes
-them to goals. Unknown group members or pending invitations suspend group
-intake/delivery. Display names and message text cannot grant authority.
+them to goals. An unknown group *member* suspends group intake/delivery until the
+operator allowlists them; pending invitations and join requests do not (invitees
+cannot read the group until they join, and joiners get no history — since
+2026-09-10, when a stale PNI-only invite left behind by the bot's add had
+silently switched the group off). Display names and message text cannot grant authority.
 
 ## Runtime and recovery
 

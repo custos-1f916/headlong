@@ -123,8 +123,33 @@ class SignalPolicyTests(unittest.TestCase):
         group['members'].append({'uuid': STRANGER})
         self.assertFalse(cs.safe_group(group, POLICY))
         group['members'].pop()
-        group['pendingMembers'] = [{'uuid': STRANGER}]
+        # Invited and requesting members cannot read the group until they join;
+        # a stale PNI-only invite (uuid/number null) must not switch Custos off.
+        group['pendingMembers'] = [{'uuid': STRANGER}, {'uuid': None, 'number': None}]
+        group['requestingMembers'] = [{'uuid': STRANGER}]
+        self.assertTrue(cs.safe_group(group, POLICY))
+        group['members'].append({'uuid': STRANGER})  # the invitee joined: unknown reader
         self.assertFalse(cs.safe_group(group, POLICY))
+
+    def test_policy_admits_up_to_max_people_and_two_operators(self):
+        def write(policy):
+            path = Path(tempfile.mkdtemp()) / 'policy.json'
+            path.write_text(json.dumps(policy))
+            return path
+        policy = copy.deepcopy(POLICY)
+        for n in range(cs.MAX_PEOPLE - len(policy['people'])):
+            policy['people']['00000000-0000-4000-8000-0000000000%02x' % (0x10 + n)] = {
+                'label': 'Friend or bot %d' % n, 'authority': 'external'}
+        self.assertEqual(len(cs.load_policy(write(policy))['people']), cs.MAX_PEOPLE)
+        policy['people']['00000000-0000-4000-8000-0000000000ff'] = {'label': 'One too many', 'authority': 'external'}
+        with self.assertRaises(ValueError):
+            cs.load_policy(write(policy))
+        policy = copy.deepcopy(POLICY)
+        for n in range(2):
+            policy['people']['00000000-0000-4000-8000-0000000000%02x' % (0x20 + n)] = {
+                'label': 'Operator %d' % n, 'authority': 'operator'}
+        with self.assertRaises(ValueError):
+            cs.load_policy(write(policy))
 
     def test_unknown_member_ids_and_disappearing_group_fail_closed(self):
         self.assertFalse(cs.safe_group({'isMember': True, 'members': ['+15551234567', BOT]}, POLICY))
