@@ -11,7 +11,7 @@ User=root
 EnvironmentFile=/etc/custos-headlong.env
 WorkingDirectory=/opt/custos/work
 PIDFile=/root/.headlong/app/.identities/custos/run/dispatcher.pid
-ExecCondition=/usr/bin/python3 /opt/custos/repo/renewal/mind_enabled.py
+ExecCondition=/usr/bin/python3 /opt/custos/current/renewal/mind_enabled.py
 ExecStart=/bin/bash -c 'source /root/.headlong/app/.identities/custos/activate >/dev/null 2>&1; exec thinkers start monolith responder social'
 # Messages that arrived while the mind was stopped (a maintenance window) are
 # handed back to the responder once the dispatcher is up, oldest first.

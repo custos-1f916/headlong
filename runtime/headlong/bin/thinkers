@@ -237,7 +237,7 @@ _start_dispatcher() {
     mkfifo "$fifo"
 
     # Fresh pending-trigger flags (steps that arrived while a thinker was busy)
-    rm -rf "$run_dir/pending"
+    [[ -f /var/lib/custos/harness-maintenance ]] || rm -rf "$run_dir/pending"
     mkdir -p "$run_dir/pending"
     # Fresh salience-injection dedup log (one feedback nudge per message step)
     rm -f "$run_dir/fb_injected"
@@ -548,6 +548,11 @@ _start_dispatcher() {
         # Launch a thinker's step in the background with the given step JSON
         _dispatch_step() {
             local _dname="$1" _djson="$2"
+            if [[ -f /var/lib/custos/harness-maintenance ]]; then
+                mkdir -p "$run_dir/pending"
+                printf '%s\n' "$_djson" > "$run_dir/pending/${_dname}.maintenance.$(date +%s%N).${RANDOM}"
+                return 0
+            fi
             local _dscript="$THINKERS_DIR/$_dname/step"
             local _dlog="$run_dir/logs/$_dname.log"
             # SHELLM_LAUNCHED_BY lands as launched_by on any shellm-run the
@@ -570,6 +575,7 @@ _start_dispatcher() {
         # wake the moment it ends). At the global concurrency cap, defer to a
         # later tick like _fire_pending does.
         _watchdog_check() {
+            [[ -f /var/lib/custos/harness-maintenance ]] && return 0
             local _c _cname _csecs _l _last _pf _f
             for _c in $_wd_conf; do
                 _cname="${_c%%:*}"
@@ -614,6 +620,7 @@ _start_dispatcher() {
         # literal and fails the -f guard, and a file revisited by the
         # catch-all pass is already fired (rm-ed or its thinker busy again).
         _fire_pending() {
+            [[ -f /var/lib/custos/harness-maintenance ]] && return 0
             local _pfile _pbase _pname _ptype _pjson _pactive
             for _pfile in "$run_dir/pending"/*.message.* \
                           "$run_dir/pending"/*.action.* \
@@ -659,6 +666,7 @@ _start_dispatcher() {
         # on macOS (no setsid) so spontaneity silently died. Generic over any
         # thinker; the monolith is the only current writer.
         _scheduled_wake_check() {
+            [[ -f /var/lib/custos/harness-maintenance ]] && return 0
             local _wf _wname _wat _now
             _now=$(date +%s)
             for _wf in "$run_dir"/*.wake_at; do

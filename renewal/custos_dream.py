@@ -41,7 +41,7 @@ class Dream:
     def __init__(self, store=None, root=None, config=None, clock=None):
         self.store = store or cm.Store()
         self.root = Path(root or self.store.directory.parent / "dream")
-        self.config = dict(DEFAULTS, **(config if config is not None else read_json(Path(__file__).with_name("dream.json"), {})))
+        self.config = dict(DEFAULTS, **(config if config is not None else read_json(Path("/var/lib/custos/config/dream.json") if Path("/var/lib/custos/config/dream.json").exists() else Path(__file__).with_name("dream.json"), {})))
         self.clock = clock or (lambda: dt.datetime.now(UTC))
         self.zone = ZoneInfo(self.config["timezone"])
         self.start = dt.time.fromisoformat(self.config["start"])

@@ -457,6 +457,9 @@ run_response=$(SHELLM_NO_BANNER=1 \
     "${shellm_flags[@]}" \
     --prompt-file "$prompt_file_tmp") || run_rc=$?
 rm -f "$prompt_file_tmp"
+if [[ "$run_rc" -eq 0 && -n "$run_response" ]]; then
+    printf '[harness-health] wake-ok %s\n' "$(date -u +%FT%TZ)" >&2
+fi
 
 after_visible=""
 after_thought=""

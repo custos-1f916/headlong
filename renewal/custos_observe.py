@@ -19,7 +19,9 @@ import xml.etree.ElementTree as ET
 from custos_square import APIError, ORIGIN, STATE, SECRET, Square, Store, allowance_summary, canonical, digest, note_allowance, public_request, square_queue, MAX_AGE_HOURS
 
 BUCKETS = ("replies", "comments_on_your_posts", "mentions_of_you", "in_threads_you_joined")
-CONFIG = Path(__file__).with_name("observations.json")
+CONFIG = Path("/var/lib/custos/config/observations.json")
+if not CONFIG.exists():
+    CONFIG = Path(__file__).with_name("observations.json")
 
 
 def square_sender(author, post, comment=0):

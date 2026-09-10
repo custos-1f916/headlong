@@ -318,7 +318,7 @@ class RPC:
 def transport(args, content=''):
     command = ['/usr/sbin/pct', 'exec', '122', '--', '/bin/bash', '-c',
                'source /root/.headlong/app/.identities/custos/activate >/dev/null 2>&1; '
-               'exec /usr/bin/python3 /opt/custos/repo/renewal/custos_transport.py "$@"',
+               'exec /usr/bin/python3 /opt/custos/current/renewal/custos_transport.py "$@"',
                'custos-signal', *args]
     result = subprocess.run(command, input=content, text=True, capture_output=True,
                             timeout=120 if '--media' in args else 40)

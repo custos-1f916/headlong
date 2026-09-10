@@ -7,8 +7,8 @@ Wants=network-online.target
 Type=simple
 User=root
 EnvironmentFile=/etc/custos-headlong.env
-WorkingDirectory=/opt/custos/repo/renewal
-ExecStart=/usr/bin/node /opt/custos/repo/renewal/relay-bridge.js
+WorkingDirectory=/opt/custos/current/renewal
+ExecStart=/usr/bin/node /opt/custos/current/renewal/relay-bridge.js
 Restart=always
 RestartSec=5
 
