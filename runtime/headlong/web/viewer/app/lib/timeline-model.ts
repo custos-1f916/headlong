@@ -135,10 +135,10 @@ export function buildTimeline(mindlog: Pick<Mindlog, "steps" | "runs">): Timelin
   const laneIds: string[] = [];
   const laneOf = new Map<string, number>();
   const laneFor = (id: string): number => {
-    // Deployment annotations share a lane; keep the original source on each
-    // step/run so its detail view and provenance remain intact.
-    if (id === "operator-harness" || id.startsWith("operator-harness-")) {
-      id = "operator";
+    // Operator annotations share Dispatcher; original step/run provenance
+    // remains available in details. Incoming transport messages use Chat.
+    if (id === "operator" || id.startsWith("operator-")) {
+      id = "dispatcher";
     }
     let idx = laneOf.get(id);
     if (idx === undefined) {
@@ -413,7 +413,7 @@ export function buildTimeline(mindlog: Pick<Mindlog, "steps" | "runs">): Timelin
 
   const lanes: TimelineLane[] = laneIds.map((id) => ({
     id,
-    label: id === "operator" ? "Operator" : id,
+    label: id,
     kind: id === "chat" ? "chat" : id === "shellm" ? "shellm" : "thinker",
   }));
 
