@@ -15,7 +15,10 @@ FRIEND = '00000000-0000-4000-8000-000000000003'
 STRANGER = '00000000-0000-4000-8000-000000000004'
 POLICY = {'version': 1, 'self_aci': BOT, 'people': {
     HAL: {'label': 'Hal', 'authority': 'operator'},
-    FRIEND: {'label': 'Friend', 'authority': 'external'}}, 'groups': ['agreed-group']}
+    FRIEND: {'label': 'Friend', 'authority': 'external'}}, 'groups': ['agreed-group'],
+    # Zero batching windows: these tests exercise delivery itself; batching has its own tests.
+    'batch': {'quiet_seconds': 0, 'max_wait_seconds': 0, 'dm_quiet_seconds': 0, 'dm_max_wait_seconds': 0}}
+WAITING = {'quiet_seconds': 120, 'max_wait_seconds': 300, 'dm_quiet_seconds': 60, 'dm_max_wait_seconds': 180}
 
 
 def envelope(sender=HAL, **changes):
@@ -104,6 +107,38 @@ class SignalPolicyTests(unittest.TestCase):
         base['dataMessage']['quote'] = {'authorUuid': BOT}
         self.assertTrue(cs.classify(base, POLICY)['directed'])
 
+    def test_group_message_addressed_to_another_member_is_not_directed(self):
+        policy = copy.deepcopy(POLICY)
+        kim = '00000000-0000-4000-8000-000000000006'
+        policy['people'][kim] = {'label': 'Kim', 'authority': 'external', 'aliases': ['Kimchi-Chan']}
+
+        def group(text, **changes):
+            return cs.classify(envelope(message=text, groupInfo={'groupId': 'agreed-group'}, **changes), policy)
+        for text in ('What do you think of my buddy Custos, Kim?', 'Kim, meet Custos',
+                     'hey Kimchi-Chan, Custos is the one I told you about',
+                     'Custos is harmless I promise Kim?', 'Kim what do you make of Custos', '@Kim say hi to Custos'):
+            item = group(text)
+            self.assertFalse(item['directed'], text)
+            self.assertEqual(item['addressee_label'], 'Kim', text)
+        self.assertFalse(group('meet Custos', mentions=[{'uuid': kim}])['directed'])  # structured mention of Kim
+        for text in ('Custos, what do you think of Kim?', 'Kim is cool. Custos, agree?',
+                     'my buddy Custos is in the chat', 'Kim is into Custos'):
+            self.assertTrue(group(text)['directed'], text)
+        self.assertTrue(group('Kim, say hi', mentions=[{'uuid': BOT}])['directed'])  # Custos @-mentioned wins
+        self.assertTrue(group('what do you think Custos', quote={'authorUuid': kim})['directed'])
+        self.assertNotIn('addressee', group('Kim is cool'))
+        self.assertTrue(cs.classify(envelope(message='Kim, see this'), policy)['directed'])  # DMs are always to Custos
+        self.assertFalse(cs.classify(envelope(message='chatting with Friend'), POLICY).get('addressee'))
+
+    def test_policy_rejects_malformed_aliases(self):
+        for aliases in ('Kim', ['x'], [1], ['a' * 49], ['k'] * 9):
+            policy = copy.deepcopy(POLICY)
+            policy['people'][HAL]['aliases'] = aliases
+            path = Path(tempfile.mkdtemp()) / 'policy.json'
+            path.write_text(json.dumps(policy))
+            with self.assertRaises(ValueError, msg=repr(aliases)):
+                cs.load_policy(path)
+
     def test_dani_has_same_authority_as_hal(self):
         policy = copy.deepcopy(POLICY)
         dani = '00000000-0000-4000-8000-000000000005'
@@ -173,7 +208,10 @@ class SignalSpoolTests(unittest.TestCase):
             return {'events':[],'trajectory':'one','offset':0}
         with mock.patch.object(cs,'paused',return_value=False),mock.patch.object(cs,'transport',side_effect=transport):
             with self.assertRaises(RuntimeError): bridge.tick()
-            bridge.rpc.call.side_effect=AssertionError('attachment must not be fetched again')
+            def no_refetch(method,params=None):
+                if method=='getAttachment': raise AssertionError('attachment must not be fetched again')
+                return {}
+            bridge.rpc.call.side_effect=no_refetch
             bridge.tick()
         self.assertEqual(calls[0],calls[1])
         self.assertEqual(self.spool.db.execute('SELECT prepared FROM inbox').fetchone()[0],None)
@@ -329,6 +367,241 @@ class SignalSpoolTests(unittest.TestCase):
                 return_value={'events': [], 'trajectory': 'one', 'offset': 50}):
             bridge.tick()
         bridge.rpc.call.assert_not_called()
+
+    def bridge_with_rpc(self, calls):
+        bridge = cs.Bridge(self.policy_path, self.spool, str(self.policy_path)+'.actions.sqlite')
+
+        def call(method, params=None):
+            calls.append((method, params))
+            if method == 'listGroups':
+                return [{'id': 'agreed-group', 'isMember': True, 'members': [{'uuid': BOT}, {'uuid': HAL}]}]
+            return {'timestamp': 88, 'results': [{'type': 'SUCCESS'}]}
+        bridge.rpc = mock.Mock(); bridge.rpc.call.side_effect = call
+        return bridge
+
+    def test_replies_quote_the_original_in_groups_and_for_superseded_dms(self):
+        calls = []; bridge = self.bridge_with_rpc(calls)
+        self.queue()  # Hal's latest DM: a plain reply, no quote
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport',
+                return_value={'events': [], 'trajectory': 'one', 'offset': 50}):
+            bridge.tick()
+        send = [p for m, p in calls if m == 'send'][0]
+        self.assertNotIn('quoteTimestamp', send); self.assertEqual(send['recipient'], [HAL])
+        # A newer DM arrived before the reply went out: quote the one being answered.
+        newer = cs.classify(envelope(message='and another thing', timestamp=123999), POLICY)
+        self.spool.receive(newer)
+        with self.spool.db:
+            self.spool.db.execute("UPDATE inbox SET phase='queued'")
+        self.spool.batch(self.item['route'], {'trajectory': 'one', 'offset': 60, 'events': [
+            {'step_id': 'reply-2', 'request_id': self.item['request_id'], 'content': 'Late answer'}]})
+        calls.clear(); bridge.last_send.clear()
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport',
+                return_value={'events': [], 'trajectory': 'one', 'offset': 60}):
+            bridge.tick()
+        send = [p for m, p in calls if m == 'send'][0]
+        self.assertEqual((send['quoteTimestamp'], send['quoteAuthor'], send['quoteMessage']), (123456, HAL, 'Hello Custos'))
+        # Group replies always quote; bracketed bridge notes are not part of the quote.
+        group = cs.classify(envelope(message='Custos, look', groupInfo={'groupId': 'agreed-group'},
+                                     attachments=[{'contentType': 'video/mp4', 'id': 'v1', 'size': 5}]), POLICY)
+        self.assertIn('\n[Video', group['body'])
+        self.spool.receive(group)
+        with self.spool.db:
+            self.spool.db.execute("UPDATE inbox SET phase='queued' WHERE id=?", (group['request_id'],))
+        self.spool.batch(group['route'], {'trajectory': 'g', 'offset': 1, 'events': [
+            {'step_id': 'reply-3', 'request_id': group['request_id'], 'content': 'Looking'}]})
+        calls.clear(); bridge.last_send.clear()
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport',
+                return_value={'events': [], 'trajectory': 'g', 'offset': 1}):
+            bridge.tick()
+        send = [p for m, p in calls if m == 'send'][0]
+        self.assertEqual(send['groupId'], 'agreed-group')
+        self.assertEqual((send['quoteTimestamp'], send['quoteAuthor'], send['quoteMessage']), (123456, HAL, 'Custos, look'))
+        self.assertEqual(cs.quote_text('[Image attached]'), '[Image attached]')
+
+    def test_intake_sends_read_receipt_and_keeps_typing_until_the_reply_is_sent(self):
+        calls = []; bridge = self.bridge_with_rpc(calls)
+        self.spool.receive(self.item)  # pending directed DM
+        ambient = cs.classify(envelope(message='just chatting', groupInfo={'groupId': 'agreed-group'}, timestamp=5), POLICY)
+        self.spool.receive(ambient)
+
+        def transport(args, content=''):
+            return {'queued': True} if args[0] == 'send' else {'events': [], 'trajectory': 'one', 'offset': 0}
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        self.assertIn(('sendReceipt', {'recipient': HAL, 'targetTimestamp': [123456], 'type': 'read'}), calls)
+        self.assertIn(('sendReceipt', {'recipient': HAL, 'targetTimestamp': [5], 'type': 'read'}), calls)
+        self.assertEqual([p for m, p in calls if m == 'sendTyping'], [{'recipient': [HAL]}])  # not for ambient
+        self.assertEqual(set(bridge.typing), {self.item['request_id']})
+        # Not refreshed inside the refresh window; refreshed once it is due.
+        calls.clear()
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        self.assertNotIn('sendTyping', [m for m, p in calls])
+        bridge.typing[self.item['request_id']]['refreshed'] -= cs.TYPING_REFRESH
+        reply = {'trajectory': 'one', 'offset': 50, 'events': [
+            {'step_id': 'reply-1', 'request_id': self.item['request_id'], 'content': 'Hello Hal'}]}
+        calls.clear()
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport',
+                side_effect=lambda args, content='': reply if args[0] == 'outbox' else {'queued': True}):
+            bridge.tick()
+        self.assertEqual([m for m, p in calls if m in ('sendTyping', 'send')], ['sendTyping', 'send'])
+        # The reply is on its way: the next tick stops the indicator and forgets it.
+        calls.clear()
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        self.assertEqual([p for m, p in calls if m == 'sendTyping'], [{'recipient': [HAL], 'stop': True}])
+        self.assertEqual(bridge.typing, {})
+
+    def test_typing_gives_up_after_the_wait_limit_and_survives_signal_errors(self):
+        calls = []; bridge = self.bridge_with_rpc(calls)
+        self.spool.receive(self.item)
+
+        def transport(args, content=''):
+            return {'queued': True} if args[0] == 'send' else {'events': [], 'trajectory': 'one', 'offset': 0}
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        bridge.typing[self.item['request_id']]['started'] -= cs.TYPING_SECONDS + 1
+        calls.clear()
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        self.assertEqual([p for m, p in calls if m == 'sendTyping'], [{'recipient': [HAL], 'stop': True}])
+        self.assertEqual(bridge.typing, {})
+        # Courtesies never block intake: a rejected receipt/typing call still queues the message.
+        other = cs.classify(envelope(message='again', timestamp=777), POLICY)
+        self.spool.receive(other)
+        bridge.rpc.call.side_effect = RuntimeError('Signal RPC rejected sendReceipt')
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        self.assertEqual(self.spool.db.execute("SELECT phase FROM inbox WHERE id=?", (other['request_id'],)).fetchone()[0], 'queued')
+        self.assertEqual(bridge.typing, {})
+
+    def waiting_bridge(self, calls, sends):
+        policy = copy.deepcopy(POLICY); policy['batch'] = dict(WAITING)
+        self.policy_path.write_text(json.dumps(policy))
+        bridge = self.bridge_with_rpc(calls)
+
+        def transport(args, content=''):
+            if args[0] == 'send':
+                sends.append((args, content))
+                return {'queued': True}
+            return {'events': [], 'trajectory': 'one', 'offset': 0}
+        return bridge, transport
+
+    def age(self, request_id, seconds):
+        with self.spool.db:
+            self.spool.db.execute('UPDATE inbox SET arrived=arrived-? WHERE id=?', (seconds, request_id))
+
+    def phase(self, request_id):
+        return self.spool.db.execute('SELECT phase FROM inbox WHERE id=?', (request_id,)).fetchone()[0]
+
+    def test_dm_flurry_waits_for_quiet_then_goes_as_one_intake(self):
+        calls, sends = [], []; bridge, transport = self.waiting_bridge(calls, sends)
+        first = cs.classify(envelope(message='Custos, are you there?', timestamp=1000), POLICY)
+        second = cs.classify(envelope(message='also: what is 2+2', timestamp=2000), POLICY)
+        self.spool.receive(first); self.spool.receive(second)
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        self.assertEqual(sends, []); self.assertEqual(self.phase(first['request_id']), 'pending')
+        self.assertEqual([m for m, p in calls if m in ('sendReceipt', 'sendTyping')], [])
+        self.age(first['request_id'], 70); self.age(second['request_id'], 61)
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        self.assertEqual(len(sends), 1)
+        args, content = sends[0]
+        self.assertEqual(args[args.index('--request-id') + 1], second['request_id'])
+        self.assertIn('2 messages arrived close together', content)
+        self.assertIn('- Hal (00:00Z): Custos, are you there?\n- Hal (00:00Z): also: what is 2+2', content)
+        self.assertIn('you were addressed directly', content)
+        self.assertEqual(self.phase(second['request_id']), 'queued')
+        self.assertEqual(self.phase(first['request_id']), 'batched')
+        self.assertEqual(json.loads(self.spool.db.execute('SELECT receipt FROM inbox WHERE id=?',
+                         (first['request_id'],)).fetchone()[0]), {'carrier': second['request_id']})
+        self.assertEqual([p['targetTimestamp'] for m, p in calls if m == 'sendReceipt'], [[1000], [2000]])
+        self.assertEqual([p for m, p in calls if m == 'sendTyping'], [{'recipient': [HAL]}])
+        # The reply threads onto the carrier, and settles the whole batch.
+        self.spool.batch(second['route'], {'trajectory': 'one', 'offset': 9, 'events': [
+            {'step_id': 'r', 'request_id': second['request_id'], 'content': 'Here, and 4.'}]})
+        calls.clear()
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        send = [p for m, p in calls if m == 'send'][0]
+        self.assertNotIn('quoteTimestamp', send)  # the carrier is still Hal's latest DM: a plain reply
+        self.assertEqual(send['recipient'], [HAL])
+
+    def test_group_flurry_carrier_is_the_last_directed_message(self):
+        calls, sends = [], []; bridge, transport = self.waiting_bridge(calls, sends)
+        group = {'groupId': 'agreed-group'}
+        items = [cs.classify(envelope(FRIEND, message=text, timestamp=stamp, groupInfo=group), POLICY) for text, stamp in
+                 (('hello all', 1000), ('Custos, ping', 2000), ('lol', 3000))]
+        for item in items:
+            self.spool.receive(item); self.age(item['request_id'], 130)
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        args, content = sends[0]
+        self.assertEqual(args[args.index('--request-id') + 1], items[1]['request_id'])
+        self.assertNotIn('--ambient', args)
+        self.assertEqual(content.count('- Friend ('), 3)
+        self.assertEqual([self.phase(i['request_id']) for i in items], ['batched', 'queued', 'batched'])
+        self.assertEqual([p for m, p in calls if m == 'sendTyping'], [{'groupId': 'agreed-group'}])
+        self.assertEqual(len([m for m, p in calls if m == 'sendReceipt']), 3)
+
+    def test_batch_goes_after_max_wait_even_while_the_room_keeps_talking(self):
+        calls, sends = [], []; bridge, transport = self.waiting_bridge(calls, sends)
+        group = {'groupId': 'agreed-group'}
+        old = cs.classify(envelope(FRIEND, message='first', timestamp=1000, groupInfo=group), POLICY)
+        fresh = cs.classify(envelope(FRIEND, message='still talking', timestamp=2000, groupInfo=group), POLICY)
+        self.spool.receive(old); self.spool.receive(fresh)
+        self.age(old['request_id'], 200)
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        self.assertEqual(sends, [])  # quiet for 0 s, oldest waited 200 s < 300
+        self.age(old['request_id'], 101)
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        self.assertEqual(len(sends), 1); self.assertIn('--ambient', sends[0][0])
+        self.assertIn('group conversation not addressed to you', sends[0][1])
+
+    def test_reactions_skip_the_wait_and_rows_without_arrival_go_at_once(self):
+        calls, sends = [], []; bridge, transport = self.waiting_bridge(calls, sends)
+        text = cs.classify(envelope(message='Custos?', timestamp=1000), POLICY)
+        react = cs.classify(reaction(timestamp=1500), POLICY)
+        self.spool.receive(text); self.spool.receive(react)
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        self.assertEqual([a[a.index('--request-id') + 1] for a, c in sends], [react['request_id']])
+        self.assertEqual(self.phase(text['request_id']), 'pending')
+        with self.spool.db:
+            self.spool.db.execute('UPDATE inbox SET arrived=NULL WHERE id=?', (text['request_id'],))
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        self.assertEqual(self.phase(text['request_id']), 'queued')
+
+    def test_batch_addressed_to_someone_else_says_so_and_deleted_carrier_frees_the_rest(self):
+        calls, sends = [], []; bridge, transport = self.waiting_bridge(calls, sends)
+        policy = json.loads(self.policy_path.read_text())
+        kim = '00000000-0000-4000-8000-000000000006'
+        policy['people'][kim] = {'label': 'Kim', 'authority': 'external'}
+        self.policy_path.write_text(json.dumps(policy))
+        group = {'groupId': 'agreed-group'}
+        items = [cs.classify(envelope(FRIEND, message=text, timestamp=stamp, groupInfo=group), policy) for text, stamp in
+                 (('Kim, meet Custos', 1000), ('what do you think of Custos, Kim?', 2000))]
+        for item in items:
+            self.spool.receive(item); self.age(item['request_id'], 130)
+        # The carrier is deleted on Signal before the batch is delivered: the other message waits again.
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport',
+                side_effect=lambda args, content='': (_ for _ in ()).throw(RuntimeError('native intake down'))):
+            with self.assertRaises(RuntimeError):
+                bridge.tick()
+        self.assertEqual([self.phase(i['request_id']) for i in items], ['batched', 'pending'])
+        self.spool.cancel(FRIEND, 2000, 'agreed-group')
+        self.assertEqual([self.phase(i['request_id']) for i in items], ['pending', 'deleted'])
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        args, content = sends[0]
+        self.assertEqual(args[args.index('--request-id') + 1], items[0]['request_id'])
+        self.assertIn('--ambient', args)
+        self.assertIn('addressed to Kim, not to you (you were named in passing). Let Kim answer.', content)
+        self.assertEqual([p for m, p in calls if m == 'sendTyping'], [])
 
 
 if __name__ == '__main__':

@@ -82,6 +82,40 @@ The profile avatar chosen by Custos is installed; stopped-state backup/restart
 recovered both services successfully.
 
 
+## Addressing, batching, threading and courtesies (2026-09-10)
+
+A group message is *directed* when Custos is @-mentioned, quoted, or addressed by
+name at the start or end of a sentence; merely naming Custos while addressing
+another allowlisted person ("what do you think of my buddy Custos, Kim?") is not.
+Addressees are recognised from structured mentions and from vocatives using each
+person's label plus optional policy `aliases` (e.g. Kim: `["Kimchi", "Kimchi-Chan"]`).
+The intake's participation line then says "addressed to Kim, not to you"; the
+responder contract already allows no-reply for messages meant for someone else.
+
+Text messages are spooled and delivered per conversation as one intake once the
+conversation has been quiet for the batch window, or the oldest message has
+waited the maximum (policy `batch`: `quiet_seconds` 120 / `max_wait_seconds` 300
+for the group, `dm_quiet_seconds` 60 / `dm_max_wait_seconds` 180 for DMs; up to
+12 messages per intake). Emoji reactions bypass the wait. The batch's *carrier*
+is the last directed message (else the last message): the wrapper carries its
+verified identity, every message is listed in order with speaker and time, the
+other rows are folded (`phase batched`, receipt names the carrier) and settle
+with it; a deleted undelivered carrier frees them for the next batch. Zero
+windows restore per-message delivery.
+
+Replies are threaded onto the message they answer as a Signal quote (author,
+timestamp and a bridge-cleaned preview) in the group always, and in a DM when
+the answered message is no longer that person's latest. The host selects the
+quoted original from the spool; the model never supplies a target. On delivery
+into Custos the bridge sends the author a read receipt for each message, and
+while a reply to a directed message is expected it keeps a typing indicator
+alive (refreshed every 10 s, dropped when the reply or reaction goes out or after
+150 s). Both are courtesies: a Signal error there never blocks intake. JSON-RPC
+shapes verified live: `sendReceipt` takes a single `recipient` string (a list is
+misparsed as a phone number) and a `targetTimestamp` list; `sendTyping` takes
+`recipient` list or `groupId` and `stop: true`; `send` accepts `quoteTimestamp`,
+`quoteAuthor`, `quoteMessage`.
+
 ## Emoji reactions
 
 Reaction additions and removals in allowed DMs and the agreed group arrive as
