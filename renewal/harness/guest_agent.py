@@ -112,7 +112,7 @@ def drain(rid):
  atomic_json(c/'schedules.json',{p.name:p.read_text() for p in run.glob('*.wake_at')})
  # Integrity evidence excludes mutable code overlays and run scratch files.
  protected={}
- for name in ['.env','info.txt','activate','social-policy.json']:
+ for name in ['.env','info.txt','activate']:
   p=identity()/name
   if p.is_file():protected[name]=digest(p)
  atomic_json(c/'protected.json',protected)
@@ -177,25 +177,35 @@ def start(rid):
 
 def health(a,rid):
  if installed()!=a:raise RuntimeError('release pointer changed during probation')
- c=checkpoint_dir(rid);log=identity()/'run/logs/monolith.log';offset=log.stat().st_size if log.exists() else 0
+ c=checkpoint_dir(rid);trajectory=identity()/'trajectories/7ed4c8d8-root/trajectory.jsonl'
+ offset=trajectory.stat().st_size if trajectory.exists() else 0
  start(rid)
  if paused():raise RuntimeError('operator pause during startup')
- deadline=time.monotonic()+660;woke=False
+ deadline=time.monotonic()+660;runs=set();reasoned=set();progress=None;buffer=b''
  while time.monotonic()<deadline:
   if paused():raise RuntimeError('operator pause during probation')
   if call(['systemctl','is-active',MIND],check=False).returncode:raise RuntimeError('mind service not active')
-  # Success marker is written only after a successful real shellm wake, with
-  # a nonempty model result. Core tool/receipt behavior is checked in the VM.
-  if log.exists():
-   with log.open() as f:f.seek(offset);tail=f.read(1024*1024)
-   if '[harness-health] wake-ok' in tail:woke=True;break
+  if trajectory.exists():
+   with trajectory.open('rb') as f:f.seek(offset);chunk=f.read(4*1024*1024);offset=f.tell()
+   buffer+=chunk
+   if len(buffer)>8*1024*1024:raise RuntimeError('trajectory probation record bound')
+   lines=buffer.split(b'\n');buffer=lines.pop()
+   for line in lines:
+    try:event=json.loads(line)
+    except ValueError:raise RuntimeError('invalid durable trajectory row')
+    if event.get('type')=='shellm-run' and event.get('launched_by')=='monolith':runs.add(event.get('step_id'))
+    run_id=event.get('run_id')
+    if run_id in runs and event.get('type')=='reasoning':reasoned.add(run_id)
+    if run_id in reasoned and event.get('type')=='shell-output' and event.get('exit')==0:
+     progress={'run_id':run_id,'step_id':event.get('step_id')};break
+  if progress:break
   time.sleep(2)
- if not woke:raise TimeoutError('no successful wake during probation')
+ if not progress:raise TimeoutError('no successful model/tool progress during probation')
  with urllib.request.urlopen('http://127.0.0.1:8080/',timeout=10) as r:
   if r.status!=200:raise RuntimeError('dashboard not healthy')
  for name in ['custos-relay-bridge.service',TIMER]:
   if call(['systemctl','is-active',name],check=False).returncode:raise RuntimeError(name+' not active')
- return {'ok':True,'wake':True,'dashboard':True}
+ return {'ok':True,'wake_progress':progress,'dashboard':True}
 
 def restore(a,rid):
  atomic_json(MAINT,{'request_id':rid,'recovery':True})

@@ -2595,6 +2595,13 @@ run_loop() {
     # Spin/stall guard state (see SHELLM_MAX_*_FAILURES).
     local _consec_fail=0 _repeat_fail=0 _prev_fail_code=""
     while [[ -z "$SHELLM_MAX_ITERATIONS" || "$iteration" -lt "$SHELLM_MAX_ITERATIONS" ]]; do
+        if [[ -f /var/lib/custos/harness-maintenance && "${IDENTITY_NAME:-}" == custos ]]; then
+            progress "Harness maintenance: yielding between completed steps"
+            printf '%s' "$(jq -nc --arg run_id "$_run_step_id" '{type:"harness-handoff",run_id:$run_id,content:"Yielded for harness maintenance; unfinished commitments remain active."}')" \
+                | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
+            printf 'Yielded for harness maintenance; unfinished work remains active.\n'
+            return 0
+        fi
         iteration=$((iteration + 1))
         local iter_label
         if [[ -n "$SHELLM_MAX_ITERATIONS" ]]; then

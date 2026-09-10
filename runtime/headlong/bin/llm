@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Only new calls yield; already-running calls and atomic tool steps finish.
+if [[ -f /var/lib/custos/harness-maintenance && "${IDENTITY_NAME:-}" == custos ]]; then
+    printf 'llm: harness_maintenance — yielding before another model request\n' >&2
+    exit 75
+fi
+
 # llm — Minimal multi-provider LLM CLI tool
 # Supports the Anthropic, OpenAI, Gemini, and OpenRouter APIs, plus any
 # OpenAI-compatible endpoint via --provider openai-compatible (see
