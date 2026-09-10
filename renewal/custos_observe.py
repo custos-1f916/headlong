@@ -784,6 +784,37 @@ def record_result(store, result):
     # The next observation run emits this durable callback, with no model call here.
     return {"request_id": result["request_id"], "queued": True, "created": prior is None}
 
+def resolve_outbox_step_ids(store, prefix):
+    """Full step_ids of outgoing square rows past the outbox cursor whose
+    id starts with prefix. The delivery filter matches the full row id, so
+    a withdrawal stored under a shorter key silently no-ops (2026-09-10:
+    eight withdrawals bound to 8-char prefixes were never applied)."""
+    cursor = store.get("outbox:cursor")
+    if not isinstance(cursor, dict) or not cursor.get("path"):
+        return []
+    path = Path(cursor["path"])
+    if not path.is_file():
+        return []
+    matches = []
+    try:
+        with path.open("rb") as probe:
+            probe.seek(int(cursor.get("offset", 0)))
+            while True:
+                line = probe.readline(128 * 1024)
+                if not line or not line.endswith(b"\n"):
+                    break
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if (row.get("type") == "message" and row.get("from") == "custos"
+                        and str(row.get("to", "")).startswith("square:")):
+                    sid = str(row.get("step_id", ""))
+                    if sid.startswith(prefix):
+                        matches.append(sid)
+    except OSError:
+        return []
+    return matches
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("once", "status", "import-continuity", "record-result", "withdraw", "metrics"))
@@ -809,8 +840,16 @@ def main(argv=None):
         if not args.step_id or not re.fullmatch(r"[0-9a-f-]{8,64}", args.step_id):
             print("custos-observe withdraw STEP_ID (the full step id of your outgoing square message)", file=sys.stderr)
             return 2
-        store.put("outbox:skip:" + args.step_id, {"at": time.time()})
-        print(canonical({"withdrawn": args.step_id, "note": "skipped at the next outbox pass; already-delivered replies cannot be withdrawn"}))
+        matches = resolve_outbox_step_ids(store, args.step_id)
+        if len(matches) > 1:
+            print("custos-observe withdraw: %s matches %d outgoing square rows; pass a unique full step id: %s" % (args.step_id, len(matches), ", ".join(m[:8] for m in matches[:4])), file=sys.stderr)
+            return 2
+        target = matches[0] if matches else args.step_id
+        store.put("outbox:skip:" + target, {"at": time.time(), "requested": args.step_id})
+        note = "skipped at the next outbox pass; already-delivered replies cannot be withdrawn"
+        if not matches:
+            note += "; no outgoing square row past the cursor matched this id - verify the row is undelivered"
+        print(canonical({"withdrawn": target, "matched_row": bool(matches), "note": note}))
         return 0
     try:
         with (STATE / "run.lock").open("a") as lock:
