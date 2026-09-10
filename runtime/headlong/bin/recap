@@ -1,0 +1,820 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# recap — Summarize a trajectory into themes + episodes with step references
+#
+# Map-reduce over a mind log (or any trajectory): filter out noise steps,
+# chunk what's left into windows, LLM-summarize each window into an
+# "episode" (title, summary, themes, notable steps), then reduce the
+# episodes into top-level themes and a narrative arc. Everything is cached
+# under <traj-dir>/recap/ and refreshed incrementally, so re-running after
+# the agent has lived more life only summarizes the new steps.
+
+RECAP_VERSION="0.1.0"
+
+die() { echo "recap: error: $*" >&2; exit 1; }
+note() { [[ "$QUIET" -eq 1 ]] || printf 'recap: %s\n' "$*" >&2; }
+
+# ---------------------------------------------------------------------------
+# Defaults & argument parsing
+# ---------------------------------------------------------------------------
+
+TRAJ_DIR="${TRAJ_DIR:-}"
+TRAJ_ID_ARG=""
+WINDOW=100          # max filtered steps per episode
+GAP_MINUTES=30      # prefer to cut windows at time gaps at least this long
+MIN_GAP_WINDOW=10   # never gap-cut a window smaller than this
+MAX_WINDOW_BYTES="${RECAP_MAX_WINDOW_BYTES:-60000}"  # token-budget guard
+MIN_TAIL=15         # don't summarize a trailing partial window smaller than this
+MODE="auto"         # auto | cached | rebuild
+OUTPUT="text"       # text | json
+QUIET=0
+# Map (windows -> episodes) and reduce (episodes -> themes) take separate
+# models; both default to the smart model. Set RECAP_MAP_MODEL to a cheap
+# model if map volume ever becomes a cost concern.
+_DEFAULT_MODEL="${RECAP_MODEL:-${SHELLM_MODEL:-claude-sonnet-4-5-20250929}}"
+MAP_MODEL="${RECAP_MAP_MODEL:-$_DEFAULT_MODEL}"
+REDUCE_MODEL="${RECAP_REDUCE_MODEL:-$_DEFAULT_MODEL}"
+
+# Step types that carry narrative signal; everything else (idle, reasoning,
+# shell-output, prompt echoes of sub-runs...) is noise at recap altitude.
+KEEP_TYPES='["thought","action","observation","message","feedback","final","shellm-run","merge"]'
+
+# Cached-render format version: bump when the TSV row format changes, so a
+# stale rendered.tsv is rebuilt instead of mixing formats. (A KEEP_TYPES
+# change is detected independently — the keep set is stored in the meta.)
+RENDER_VERSION=1
+
+# --- Tiered rollups / --context (see design/tiered_memory.md) ---
+CONTEXT=0
+BACKFILL=0                             # --backfill: also summarize pre-enable history
+FANOUT="${ROLLUP_FANOUT:-10}"          # F: children per tier; tier k covers F^k steps
+CTX_BUDGET="${MONOLITH_CONTEXT_BUDGET:-auto}"   # token budget; auto = fraction of model window
+CTX_RAW_TAIL="${ROLLUP_RAW_TAIL:-auto}"         # R: verbatim recent steps; auto = from budget
+ROLLUP_PROMPT_VERSION=3                 # stamped into sealed blocks for honest determinism (v2: first-person voice; v3: outcomes, not temperament)
+
+usage() {
+    cat <<'EOF'
+recap — Summarize a trajectory into themes + episodes with step references
+
+Usage:
+  recap [ID] [options]              ID: traj UUID/hex prefix (default: $TRAJ_ID)
+
+Options:
+  --traj_dir DIR      Trajectories root (default: $TRAJ_DIR)
+  --window N          Max filtered steps per episode window (default: 100)
+  --gap-minutes N     Prefer window cuts at time gaps >= N minutes (default: 30;
+                      0 disables gap-aware cutting)
+  --context           Print a budget-bounded "staircase": tiered rollups
+                      (coarse→fine) covering the whole trajectory, then the
+                      recent steps verbatim. Builds rollups lazily but only
+                      GOING FORWARD from first use (safe on a long log).
+  --backfill          One-time: also summarize all pre-existing history, so the
+                      staircase covers the whole past. Run manually/offline —
+                      the first build on a long log is the expensive one.
+  --budget N|auto     Token budget for --context (auto = fraction of model window)
+  --raw-tail N        Verbatim recent steps to show under --context (default: auto)
+  --fanout N          F: children per tier for --context rollups (default: 10)
+  --cached            Print the existing recap; never call the LLM
+  --rebuild           Drop the cache and re-summarize everything
+  --json              Emit {"themes":..., "episodes":[...]} JSON
+  --model MODEL       LLM for both stages (default: $RECAP_MODEL, $SHELLM_MODEL)
+  --map-model MODEL   LLM for window summaries only ($RECAP_MAP_MODEL)
+  --reduce-model MODEL  LLM for the theme reduction only ($RECAP_REDUCE_MODEL)
+  -q, --quiet         No progress chatter on stderr
+  -h, --help          Show this help
+
+Windows close at the first of: a time gap of --gap-minutes (so episodes align
+with the agent's natural sessions), --window steps, or ~60KB of text
+($RECAP_MAX_WINDOW_BYTES).
+
+Default behavior refreshes the cache incrementally (only new steps get
+summarized), then prints. Cache lives in <traj-dir>/recap/.
+
+Inside an identity shell, plain `recap` summarizes the identity's mind log.
+Step references print as [8-char ids] that resolve in the web dash mind log.
+EOF
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --traj_dir) TRAJ_DIR="${2:?--traj_dir requires DIR}"; shift 2 ;;
+        --window)   WINDOW="${2:?--window requires N}"; shift 2 ;;
+        --context)  CONTEXT=1; shift ;;
+        --backfill) CONTEXT=1; BACKFILL=1; shift ;;
+        --budget)   CTX_BUDGET="${2:?--budget requires N|auto}"; shift 2 ;;
+        --raw-tail) CTX_RAW_TAIL="${2:?--raw-tail requires N}"; shift 2 ;;
+        --fanout)   FANOUT="${2:?--fanout requires N}"; shift 2 ;;
+        --gap-minutes) GAP_MINUTES="${2:?--gap-minutes requires N}"; shift 2 ;;
+        --cached)   MODE="cached"; shift ;;
+        --rebuild)  MODE="rebuild"; shift ;;
+        --json)     OUTPUT="json"; shift ;;
+        --model)
+            MAP_MODEL="${2:?--model requires MODEL}"
+            REDUCE_MODEL="$2"; shift 2 ;;
+        --map-model)    MAP_MODEL="${2:?--map-model requires MODEL}"; shift 2 ;;
+        --reduce-model) REDUCE_MODEL="${2:?--reduce-model requires MODEL}"; shift 2 ;;
+        -q|--quiet) QUIET=1; shift ;;
+        -h|--help)  usage ;;
+        --version)  echo "recap $RECAP_VERSION"; exit 0 ;;
+        -*)         die "Unknown option: $1" ;;
+        *)
+            [[ -n "$TRAJ_ID_ARG" ]] && die "Usage: recap [ID] [options]"
+            TRAJ_ID_ARG="$1"; shift ;;
+    esac
+done
+
+[[ "$WINDOW" =~ ^[0-9]+$ && "$WINDOW" -ge 10 ]] || die "--window must be a number >= 10"
+
+# ---------------------------------------------------------------------------
+# Resolve the trajectory directory
+# ---------------------------------------------------------------------------
+
+_resolve_traj_dir() {
+    local id="${TRAJ_ID_ARG:-${TRAJ_ID:-}}"
+    [[ -n "$TRAJ_DIR" ]] || die "no trajectory: set TRAJ_DIR (+ TRAJ_ID) or pass --traj_dir DIR <ID>"
+    [[ -d "$TRAJ_DIR" ]] || die "not a directory: $TRAJ_DIR"
+    [[ -n "$id" ]] || die "no trajectory ID: pass one or set TRAJ_ID"
+
+    # Accept a full dir path, a UUID, or a hex prefix
+    if [[ -f "$id/trajectory.jsonl" ]]; then
+        (cd "$id" && pwd)
+        return
+    fi
+    local prefix="${id%%-*}"
+    local match
+    # `|| true`: head's early exit SIGPIPEs find under pipefail
+    match=$(find "$TRAJ_DIR" -maxdepth 4 -type d -name "${prefix}*" 2>/dev/null | head -1) || true
+    [[ -n "$match" && -f "$match/trajectory.jsonl" ]] || die "no trajectory matching: $id (under $TRAJ_DIR)"
+    (cd "$match" && pwd)
+}
+
+RUN_DIR=$(_resolve_traj_dir)
+JSONL="$RUN_DIR/trajectory.jsonl"
+CACHE="$RUN_DIR/recap"
+EPISODES="$CACHE/episodes.jsonl"
+THEMES="$CACHE/themes.json"
+LOCK="$CACHE/.lock"
+ROLLUP_DIR="$RUN_DIR/rollups"
+ROLLUP_LOCK="$ROLLUP_DIR/.lock"
+ROLLUP_META="$ROLLUP_DIR/meta.json"
+
+[[ "$FANOUT" =~ ^[0-9]+$ && "$FANOUT" -ge 2 ]] || die "--fanout must be a number >= 2"
+# Validated only when --context/--backfill will actually read them: both are
+# seeded from env (MONOLITH_CONTEXT_BUDGET, ROLLUP_RAW_TAIL), and a malformed
+# identity .env must not break plain `recap`, which never consults them.
+if (( CONTEXT )); then
+    [[ "$CTX_RAW_TAIL" == "auto" || "$CTX_RAW_TAIL" =~ ^[0-9]+$ ]] || die "--raw-tail must be a number or auto"
+    [[ "$CTX_BUDGET" == "auto" || ( "$CTX_BUDGET" =~ ^[0-9]+$ && "$CTX_BUDGET" -gt 0 ) ]] || die "--budget must be a positive number or auto"
+fi
+
+# ---------------------------------------------------------------------------
+# Rendering: trajectory lines -> TSV of (raw_line, step_id, ts, text)
+# ---------------------------------------------------------------------------
+
+# Renders signal steps one per line as TSV: raw jsonl line number (so
+# incremental refresh can resume exactly where the last episode ended),
+# short step id, display ts, prompt text, and UTC epoch-minutes (for
+# gap-aware window cuts; empty when the ts doesn't parse). Epoch math is
+# done by hand because mind logs mix timezones (+0800 thinkers, +0000
+# actor) and naive comparison would see 8-hour phantom gaps.
+_render_steps() {
+    local from_line="${1:-1}" limit="${2:-}"
+    # Optional line bound: the render cache snapshots the raw line count
+    # BEFORE rendering, then renders exactly that many lines — steps appended
+    # mid-render would otherwise land in the TSV above the recorded
+    # high-water mark and duplicate on the next incremental pass.
+    tail -n "+$from_line" "$JSONL" \
+        | { if [[ -n "$limit" ]]; then head -n "$limit"; else cat; fi; } \
+        | jq -r --argjson keep "$KEEP_TYPES" --argjson off "$((from_line - 1))" '
+        def epoch_min:
+          (tostring
+           | capture("^(?<y>[0-9]{4})-(?<mo>[0-9]{2})-(?<d>[0-9]{2})T(?<h>[0-9]{2}):(?<mi>[0-9]{2})(:[0-9]{2})?([.][0-9]+)?(?<tz>Z|[+-][0-9]{4})?")
+           // null) as $c
+          | if $c == null then "" else
+              ($c.y|tonumber) as $y0 | ($c.mo|tonumber) as $m0 | ($c.d|tonumber) as $d0
+              | (if $m0 <= 2 then $y0 - 1 else $y0 end) as $y
+              | (if $m0 <= 2 then $m0 + 12 else $m0 end) as $m
+              | (365*$y + (($y/4)|floor) - (($y/100)|floor) + (($y/400)|floor)
+                 + (((153*($m+1))/5)|floor) + $d0) as $days
+              | (($days*1440 + ($c.h|tonumber)*60 + ($c.mi|tonumber))
+                 - (if ($c.tz != null and $c.tz != "Z" and $c.tz != null)
+                    then (if $c.tz[0:1] == "-" then -1 else 1 end)
+                         * ((($c.tz[1:3])|tonumber)*60 + (($c.tz[3:5])|tonumber))
+                    else 0 end))
+              | tostring
+            end;
+        select(type == "object") |
+        select(.type as $t | $keep | index($t)) |
+        select(.source != "seed") |
+        [
+            (input_line_number + $off),
+            ((.step_id // "?") | tostring | .[0:8]),
+            ((.ts // "") | tostring | .[0:16]),
+            (
+                "[" + ((.step_id // "?") | tostring | .[0:8]) + "] "
+                + .type
+                + (if .source then "(" + .source + ")"
+                   elif .launched_by then "(" + (.launched_by|tostring) + ")"
+                   else "" end)
+                + (if .from then " " + (.from|tostring) + "→" + ((.to // "?")|tostring) else "" end)
+                + ": "
+                + (if .type == "shellm-run" then
+                       # The launcher argv is ~500 chars of identical flags on
+                       # every wakeup (40% of the raw tail on a live mind) and
+                       # says nothing the model can act on. The meaning lives in
+                       # the fields beside it: which thinker woke, and why. A
+                       # run with no launched_by is one the mind started itself,
+                       # where the command IS the payload — keep its tail.
+                       (if .wake then "wake " + (.wake|tostring) + ", " else "" end)
+                       + "model " + ((.model // "?") | tostring)
+                       + (if (.launched_by // "") == "" and (.command // "") != ""
+                          then ", cmd " + ((.command | tostring
+                                            | gsub("[\\t\\n\\r]+"; " "))[-200:])
+                          else "" end)
+                   else
+                       ((.content // .command // .tldr // "") | tostring
+                        | gsub("[\\t\\n\\r]+"; " ") | .[0:500])
+                   end)
+            ),
+            ((.ts // "") | epoch_min)
+        ] | @tsv
+    ' 2>/dev/null || true
+}
+
+# Emit "start end reason" window ranges over the rendered TSV. A window
+# closes at the first of: a time gap >= GAP_MINUTES before the next step
+# (only once the window has MIN_GAP_WINDOW steps), WINDOW steps, or
+# MAX_WINDOW_BYTES of text. The final range is tagged "eof".
+_window_ranges() {
+    awk -F'\t' -v maxsteps="$WINDOW" -v gapmin="$GAP_MINUTES" \
+        -v mingap="$MIN_GAP_WINDOW" -v maxbytes="$MAX_WINDOW_BYTES" '
+    {
+        if (gapmin > 0 && n >= mingap && $5 != "" && prevts != "" \
+            && ($5 - prevts) >= gapmin) {
+            print start, NR - 1, "gap"
+            n = 0; bytes = 0
+        }
+        if (n == 0) start = NR
+        n++
+        bytes += length($0)
+        if ($5 != "") prevts = $5
+        if (n >= maxsteps || bytes >= maxbytes) {
+            print start, NR, "size"
+            n = 0; bytes = 0
+        }
+    }
+    END { if (n > 0) print start, NR, "eof" }
+    ' "$1"
+}
+
+# ---------------------------------------------------------------------------
+# LLM calls
+# ---------------------------------------------------------------------------
+
+_llm_json() {
+    # _llm_json <model> <system_prompt> <user_text> [max_tokens]
+    # Returns validated JSON or fails. The cap must leave room for
+    # reasoning-channel tokens on models that bill them against max_tokens.
+    local model="$1" system="$2" user="$3" max_tokens="${4:-2048}" attempt raw cleaned
+    for attempt in 1 2; do
+        raw=$(printf '%s' "$user" | llm -m "$model" -t "$max_tokens" -s "$system") || { raw=""; }
+        cleaned=$(printf '%s\n' "$raw" | sed '/^```/d')
+        if printf '%s' "$cleaned" | jq -e . >/dev/null 2>&1; then
+            printf '%s' "$cleaned"
+            return 0
+        fi
+        note "model returned invalid JSON (attempt $attempt), retrying"
+    done
+    return 1
+}
+
+_WINDOW_SYSTEM='You summarize one window of an AI agent'\''s mind log. Lines look like "[step-id] type(source): content". Reply with ONLY a JSON object, no markdown fences:
+{"title": "short episode title (<=8 words)",
+ "summary": "2-4 sentences on outcomes: what the agent did, decided, learned, and left open, naming people, artifacts, and threads. Events, not character: no words for its habits or temperament (not disciplined, restrained, patient, waiting mode); if it idled, say once what it was waiting for",
+ "themes": ["1-4 short kebab-case topics"],
+ "notable_steps": [{"step": "8-char id from the window", "note": "why it matters (<=15 words)"}]}
+Pick 3-6 notable steps. Use only step ids that literally appear in the window.'
+
+_REDUCE_SYSTEM='You are given numbered episode summaries covering an AI agent'\''s life log in chronological order. Reply with ONLY a JSON object, no markdown fences:
+{"arc": "1-2 paragraphs narrating the overall arc: what this agent has been up to, how its focus evolved, where it stands now",
+ "themes": [{"name": "short theme name",
+             "description": "2-3 sentences on this thread of activity",
+             "episodes": [episode numbers where it shows up],
+             "key_steps": [{"step": "8-char id taken from the episodes'\'' notable steps", "note": "<=15 words"}]}]}
+Give 3-8 themes, most prominent first. Use only step ids that appear in the input.'
+
+_summarize_window() {
+    # stdin: TSV rows of the window. Appends one episode object to $EPISODES.
+    local idx="$1" partial="$2"
+    local rows
+    rows=$(cat)
+    [[ -n "$rows" ]] || return 0
+
+    local first_line last_line first_step last_step first_ts last_ts n window_text
+    first_line=$(head -1 <<<"$rows" | cut -f1)
+    last_line=$(tail -1 <<<"$rows" | cut -f1)
+    first_step=$(head -1 <<<"$rows" | cut -f2)
+    last_step=$(tail -1 <<<"$rows" | cut -f2)
+    first_ts=$(head -1 <<<"$rows" | cut -f3)
+    last_ts=$(tail -1 <<<"$rows" | cut -f3)
+    n=$(wc -l <<<"$rows" | tr -d ' ')
+    window_text=$(cut -f4 <<<"$rows")
+
+    note "summarizing episode $idx ($n steps, $first_ts → $last_ts)"
+    local body
+    body=$(_llm_json "$MAP_MODEL" "$_WINDOW_SYSTEM" "$window_text") \
+        || die "episode $idx: model did not produce valid JSON"
+
+    jq -n -c \
+        --argjson idx "$idx" \
+        --argjson body "$body" \
+        --argjson start "$first_line" --argjson end "$last_line" \
+        --arg fs "$first_step" --arg ls "$last_step" \
+        --arg fts "$first_ts" --arg lts "$last_ts" \
+        --argjson n "$n" --argjson partial "$partial" \
+        --arg model "$MAP_MODEL" --arg created "$(date +%Y-%m-%dT%H:%M:%S)" '
+        {idx: $idx, raw_start_line: $start, raw_end_line: $end,
+         first_step: $fs, last_step: $ls, first_ts: $fts, last_ts: $lts,
+         n_steps: $n, partial: $partial, model: $model, created: $created}
+        + {title: ($body.title // "untitled"),
+           summary: ($body.summary // ""),
+           themes: ($body.themes // []),
+           notable_steps: ($body.notable_steps // [])}
+    ' >> "$EPISODES"
+}
+
+_reduce_themes() {
+    local n_episodes
+    n_episodes=$(wc -l < "$EPISODES" | tr -d ' ')
+    [[ "$n_episodes" -gt 0 ]] || return 0
+
+    local episode_text
+    episode_text=$(jq -r '
+        "EPISODE \(.idx) [\(.first_ts) → \(.last_ts)] \(.title)\n"
+        + "  \(.summary)\n"
+        + "  themes: \(.themes | join(", "))\n"
+        + "  notable: " + ([.notable_steps[]? | "[\(.step)] \(.note)"] | join("; "))
+    ' "$EPISODES")
+
+    note "reducing $n_episodes episodes into themes"
+    local body
+    body=$(_llm_json "$REDUCE_MODEL" "$_REDUCE_SYSTEM" "$episode_text" 8192) \
+        || die "theme reduction: model did not produce valid JSON"
+
+    local last_end total_lines
+    last_end=$(tail -1 "$EPISODES" | jq -r '.raw_end_line')
+    total_lines=$(wc -l < "$JSONL" | tr -d ' ')
+    jq -n \
+        --argjson body "$body" \
+        --argjson episodes "$n_episodes" \
+        --argjson last_end "$last_end" \
+        --argjson total "$total_lines" \
+        --arg model "$REDUCE_MODEL" --arg generated "$(date +%Y-%m-%dT%H:%M:%S)" '
+        {generated_at: $generated, model: $model,
+         episodes: $episodes, raw_end_line: $last_end, total_lines: $total,
+         arc: ($body.arc // ""), themes: ($body.themes // [])}
+    ' > "$THEMES.tmp" && mv "$THEMES.tmp" "$THEMES"
+}
+
+# ---------------------------------------------------------------------------
+# Refresh: summarize whatever the cache doesn't cover yet
+# ---------------------------------------------------------------------------
+
+_refresh() {
+    mkdir -p "$CACHE"
+
+    # One recap at a time per trajectory (web + CLI can race otherwise).
+    if [[ -d "$LOCK" ]]; then
+        # a crashed run leaves a stale lock; 30 min is far beyond a real run
+        if [[ -n "$(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ]]; then
+            rmdir "$LOCK" 2>/dev/null || true
+        else
+            die "another recap is in progress (remove $LOCK if that's wrong)"
+        fi
+    fi
+    mkdir "$LOCK" || die "another recap is in progress (remove $LOCK if that's wrong)"
+    # shellcheck disable=SC2064
+    trap "rmdir '$LOCK' 2>/dev/null || true" EXIT
+
+    local from_line=1 next_idx=1
+    if [[ -s "$EPISODES" ]]; then
+        # Resume after the last complete episode; a trailing partial episode
+        # gets dropped and re-summarized now that more steps may exist.
+        local last partial
+        last=$(tail -1 "$EPISODES")
+        partial=$(jq -r '.partial' <<<"$last")
+        if [[ "$partial" == "true" ]]; then
+            from_line=$(jq -r '.raw_start_line' <<<"$last")
+            next_idx=$(jq -r '.idx' <<<"$last")
+            local trimmed
+            trimmed=$(mktemp)
+            sed '$d' "$EPISODES" > "$trimmed"   # portable "all but last line"
+            mv "$trimmed" "$EPISODES"
+        else
+            from_line=$(( $(jq -r '.raw_end_line' <<<"$last") + 1 ))
+            next_idx=$(( $(jq -r '.idx' <<<"$last") + 1 ))
+        fi
+    fi
+
+    local rendered
+    rendered=$(mktemp)
+    # shellcheck disable=SC2064
+    trap "rm -f '$rendered'; rmdir '$LOCK' 2>/dev/null || true" EXIT
+    _render_steps "$from_line" > "$rendered"
+
+    local total new_episodes=0
+    total=$(wc -l < "$rendered" | tr -d ' ')
+    if [[ "$total" -eq 0 ]]; then
+        note "no new steps since last recap"
+    else
+        # Windows close at gaps/size caps (complete) or end-of-data ("eof",
+        # provisional: partial if big enough, deferred if tiny).
+        local rstart rend reason size partial
+        while read -r rstart rend reason; do
+            [[ -n "$rstart" ]] || continue
+            size=$((rend - rstart + 1))
+            partial=false
+            if [[ "$reason" == "eof" ]]; then
+                # Skip a tiny tail entirely — it'll fold into the next refresh
+                if [[ "$size" -lt "$MIN_TAIL" && -s "$EPISODES" ]]; then
+                    note "leaving $size-step tail for the next refresh"
+                    break
+                fi
+                partial=true
+            fi
+            # sed range, not tail|head: head's early exit would SIGPIPE tail
+            # under pipefail once the render outgrows the pipe buffer
+            sed -n "${rstart},${rend}p" "$rendered" \
+                | _summarize_window "$next_idx" "$partial"
+            next_idx=$((next_idx + 1))
+            new_episodes=$((new_episodes + 1))
+        done <<< "$(_window_ranges "$rendered")"
+    fi
+
+    # Re-reduce when episodes changed or the reduction is missing
+    if [[ "$new_episodes" -gt 0 || ! -s "$THEMES" ]]; then
+        _reduce_themes
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+_print_text() {
+    [[ -s "$THEMES" ]] || die "no recap yet — run without --cached to generate one"
+    jq -r '
+        "◆ recap — \(.episodes) episodes over \(.total_lines) steps · generated \(.generated_at) · \(.model)\n"
+    ' "$THEMES"
+    jq -r '.arc' "$THEMES"
+    printf '\nTHEMES\n'
+    jq -r '
+        .themes | to_entries[] |
+        "\(.key + 1). \(.value.name) — \(.value.description)"
+        + "\n     steps: " + ([.value.key_steps[]? | "[\(.step)] \(.note)"] | join("; "))
+        + "  (episodes \(.value.episodes | map(tostring) | join(",")))"
+    ' "$THEMES"
+    printf '\nEPISODES\n'
+    jq -r '
+        "\(.idx). \(.first_ts) → \(.last_ts)  \(.title)\(if .partial then " (partial)" else "" end)"
+        + "\n     \(.summary)"
+        + "\n     " + ([.notable_steps[]? | "[\(.step)] \(.note)"] | join("; "))
+    ' "$EPISODES"
+}
+
+_print_json() {
+    [[ -s "$THEMES" ]] || die "no recap yet — run without --cached to generate one"
+    jq -n \
+        --slurpfile themes "$THEMES" \
+        --slurpfile episodes <(jq -c . "$EPISODES") '
+        {themes: $themes[0], episodes: $episodes}
+    '
+}
+
+# ---------------------------------------------------------------------------
+# Tiered rollups + staircase context (--context)
+# ---------------------------------------------------------------------------
+# A logarithmic pyramid of summaries so a single bounded context always spans
+# the whole trajectory. Tier k holds one rollup per F^k steps, rolled up from
+# tier k-1. Blocks are keyed by filtered-step index range, sealed immutable and
+# cached forever; only the frontier (newly-complete blocks) is built each run.
+# See design/tiered_memory.md.
+
+_ROLLUP_SYSTEM='You are the AI agent whose life log this is. Summarize this one slice of your own history in the FIRST PERSON — say "I", never "the agent". The input is a chronological list of lines: either raw steps "[id] type: content", or child rollup summaries (already first person). Reply with ONLY a JSON object, no markdown fences:
+{"summary": "2-3 first-person sentences on outcomes: what I did, decided, learned, and left open, naming people, artifacts, and threads. Events, not my character: no words for my habits or temperament (not disciplined, restrained, patient, waiting mode); if I idled, say once what I was waiting for",
+ "themes": ["1-4 short kebab-case topics"],
+ "step_ids": ["up to 4 of the most important 8-char step ids that literally appear in the input"]}'
+
+_ctx_pow() { local b=$1 e=$2 r=1 i=0; while [ "$i" -lt "$e" ]; do r=$((r * b)); i=$((i + 1)); done; printf '%s' "$r"; }
+
+_ctx_blockfile() { printf '%s/t%s/%012d-%012d.json' "$ROLLUP_DIR" "$1" "$2" "$3"; }
+
+# Resolve the inference model's context window (tokens).
+_ctx_model_window() {
+    local m="${MODEL_CONTEXT_WINDOW:-auto}"
+    [[ "$m" != "auto" ]] && { printf '%s' "$m"; return; }
+    case "${THINK_MODEL:-${SHELLM_MODEL:-}}" in
+        *claude*|*opus*|*sonnet*|*haiku*) printf '200000' ;;
+        *gpt-4.1*|*o1*|*o3*|*o4*)         printf '1000000' ;;
+        '')                               printf '200000' ;;
+        *)                                printf '128000' ;;
+    esac
+}
+
+# Raw-tail size R from the budget (recency gets ~40% of budget). A rendered
+# step is capped at 500 chars (_render_steps), ~4 chars/token, so budget at
+# ~125 tok/step — the worst case, not the mean, because overshooting the
+# window truncates the mind's context while undershooting only shortens it.
+_ctx_resolve_R() {
+    local n=$1
+    if [[ "$CTX_RAW_TAIL" != "auto" ]]; then printf '%s' "$CTX_RAW_TAIL"; return; fi
+    local budget win r cap
+    if [[ "$CTX_BUDGET" == "auto" ]]; then
+        win=$(_ctx_model_window)
+        budget=$(( win * 6 / 10 ))
+        # Cap auto at an absolute ceiling. auto = 0.6 * window, but on
+        # huge-context models (grok 128k-2M, gpt 1M) that is tens of thousands
+        # of tokens, so the life section balloons and the mind burns each
+        # wakeup re-reading it. min(0.6*window, cap). See
+        # design/monolith_run_health.md A1.
+        cap="${RECAP_CONTEXT_BUDGET_MAX:-4000}"
+        (( budget > cap )) && budget=$cap
+    else
+        budget=$CTX_BUDGET
+    fi
+    r=$(( (budget * 4 / 10) / 125 ))
+    (( r < 20 )) && r=20
+    (( r > n )) && r=n
+    printf '%s' "$r"
+}
+
+# Write one sealed tier-1 block over filtered-step indices [s,e) (TSV lines s+1..e).
+_ctx_seal_tier1() {
+    local s=$1 e=$2 file rows text fid lid body
+    file=$(_ctx_blockfile 1 "$s" "$e"); [[ -f "$file" ]] && return 0
+    # Keepalive: _ctx_run breaks locks idle >30min as stale, but a --backfill
+    # legitimately seals for hours. Refresh the lock before each seal so a
+    # LIVE builder never looks stale — a second concurrent builder would
+    # corrupt the shared rendered.tsv.
+    touch "$ROLLUP_LOCK" 2>/dev/null || true
+    rows=$(sed -n "$((s + 1)),${e}p" "$RENDERED_TSV")
+    text=$(cut -f4 <<<"$rows")
+    fid=$(head -1 <<<"$rows" | cut -f2); lid=$(tail -1 <<<"$rows" | cut -f2)
+    note "rollup t1 [$s,$e)"
+    body=$(_llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$text" 1024) || die "rollup t1 [$s,$e): bad JSON"
+    mkdir -p "$(dirname "$file")"
+    jq -n -c --argjson tier 1 --argjson start "$s" --argjson end "$e" --argjson n "$((e - s))" \
+        --argjson body "$body" --arg fid "$fid" --arg lid "$lid" \
+        --arg model "$MAP_MODEL" --argjson pv "$ROLLUP_PROMPT_VERSION" --arg created "$(date +%Y-%m-%dT%H:%M:%S)" '
+        {tier:$tier, start:$start, end:$end, n:$n,
+         summary:($body.summary // ""), themes:($body.themes // []),
+         step_ids:(($body.step_ids // []) | if length==0 then [$fid,$lid] else . end),
+         model:$model, prompt_version:$pv, created:$created}' > "$file"
+}
+
+# Write one sealed tier-k block (k>1) over indices [s,e), rolled up from tier k-1.
+_ctx_seal_tierk() {
+    local tier=$1 s=$2 e=$3 file childblk c cf lines fallback body
+    file=$(_ctx_blockfile "$tier" "$s" "$e"); [[ -f "$file" ]] && return 0
+    touch "$ROLLUP_LOCK" 2>/dev/null || true   # keepalive, see _ctx_seal_tier1
+    childblk=$(_ctx_pow "$FANOUT" $((tier - 1)))
+    lines=""; fallback=""; c=$s
+    while (( c < e )); do
+        cf=$(_ctx_blockfile $((tier - 1)) "$c" $((c + childblk)))
+        [[ -f "$cf" ]] || die "rollup t$tier [$s,$e): missing child $cf"
+        lines+="$(jq -r '"[" + (.step_ids | join(",")) + "] " + .summary' "$cf")"$'\n'
+        fallback+="$(jq -r '.step_ids[0] // empty' "$cf")"$'\n'
+        c=$((c + childblk))
+    done
+    note "rollup t$tier [$s,$e)"
+    body=$(_llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$lines" 1024) || die "rollup t$tier [$s,$e): bad JSON"
+    local fb_json
+    # awk, not `grep | head`: head's early exit SIGPIPEs grep under pipefail
+    # once the payload outgrows the pipe buffer (large --fanout).
+    fb_json=$(printf '%s' "$fallback" | awk 'NF && ++c <= 4' | jq -R . | jq -sc .)
+    mkdir -p "$(dirname "$file")"
+    jq -n -c --argjson tier "$tier" --argjson start "$s" --argjson end "$e" --argjson n "$((e - s))" \
+        --argjson body "$body" --argjson fb "$fb_json" \
+        --arg model "$MAP_MODEL" --argjson pv "$ROLLUP_PROMPT_VERSION" --arg created "$(date +%Y-%m-%dT%H:%M:%S)" '
+        {tier:$tier, start:$start, end:$end, n:$n,
+         summary:($body.summary // ""), themes:($body.themes // []),
+         step_ids:(($body.step_ids // []) | if length==0 then $fb else . end),
+         model:$model, prompt_version:$pv, created:$created}' > "$file"
+}
+
+# The filtered-step index from which blocks are auto-built. First run records
+# "now" so tiered memory works GOING FORWARD without a synchronous build of any
+# pre-existing history; a --backfill run resets it to 0 (summarize everything).
+# A brand-new agent enables at ~step 0, so "forward from now" is its whole life.
+_ctx_start_index() {
+    local n=$1 s
+    if [[ "$BACKFILL" -eq 1 ]]; then printf '0'; return; fi
+    if [[ -f "$ROLLUP_META" ]]; then
+        s=$(jq -r '.start_index // 0' "$ROLLUP_META" 2>/dev/null) || s=0
+        [[ "$s" =~ ^[0-9]+$ ]] || s=0
+    else
+        s=$n
+    fi
+    # Snap DOWN to a FANOUT boundary: an unsnapped marker leaves the block
+    # straddling it unbuildable forever ((( s < start )) skips it at every
+    # tier), a permanent coverage hole right at the enable point.
+    printf '%s' "$(( (s / FANOUT) * FANOUT ))"
+}
+
+# Lazily seal every complete block at or after `start`, bottom-up. Existing
+# files are skipped, so this is incremental (only the frontier calls the LLM)
+# and idempotent. Blocks older than `start` are left for `recap --backfill`.
+_ctx_build() {
+    local n=$1 start=$2 tier=1 blk nblocks b s e
+    blk=$FANOUT
+    while (( blk <= n )); do
+        nblocks=$(( n / blk ))
+        for (( b = 0; b < nblocks; b++ )); do
+            s=$(( b * blk )); e=$(( (b + 1) * blk ))
+            (( s < start )) && continue
+            if (( tier == 1 )); then _ctx_seal_tier1 "$s" "$e"; else _ctx_seal_tierk "$tier" "$s" "$e"; fi
+        done
+        tier=$(( tier + 1 )); blk=$(( blk * FANOUT ))
+    done
+}
+
+# Assemble and print the staircase: coarse→fine summaries covering [0, cut0),
+# then the raw tail [cut0, N) verbatim. cut0 is snapped to an F boundary and the
+# older region is decomposed positionally (base-F), so coverage is gapless and
+# each tier contributes at most F-1 blocks.
+_ctx_assemble() {
+    local n=$1 r=$2 cut0 remaining tier blk coarser chunk a x
+    _CTX_START=${3:-0}
+    cut0=$(( ((n - r) / FANOUT) * FANOUT )); (( cut0 < 0 )) && cut0=0
+    local -a seg_tier=() seg_s=() seg_e=()
+    remaining=$cut0; tier=1
+    while (( remaining > 0 )); do
+        blk=$(_ctx_pow "$FANOUT" "$tier"); coarser=$(( blk * FANOUT ))
+        chunk=$(( remaining - (remaining / coarser) * coarser ))
+        if (( chunk > 0 )); then
+            a=$(( remaining - chunk ))
+            for (( x = a; x < remaining; x += blk )); do
+                seg_tier+=("$tier"); seg_s+=("$x"); seg_e+=("$(( x + blk ))")
+            done
+        fi
+        remaining=$(( remaining - chunk )); tier=$(( tier + 1 ))
+        (( blk > cut0 )) && break
+    done
+
+    # Print coarse→fine (highest tier first) and, WITHIN a tier, oldest
+    # first. Segments were appended tier-ascending/start-ascending, so a
+    # simple reverse of the flat list flips block order inside each tier —
+    # scrambled chronology under an "oldest first" header. Walk tiers
+    # descending, blocks ascending, instead — that IS chronological order,
+    # since coarser blocks always cover strictly older regions.
+    _CTX_EMITTED=0
+    local max_tier=0 i
+    for (( i = 0; i < ${#seg_tier[@]}; i++ )); do
+        # if-form, not `(( cond )) && assign`: the list form leaves the loop
+        # (and any function it might one day end) with status 1 whenever the
+        # final comparison is false — a latent set -e trap.
+        if (( seg_tier[i] > max_tier )); then max_tier=${seg_tier[i]}; fi
+    done
+    local t
+    for (( t = max_tier; t >= 1; t-- )); do
+        for (( i = 0; i < ${#seg_tier[@]}; i++ )); do
+            (( seg_tier[i] == t )) || continue
+            _ctx_emit_seg "$t" "${seg_s[$i]}" "${seg_e[$i]}"
+        done
+    done
+    (( _CTX_EMITTED )) && printf '\n'
+    # --raw-tail 0 means no verbatim block at all, not "the unsealed
+    # remainder": the caller (the monolith) shows recent steps itself.
+    [[ "$CTX_RAW_TAIL" == "0" ]] && return 0
+    printf '=== RIGHT NOW — the last %s steps, verbatim ===\n' "$(( n - cut0 ))"
+    sed -n "$(( cut0 + 1 )),${n}p" "$RENDERED_TSV" | cut -f4
+}
+
+# Emit one staircase segment. A missing block file is expected, not an
+# error: blocks older than the enable marker are deliberately never built
+# until --backfill, so dying here would cost the mind its whole context
+# (callers swallow stderr and the raw tail would be lost with it). But a
+# coarse block can ALSO be missing because it merely STRADDLES the marker —
+# its oldest child is pre-enable, so tier k never seals even though the
+# finer blocks from the marker onward all exist. Skipping such a segment
+# outright would silently drop every one of those built summaries the
+# moment cut0 crosses a FANOUT^k boundary (at 10k steps, all summarized
+# life before 10k vanishes). So: descend into the F children one tier down
+# and emit whatever exists; only a tier-1 miss is truly absent history.
+_ctx_emit_seg() {
+    local tier=$1 s=$2 e=$3 bf blk c
+    # Prune segments wholly before the enable marker: nothing there is built
+    # at ANY tier until --backfill, and without this cutoff the descent
+    # explores that entire empty tree — one subshell per node, ~cut0/FANOUT
+    # forks on EVERY --context call, growing with the age of the mind. A
+    # straddling segment (s < start < e) still descends: its post-marker
+    # children exist and must print.
+    (( e <= _CTX_START )) && return 0
+    printf -v bf '%s/t%s/%012d-%012d.json' "$ROLLUP_DIR" "$tier" "$s" "$e"
+    if [[ -f "$bf" ]]; then
+        if (( _CTX_EMITTED == 0 )); then
+            printf '=== YOUR LIFE SO FAR — summarized, oldest first ===\n'
+        fi
+        _CTX_EMITTED=1
+        jq -r '"[t\(.tier) · steps \(.start)–\(.end)] \(.summary)   (\(.step_ids | join(" ")))"' \
+            "$bf" 2>/dev/null \
+            || printf '[t%s · steps %s–%s] (unreadable rollup block)\n' "$tier" "$s" "$e"
+        return 0
+    fi
+    (( tier <= 1 )) && return 0
+    blk=$(_ctx_pow "$FANOUT" $((tier - 1)))
+    for (( c = s; c < e; c += blk )); do
+        _ctx_emit_seg $((tier - 1)) "$c" $((c + blk))
+    done
+}
+
+# Render the trajectory into $RENDERED_TSV via a persistent cache. Parsing
+# every raw line to keep the ~8 signal types is the dominant --context cost
+# on a long life (minutes of jq at 100% CPU on a multi-hundred-MB log), and
+# the log is append-only — so the TSV is kept next to the blocks and only
+# raw lines past the recorded high-water mark are rendered on later calls.
+# Any mismatch (row-format version, keep set, or a log that SHRANK, which
+# append-only says cannot happen) rebuilds from scratch. Runs under
+# $ROLLUP_LOCK, so no concurrent writers.
+_render_cached() {
+    local raw_lines done_lines="" meta_ver="" meta_keep="" last_row
+    raw_lines=$(wc -l < "$JSONL" | tr -d ' ')
+    if [[ -f "$RENDER_META" && -f "$RENDERED_TSV" ]]; then
+        meta_ver=$(jq -r '.version // empty' "$RENDER_META" 2>/dev/null) || meta_ver=""
+        meta_keep=$(jq -r '.keep // empty' "$RENDER_META" 2>/dev/null) || meta_keep=""
+        done_lines=$(jq -r '.raw_lines // empty' "$RENDER_META" 2>/dev/null) || done_lines=""
+    fi
+    if [[ "$meta_ver" != "$RENDER_VERSION" || "$meta_keep" != "$KEEP_TYPES" \
+          || ! "$done_lines" =~ ^[0-9]+$ || "$done_lines" -gt "$raw_lines" ]]; then
+        _render_steps 1 "$raw_lines" > "$RENDERED_TSV.tmp"
+        mv "$RENDERED_TSV.tmp" "$RENDERED_TSV"
+    elif (( done_lines < raw_lines )); then
+        # A crash between a previous append and its meta write leaves rows
+        # above the recorded mark; drop them first or they would duplicate.
+        last_row=$(tail -n 1 "$RENDERED_TSV" | cut -f1)
+        if [[ "$last_row" =~ ^[0-9]+$ ]] && (( last_row > done_lines )); then
+            awk -F'\t' -v max="$done_lines" '$1 + 0 <= max' "$RENDERED_TSV" > "$RENDERED_TSV.tmp"
+            mv "$RENDERED_TSV.tmp" "$RENDERED_TSV"
+        fi
+        _render_steps "$((done_lines + 1))" "$((raw_lines - done_lines))" >> "$RENDERED_TSV"
+    fi
+    jq -n --argjson v "$RENDER_VERSION" --arg keep "$KEEP_TYPES" \
+        --argjson lines "$raw_lines" --arg u "$(date +%Y-%m-%dT%H:%M:%S)" \
+        '{version:$v, keep:$keep, raw_lines:$lines, updated:$u}' > "$RENDER_META"
+}
+
+_ctx_run() {
+    mkdir -p "$ROLLUP_DIR"
+    if [[ -d "$ROLLUP_LOCK" ]]; then
+        [[ -n "$(find "$ROLLUP_LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ]] && rmdir "$ROLLUP_LOCK" 2>/dev/null || true
+    fi
+    mkdir "$ROLLUP_LOCK" 2>/dev/null || die "another rollup build is in progress (remove $ROLLUP_LOCK if wrong)"
+    RENDERED_TSV="$ROLLUP_DIR/rendered.tsv"
+    RENDER_META="$ROLLUP_DIR/rendered.meta.json"
+    # shellcheck disable=SC2064
+    trap "rm -f '$RENDERED_TSV.tmp'; rmdir '$ROLLUP_LOCK' 2>/dev/null || true" EXIT
+
+    _render_cached
+    local n r start
+    n=$(wc -l < "$RENDERED_TSV" | tr -d ' ')
+    r=$(_ctx_resolve_R "$n")
+    start=$(_ctx_start_index "$n")
+    # Persist the start marker on first enable (records "now") or on backfill
+    # (resets to 0 → history is now in-scope and stays complete going forward).
+    if [[ ! -f "$ROLLUP_META" || "$BACKFILL" -eq 1 ]]; then
+        jq -n --argjson s "$start" --arg u "$(date +%Y-%m-%dT%H:%M:%S)" \
+            '{start_index:$s, updated:$u}' > "$ROLLUP_META"
+    fi
+    [[ "$MODE" == "rebuild" ]] && rm -rf "$ROLLUP_DIR"/t* 2>/dev/null || true
+    [[ "$MODE" != "cached" ]] && _ctx_build "$n" "$start"
+    _ctx_assemble "$n" "$r" "$start"
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+if [[ "$CONTEXT" -eq 1 ]]; then
+    _ctx_run
+    exit 0
+fi
+
+case "$MODE" in
+    rebuild)
+        rm -rf "$CACHE"
+        _refresh
+        ;;
+    auto)
+        _refresh
+        ;;
+    cached)
+        ;;
+esac
+
+if [[ "$OUTPUT" == "json" ]]; then
+    _print_json
+else
+    _print_text
+fi

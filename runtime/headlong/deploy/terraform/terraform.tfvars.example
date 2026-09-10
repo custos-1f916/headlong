@@ -1,0 +1,31 @@
+# Copy to terraform.tfvars and fill in. No secrets belong here — the box's
+# .env (API keys, SHELLM_MODEL) lives in the SSM parameter; see README.
+# Gitignored anyway, and the state file DOES hold secrets (tunnel token).
+
+aws_region = "us-east-1"
+
+# Cloudflare — IDs are on the zone overview page / Zero Trust dashboard
+cloudflare_account_id = "REPLACE_ME"
+cloudflare_zone_id    = "REPLACE_ME"
+domain                = "example.com"
+subdomain             = "agents"
+
+allowed_emails = [
+  "you@example.com",
+  "boss@example.com",
+]
+
+# Optional: let a whole Google Workspace domain SSO into the dash. Create an
+# OAuth client in Google Cloud console first (type Web application, redirect
+# URI https://<team>.cloudflareaccess.com/cdn-cgi/access/callback) — see
+# deploy/terraform-slack/README.md for the consent-screen choice. Leave
+# unset for OTP-only.
+# allowed_email_domains  = ["example.com"]
+# google_oauth_client_id = "1234-abc.apps.googleusercontent.com"
+# Secret: prefer TF_VAR_google_oauth_client_secret from op via .envrc (see
+# envrc.example). Setting it here works too (gitignored; state holds it
+# regardless):
+# google_oauth_client_secret = "GOCSPX-..."
+
+# Deploy a specific branch while the feature branch is unmerged
+# shellm_branch = "nj/run_local_llm"

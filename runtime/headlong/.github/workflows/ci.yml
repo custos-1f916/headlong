@@ -1,0 +1,351 @@
+# CI — runs on every push to main and every pull request.
+#
+# All of these are hermetic: the bash tests stub `llm`/`curl`, the pytest
+# suites need no keys or network beyond package downloads, and the install
+# smoke test clones from the workspace instead of GitHub. No secrets needed
+# except for the failure alert at the end.
+#
+# Jobs (all run in parallel, ~3 min wall clock):
+#   harness        tests/run-all.sh            bash tests for bin/ and tools/
+#   python         pytest                       web, slack, telegram (matrix)
+#   viewer         bun test + typecheck + build web/viewer (what the box builds)
+#   tui            cargo fmt/clippy/check       tui/headlong
+#   shellcheck     shellcheck -S warning        every shell script in the tree
+#   macos          bash 3.2 lint + harness      the product scripts must run on
+#                                               macOS's stock /bin/bash (3.2):
+#                                               syntax parse, a grep for
+#                                               bash-4-only constructs, and
+#                                               tests/run-all.sh, on a macOS
+#                                               runner with bash 3.2 as `bash`
+#   install-smoke  tests/smoke_install.sh       install.sh, both modes, in a
+#                                               bare ubuntu:24.04 container
+#   gitleaks       gitleaks git (full history)  secrets; allowlist in .gitleaks.toml
+#   loc            cloc bin/ thinkers/          the harness stays under
+#                                               LOC_LIMIT code lines (the
+#                                               README's "about 10K lines"
+#                                               claim; was 10K at the launch
+#                                               blog post, week of 2026-08-24)
+#   alert-main     Slack post                    after each push to main: red
+#                                               when a job failed, green-again
+#                                               when the previous run was red;
+#                                               the one job that uses a secret
+#                                               (SLACK_ALERT_BOT_TOKEN); skipped
+#                                               on PRs
+#
+# Run the same things locally: tests/run-all.sh, uv run --project web pytest
+# web/tests (and slack, telegram), bun run test/typecheck/build in web/viewer,
+# cargo fmt --check / clippy / check in tui/headlong, tests/smoke_install.sh,
+# gitleaks git . -c .gitleaks.toml, cloc bin/ thinkers/. For the macOS gate on
+# a Mac: PATH=/bin:/usr/bin:$PATH tests/run-all.sh (so `bash` is 3.2).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch/PR cancels the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  harness:
+    name: bash tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # The runner has a live Docker daemon, and shellm switches to Docker
+      # mode whenever `docker info` succeeds. The harness tests stub llm on
+      # the host, so force host execution here (tests that spawn shellm pin
+      # this themselves too; this is the safety net for new ones).
+      SHELLM_ENV: local
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tools the harness shells out to
+        # jq, shellcheck, setsid, flock, timeout, python3 ship on the runner
+        # image; uuidgen (uuid-runtime) is installed explicitly so a nested
+        # shellm run never depends on the image's package set.
+        run: sudo apt-get install -y -qq uuid-runtime >/dev/null
+      - name: Run tests/test_*.sh
+        run: tests/run-all.sh
+
+  python:
+    name: pytest (${{ matrix.project }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [web, slack, telegram]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: ${{ matrix.project }}/uv.lock
+      - name: Sync (lockfile must be current)
+        run: uv sync --locked --project ${{ matrix.project }}
+      - name: pytest
+        run: uv run --project ${{ matrix.project }} pytest ${{ matrix.project }}/tests -q
+
+  viewer:
+    name: viewer test + typecheck + build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web/viewer
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run test
+      - run: bun run typecheck
+      - run: bun run build
+
+  tui:
+    name: cargo fmt + clippy + check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: tui/headlong
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tui/headlong
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo check
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck -S warning on every shell script
+        # Every tracked file with a sh/bash shebang, plus *.sh (sourced libs
+        # without a shebang carry a `# shellcheck shell=` directive).
+        # Terraform templates (*.tpl) are skipped: their ${var} interpolation
+        # is not shell. Warning level is the gate; the tree is clean at it.
+        run: |
+          set -euo pipefail
+          shellcheck --version
+          files=$( { git ls-files -z | xargs -0 grep -lE '^#!.*\b(ba)?sh\b' ; git ls-files '*.sh'; } | sort -u | grep -v '\.tpl$')
+          echo "$files" | wc -l | xargs echo "checking files:"
+          echo "$files" | xargs shellcheck -S warning
+  macos:
+    name: macOS (bash 3.2)
+    # Headlong has to run on a stock Mac, whose /bin/bash is 3.2 (Apple never
+    # shipped a GPLv3 bash). Bash-4 expansions like ${x^^} are a fatal "bad
+    # substitution" there, which once made every shellm run on macOS exit
+    # rc=1 with no output (PR #38). Three checks, all with bash 3.2 as the
+    # `bash` that `#!/usr/bin/env bash` resolves to:
+    #   1. bash -n parses every product script.
+    #   2. A grep for the bash-4-only constructs bash -n cannot catch (they
+    #      fail at run time, only on the path that reaches them).
+    #   3. The full harness, tests/run-all.sh.
+    # Scope is the product: bin/ thinkers/ tools/ tests/ and the root
+    # scripts. deploy/ is Linux-only (systemd) or laptop operator tooling
+    # that runs under Homebrew bash, so it is left out.
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      SHELLM_ENV: local
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tools the harness shells out to
+        # GNU timeout/realpath (coreutils) and jq. Usually preinstalled on
+        # the macOS image; install only when missing.
+        run: |
+          brew list coreutils >/dev/null 2>&1 || brew install -q coreutils
+          brew list jq >/dev/null 2>&1 || brew install -q jq
+      - name: Make Apple's /bin/bash the `bash` on PATH
+        # The image also has Homebrew bash 5 on PATH, which would hide every
+        # 3.2 problem. A shim dir ahead of everything else makes `bash` and
+        # `/usr/bin/env bash` resolve to /bin/bash.
+        run: |
+          mkdir -p "$RUNNER_TEMP/bash32"
+          ln -sf /bin/bash "$RUNNER_TEMP/bash32/bash"
+          echo "$RUNNER_TEMP/bash32" >> "$GITHUB_PATH"
+      - name: Verify bash is 3.2
+        run: |
+          bash --version | head -1
+          bash -c 'echo "BASH_VERSION=$BASH_VERSION"; [[ "$BASH_VERSION" == 3.2.* ]]'
+          env bash -c '[[ "$BASH_VERSION" == 3.2.* ]]'
+      - name: bash -n parse under 3.2
+        run: |
+          set -euo pipefail
+          files=$( { git ls-files -z bin thinkers tools tests install.sh uninstall.sh status.sh | xargs -0 grep -lE '^#!.*\b(ba)?sh\b' ; git ls-files 'bin/*.sh' 'thinkers/*.sh' 'tools/*.sh' 'tests/*.sh'; } | sort -u)
+          echo "$files" | wc -l | xargs echo "parsing files:"
+          rc=0
+          for f in $files; do bash -n "$f" || { echo "::error file=$f::does not parse under bash 3.2"; rc=1; }; done
+          exit $rc
+      - name: Lint for bash-4-only constructs
+        # Run-time failures on 3.2 that bash -n accepts: case-changing
+        # expansions ${x^^} ${x,,}, ${x@Q}-style transforms, associative
+        # arrays (declare -A), mapfile/readarray, coproc, |&, ;;&, &>>.
+        # Comment lines are ignored. Use tr for case, a while-read loop for
+        # mapfile, and plain arrays or a lookup function for declare -A.
+        run: |
+          set -euo pipefail
+          files=$( { git ls-files -z bin thinkers tools tests install.sh uninstall.sh status.sh | xargs -0 grep -lE '^#!.*\b(ba)?sh\b' ; git ls-files 'bin/*.sh' 'thinkers/*.sh' 'tools/*.sh' 'tests/*.sh'; } | sort -u)
+          pat='\$\{[A-Za-z_0-9@*#!]+(\[[^]]*\])?(\^|,)|\$\{[A-Za-z_0-9]+(\[[^]]*\])?@[QEPAaKkULu]\}|(^|[^-a-zA-Z])(declare|local|typeset) +-[a-zA-Z]*A|\b(mapfile|readarray|coproc)\b|\|&|;;&|&>>'
+          hits=$(echo "$files" | xargs grep -nE "$pat" | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)
+          if [[ -n "$hits" ]]; then
+            echo "$hits"
+            echo "::error::bash-4-only syntax found; macOS /bin/bash is 3.2"
+            exit 1
+          fi
+          echo "clean"
+      - name: Run tests/test_*.sh under bash 3.2
+        run: tests/run-all.sh
+
+  install-smoke:
+    name: install.sh smoke (ubuntu:24.04)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # A bare image, as root, with no jq/curl: exercises install.sh's own
+    # apt-get path and the container branch of its PATH handling.
+    container: ubuntu:24.04
+    steps:
+      - name: Install git (checkout + the smoke test's local clone need it)
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git ca-certificates >/dev/null
+      - uses: actions/checkout@v5
+      - name: Trust the workspace (owned by the runner user, we are root)
+        run: git config --global --add safe.directory '*'
+      - name: tests/smoke_install.sh
+        run: bash tests/smoke_install.sh
+
+  gitleaks:
+    name: gitleaks (full history)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GITLEAKS_VERSION: 8.30.1
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # scan every commit, not just the tip
+      - name: Install gitleaks (pinned release, checksum-verified)
+        # The gitleaks GitHub Action needs a paid license for org repos; the
+        # binary does the same scan for free.
+        run: |
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          curl -fsSLO "$base/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSLO "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz\$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum -c -
+          tar -xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Scan all commits
+        # Fails on any finding not allowlisted in .gitleaks.toml. Secrets are
+        # redacted in the log; the SARIF-free JSON report is kept as an
+        # artifact for triage.
+        run: gitleaks git . --config .gitleaks.toml --redact --report-format json --report-path gitleaks-report.json --no-banner -v
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: gitleaks-report
+          path: gitleaks-report.json
+          retention-days: 7
+
+  loc:
+    name: cloc bin/ thinkers/ under limit
+    # The README sells the harness as small enough to read end to end and
+    # quotes cloc's count for bin/ + thinkers/. This keeps that honest: the
+    # job fails when the code-line total (cloc's SUM, blanks and comments
+    # excluded) goes over LOC_LIMIT, so growth is a deliberate choice (raise
+    # the limit here, and the README number) rather than drift.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      LOC_LIMIT: 11000
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install cloc
+        run: sudo apt-get install -y -qq cloc >/dev/null
+      - name: Count and compare
+        run: |
+          set -euo pipefail
+          cloc --version
+          cloc bin/ thinkers/
+          code=$(cloc --quiet --json bin/ thinkers/ | jq -r '.SUM.code')
+          echo "cloc bin/ thinkers/ = ${code} code lines (limit ${LOC_LIMIT})"
+          echo "cloc bin/ thinkers/ = **${code}** code lines (limit ${LOC_LIMIT})" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -gt "$LOC_LIMIT" ]; then
+            echo "::error::bin/ + thinkers/ is ${code} code lines, over the ${LOC_LIMIT} limit. Trim, or raise LOC_LIMIT in .github/workflows/ci.yml and update the README's line count on purpose."
+            exit 1
+          fi
+
+  alert-main:
+    name: alert on red / green main
+    # Runs after every push to main. Posts to Slack when a job failed, and
+    # posts again when main goes back to green after a red run (it asks the
+    # API for the previous completed run's conclusion). Silent when green
+    # follows green. Same channel as the box's thinkers-alert unit
+    # (C0BMVH6LM4K). The token is a bot token with chat:write; the job
+    # skips the post if the secret is missing. Skipped entirely on PRs.
+    needs: [harness, python, viewer, tui, shellcheck, install-smoke, gitleaks, loc]
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read      # to read the previous run's conclusion
+    env:
+      SLACK_CHANNEL: C0BMVH6LM4K
+    steps:
+      - name: Decide and post
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_ALERT_BOT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          NEEDS: ${{ toJSON(needs) }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO: ${{ github.repository }}
+          WORKFLOW_FILE: ci.yml
+          SHA: ${{ github.sha }}
+          HEAD_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          failed=$(jq -r 'to_entries[] | select(.value.result=="failure") | .key' <<<"$NEEDS" | paste -sd, -)
+          subject=$(printf '%s' "$HEAD_MSG" | head -n1 | cut -c1-80)
+
+          if [[ -n "$failed" ]]; then
+            text=":red_circle: CI red on main at ${SHA:0:7} (${subject}) — failed: ${failed}. ${RUN_URL}"
+          else
+            # Green now. Was the previous completed push run on main red?
+            prev=$(gh api "repos/${REPO}/actions/workflows/${WORKFLOW_FILE}/runs?branch=main&event=push&status=completed&per_page=10"               --jq "[.workflow_runs[] | select(.id != ${RUN_ID}) | select(.conclusion != \"cancelled\" and .conclusion != \"skipped\")] | .[0].conclusion // \"none\"")
+            echo "previous completed main run: ${prev}"
+            if [[ "$prev" != "failure" ]]; then
+              echo "green after green; nothing to post"
+              exit 0
+            fi
+            text=":large_green_circle: main is green again at ${SHA:0:7} (${subject}). ${RUN_URL}"
+          fi
+
+          if [[ -z "${SLACK_BOT_TOKEN:-}" ]]; then
+            echo "SLACK_ALERT_BOT_TOKEN not set; would have posted: ${text}" >&2
+            exit 0
+          fi
+          payload=$(jq -n --arg ch "$SLACK_CHANNEL" --arg t "$text" '{channel:$ch, text:$t, unfurl_links:false}')
+          resp=$(curl -fsS -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H 'content-type: application/json; charset=utf-8' \
+            --data "$payload")
+          jq -e '.ok' <<<"$resp" >/dev/null || { echo "Slack API error: $resp" >&2; exit 1; }
+          echo "posted to $SLACK_CHANNEL: $text"

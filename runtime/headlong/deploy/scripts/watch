@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# deploy/scripts/watch — follow a service's journal on the box from your
+# laptop. Ctrl-C detaches; the service keeps running.
+#
+# Usage: deploy/scripts/watch [web|bridge|persona]   (default: web)
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+case "${1:-}" in
+    -h|--help) sed -n '2,5p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
+case "${1:-web}" in
+    web)     unit="headlong-web" ;;
+    bridge)  unit="headlong-slack-bridge" ;;
+    persona) unit="headlong-slack-agent" ;;
+    *) die "unknown target '${1}' (web|bridge|persona)" ;;
+esac
+
+require_tools terraform aws session-manager-plugin jq
+require_state
+require_aws
+
+state=$(instance_state)
+[[ "$state" == "running" ]] || die "instance is '$state' — start it with deploy/scripts/start"
+
+# The box may be either side of the headlong unit rename; journalctl on a
+# unit that was never installed just sits there printing nothing, which
+# reads as "the service is quiet" rather than "wrong unit name".
+info "Following $unit on $(instance_id) (Ctrl-C detaches)"
+run_on_box "u='$unit'
+[ -f \"/etc/systemd/system/\$u.service\" ] || u=\"shelly-\${u#headlong-}\"
+sudo journalctl -u \"\$u\" -n 50 -f"

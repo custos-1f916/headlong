@@ -1,0 +1,613 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# skills — the skills the mind can read: list, show, and render them into
+# its prompt. Skills follow the Agent Skills open standard (a SKILL.md with
+# YAML frontmatter). Installing, searching, checking, remotes and the kernel
+# live in tools/headlong-skills, which shares this file; `skills <that
+# subcommand>` forwards to it when it is on PATH. Pure bash, jq.
+
+# ---------------------------------------------------------------------------
+# Config & defaults
+# ---------------------------------------------------------------------------
+
+SKILLS_VERSION="0.1.0"
+SKILLS_DIR="${SKILLS_DIR:-./.skills}"
+SKILLS_KERNEL_DIR="${SKILLS_KERNEL_DIR:-}"
+SKILLS_KERNEL_TOKEN_BUDGET="${SKILLS_KERNEL_TOKEN_BUDGET:-8000}"
+SKILLS_REMOTES="${SKILLS_REMOTES:-}"
+VERBOSE=0
+
+# Source rc file (flags > env vars > rc file)
+# SKILLSRC env var overrides the default ./.skillsrc location.
+_skillsrc="${SKILLSRC:-.skillsrc}"
+if [[ -f "$_skillsrc" ]]; then
+    _pre_env=$(env | grep '^SKILLS_') || true
+    # shellcheck disable=SC1090  # user rc file, location is runtime
+    source "$_skillsrc"
+    while IFS='=' read -r k v; do
+        [[ -n "$k" ]] && export "$k=$v"
+    done <<< "$_pre_env"
+fi
+# Warn if CWD .skillsrc exists but is being ignored due to SKILLSRC override
+if [[ -n "${SKILLSRC:-}" && -f ".skillsrc" && "$_skillsrc" != ".skillsrc" ]]; then
+    printf '\033[33m⚠\033[0m Ignoring .skillsrc in current directory (using %s)\n' "$_skillsrc" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+die() { echo "skills: error: $*" >&2; exit 1; }
+
+# Process SKILL.md content, executing ```bash blocks with #| eval: true.
+# Reads from stdin, writes processed output to stdout.
+# Quarto-inspired directives: eval, echo, stdout, stderr.
+_process_skill_blocks() {
+    local state="passthrough"
+    local -a code_lines=()
+    local eval_dir="false" echo_dir="false" stdout_dir="true" stderr_dir="true"
+    local line key value
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$state" == "passthrough" ]]; then
+            if [[ "$line" =~ ^\`\`\`bash[[:space:]]*$ || "$line" == '```bash' ]]; then
+                state="fence"
+                code_lines=()
+                eval_dir="false"
+                echo_dir="false"
+                stdout_dir="true"
+                stderr_dir="true"
+            else
+                printf '%s\n' "$line"
+            fi
+        elif [[ "$state" == "fence" ]]; then
+            if [[ "$line" =~ ^'#| '([a-zA-Z]+):[[:space:]]*(.*) ]]; then
+                key="${BASH_REMATCH[1]}"
+                value="${BASH_REMATCH[2]}"
+                # Trim trailing whitespace
+                value="${value%"${value##*[![:space:]]}"}"
+                case "$key" in
+                    eval)   eval_dir="$value" ;;
+                    echo)   echo_dir="$value" ;;
+                    stdout) stdout_dir="$value" ;;
+                    stderr) stderr_dir="$value" ;;
+                esac
+            elif [[ "$line" == '```' ]]; then
+                if [[ "$eval_dir" == "true" ]]; then
+                    # Execute the block
+                    if [[ "$echo_dir" == "true" ]]; then
+                        printf '%s\n' '```bash'
+                        printf '%s\n' "${code_lines[@]}"
+                        printf '%s\n' '```'
+                    fi
+                    # Build the script from collected code lines
+                    local script=""
+                    local cl
+                    for cl in "${code_lines[@]}"; do
+                        script="${script}${cl}
+"
+                    done
+                    # Run and capture stdout/stderr separately
+                    local tmp_out tmp_err
+                    tmp_out=$(mktemp)
+                    tmp_err=$(mktemp)
+                    bash -c "$script" >"$tmp_out" 2>"$tmp_err" || true
+                    if [[ "$stdout_dir" == "true" && -s "$tmp_out" ]]; then
+                        cat "$tmp_out"
+                    fi
+                    if [[ "$stderr_dir" == "true" && -s "$tmp_err" ]]; then
+                        cat "$tmp_err"
+                    fi
+                    rm -f "$tmp_out" "$tmp_err"
+                else
+                    # Not eval — emit block unchanged
+                    printf '%s\n' '```bash'
+                    local cl
+                    for cl in "${code_lines[@]}"; do
+                        printf '%s\n' "$cl"
+                    done
+                    printf '%s\n' '```'
+                fi
+                state="passthrough"
+            else
+                code_lines+=("$line")
+            fi
+        fi
+    done
+}
+
+# Color output (respects NO_COLOR env var)
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    _bold='\033[1m'
+    _dim='\033[90m'
+    _blue='\033[1;34m'
+    _cyan='\033[36m'
+    _yellow='\033[33m'
+    _reset='\033[0m'
+else
+    _bold='' _dim='' _blue='' _cyan='' _yellow='' _reset=''
+fi
+
+info() { printf "${_blue}▶${_reset} %b\n" "$*" >&2; }
+dim() { printf "${_dim}  %s${_reset}\n" "$*" >&2; }
+warn() { printf "${_yellow}⚠${_reset} %b\n" "$*" >&2; }
+
+debug() {
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        printf "${_dim}[skills debug] %s${_reset}\n" "$*" >&2
+    fi
+}
+
+# Extract a field from SKILL.md YAML frontmatter.
+# Usage: frontmatter_field <file> <field>
+# Handles unquoted, double-quoted, and single-quoted values.
+# Only reads the first frontmatter block (between first and second ---).
+# Prints the first value of a frontmatter field, or nothing. Never fails:
+# under `set -e -o pipefail` a grep miss on a SKILL.md with no frontmatter
+# used to abort the whole script, and `skills prompt` then printed nothing.
+# Audel wrote such a skill on 2026-08-15 and every wake prompt after it lost
+# its skills section, unnoticed, until 2026-09-04.
+frontmatter_field() {
+    local file="$1" field="$2"
+    { awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f{print}' "$file" \
+        | grep "^${field}:" \
+        | head -1 \
+        | sed "s/^${field}:[[:space:]]*//" \
+        | sed "s/^[\"']\(.*\)[\"']$/\1/"; } 2>/dev/null || true
+}
+
+# Resolve the skills directory (project-level or local).
+skills_dir() {
+    local project="${1:-0}"
+    if [[ "$project" -eq 1 ]]; then
+        echo ".skills"
+    else
+        echo "$SKILLS_DIR"
+    fi
+}
+
+# Build deduplicated list of skill search directories.
+# Checks: .skills (project), kernel dir (if set), SKILLS_DIR (identity/override)
+_all_skill_dirs() {
+    local d real _seen=""
+    for d in ".skills" ${SKILLS_KERNEL_DIR:+"$SKILLS_KERNEL_DIR"} "$SKILLS_DIR"; do
+        [[ -z "$d" ]] && continue
+        real=$(cd "$d" 2>/dev/null && pwd) || real="$d"
+        case "$_seen" in
+            *"|$real|"*) continue ;;
+        esac
+        _seen="${_seen}|${real}|"
+        echo "$d"
+    done
+}
+
+# Label a skill directory as project, kernel, or local.
+_skill_dir_label() {
+    local dir="$1" dreal kreal
+    dreal=$(cd "$dir" 2>/dev/null && pwd) || dreal="$dir"
+    if [[ "$dir" == ".skills" ]]; then echo "project"
+    elif [[ -n "$SKILLS_KERNEL_DIR" ]]; then
+        kreal=$(cd "$SKILLS_KERNEL_DIR" 2>/dev/null && pwd) || kreal="$SKILLS_KERNEL_DIR"
+        if [[ "$dreal" == "$kreal" ]]; then echo "kernel"; else echo "local"; fi
+    else echo "local"
+    fi
+}
+
+# Find a skill directory by name. Checks project-level first, then kernel, then local.
+# Matches against the frontmatter `name` field, then the directory name.
+# Prints the path to stdout, or returns 1 if not found.
+find_skill() {
+    local name="$1"
+    local dir skill_dir skill_name
+
+    while IFS= read -r dir; do
+        [[ -d "$dir" ]] || continue
+
+        # Match by directory name
+        if [[ -d "$dir/$name" && -f "$dir/$name/SKILL.md" ]]; then
+            echo "$dir/$name"
+            return
+        fi
+
+        # Match by frontmatter name field
+        for skill_dir in "$dir"/*/; do
+            [[ -f "${skill_dir}SKILL.md" ]] || continue
+            skill_name=$(frontmatter_field "${skill_dir}SKILL.md" "name")
+            if [[ "$skill_name" == "$name" ]]; then
+                printf '%s' "${skill_dir%/}"
+                return
+            fi
+        done
+    done < <(_all_skill_dirs)
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Requirements parsing & checking
+# ---------------------------------------------------------------------------
+
+# Extract metadata.shelllm block from SKILL.md frontmatter as JSON.
+# Supports inline JSON (metadata: {"shelllm": {...}}) and multi-line YAML.
+# Returns JSON: {"requires":{"env":[],"bins":[],"anyBins":[],"os":[]}}
+# Returns "{}" if no metadata.shelllm block found.
+_extract_shelllm_meta() {
+    local file="$1"
+    [[ -f "$file" ]] || { echo '{}'; return; }
+
+    # Extract only the first frontmatter block (between first and second ---)
+    # Using awk instead of sed to avoid capturing --- delimited blocks in the body
+    local frontmatter
+    frontmatter=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f{print}' "$file")
+    [[ -z "$frontmatter" ]] && { echo '{}'; return; }
+
+    # Check if metadata exists at all
+    printf '%s\n' "$frontmatter" | grep -q '^metadata:' || { echo '{}'; return; }
+
+    # Try inline JSON: metadata: {"shelllm": {...}}
+    local meta_inline
+    meta_inline=$(printf '%s\n' "$frontmatter" | grep '^metadata:' | sed 's/^metadata:[[:space:]]*//')
+    if [[ -n "$meta_inline" ]] && printf '%s' "$meta_inline" | jq -e '.shelllm' >/dev/null 2>&1; then
+        printf '%s' "$meta_inline" | jq -c '.shelllm'
+        return
+    fi
+
+    # Multi-line YAML: extract requires fields by grepping indented lines.
+    # Arrays use JSON bracket notation ["a", "b"], so jq can parse them directly.
+    local env_val bins_val anybins_val os_val
+    env_val=$(printf '%s\n' "$frontmatter" | awk '/^[[:space:]]+env:/{sub(/.*env:[[:space:]]*/, ""); print; exit}')
+    bins_val=$(printf '%s\n' "$frontmatter" | awk '/^[[:space:]]+bins:/{sub(/.*bins:[[:space:]]*/, ""); print; exit}')
+    anybins_val=$(printf '%s\n' "$frontmatter" | awk '/^[[:space:]]+anyBins:/{sub(/.*anyBins:[[:space:]]*/, ""); print; exit}')
+    os_val=$(printf '%s\n' "$frontmatter" | awk '/^[[:space:]]+os:/{sub(/.*os:[[:space:]]*/, ""); print; exit}')
+
+    # If nothing found, return empty
+    if [[ -z "$env_val" && -z "$bins_val" && -z "$anybins_val" && -z "$os_val" ]]; then
+        echo '{}'
+        return
+    fi
+
+    jq -n \
+        --argjson env "${env_val:-[]}" \
+        --argjson bins "${bins_val:-[]}" \
+        --argjson anybins "${anybins_val:-[]}" \
+        --argjson os "${os_val:-[]}" \
+        '{requires: {env: $env, bins: $bins, anyBins: $anybins, os: $os}}'
+}
+
+# Returns a comma-separated summary of missing requirements.
+# Takes the JSON from _extract_shelllm_meta as $1.
+_missing_summary() {
+    local meta="$1"
+    [[ "$meta" == "{}" || -z "$meta" ]] && return
+
+    local missing=""
+
+    # Missing env vars
+    local var
+    while IFS= read -r var; do
+        [[ -z "$var" ]] && continue
+        if [[ -z "${!var:-}" ]]; then
+            [[ -n "$missing" ]] && missing="$missing, "
+            missing="${missing}${var}"
+        fi
+    done < <(printf '%s' "$meta" | jq -r '(.requires.env // [])[]' 2>/dev/null)
+
+    # Missing required bins
+    local bin
+    while IFS= read -r bin; do
+        [[ -z "$bin" ]] && continue
+        if ! command -v "$bin" >/dev/null 2>&1; then
+            [[ -n "$missing" ]] && missing="$missing, "
+            missing="${missing}${bin}"
+        fi
+    done < <(printf '%s' "$meta" | jq -r '(.requires.bins // [])[]' 2>/dev/null)
+
+    # Missing anyBins
+    local any_count=0 any_found=0 any_names=""
+    while IFS= read -r bin; do
+        [[ -z "$bin" ]] && continue
+        any_count=$((any_count + 1))
+        [[ -n "$any_names" ]] && any_names="$any_names, "
+        any_names="${any_names}${bin}"
+        command -v "$bin" >/dev/null 2>&1 && any_found=1
+    done < <(printf '%s' "$meta" | jq -r '(.requires.anyBins // [])[]' 2>/dev/null)
+    if [[ "$any_count" -gt 0 && "$any_found" -eq 0 ]]; then
+        [[ -n "$missing" ]] && missing="$missing, "
+        missing="${missing}one of [${any_names}]"
+    fi
+
+    # Missing OS
+    local os_count
+    os_count=$(printf '%s' "$meta" | jq -r '(.requires.os // []) | length' 2>/dev/null)
+    if [[ "${os_count:-0}" -gt 0 ]]; then
+        local current_os
+        current_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+        if ! printf '%s' "$meta" | jq -e --arg os "$current_os" '(.requires.os // []) | index($os) != null' >/dev/null 2>&1; then
+            [[ -n "$missing" ]] && missing="$missing, "
+            missing="${missing}os:${current_os}"
+        fi
+    fi
+
+    printf '%s' "$missing"
+}
+
+# ---------------------------------------------------------------------------
+# Remote management utilities
+# ---------------------------------------------------------------------------
+
+
+# Split SKILLS_REMOTES on commas, trim whitespace, output one per line.
+
+action_list() {
+    local show_all="${1:-0}"
+    local format="${2:-}"
+    local found=0
+    local dir label skill_dir name desc
+    local skipped=""
+    # Track seen skill names for conflict detection (pipe-delimited for bash 3.2 compat)
+    local _seen_skills="|"
+    local _seen_paths=""
+
+    while IFS= read -r dir; do
+        [[ -d "$dir" ]] || continue
+        label=$(_skill_dir_label "$dir")
+
+        for skill_dir in "$dir"/*/; do
+            [[ -f "${skill_dir}SKILL.md" ]] || continue
+
+            name=$(frontmatter_field "${skill_dir}SKILL.md" "name")
+            desc=$(frontmatter_field "${skill_dir}SKILL.md" "description")
+            [[ -z "$name" ]] && name=$(basename "$skill_dir")
+
+            # Detect conflicts: same skill name from multiple directories
+            local skill_path="${skill_dir%/}"
+            case "$_seen_skills" in
+                *"|${name}|"*)
+                    # Find the earlier path for the warning
+                    local prev_path
+                    prev_path=$(printf '%s\n' "$_seen_paths" | grep "^${name}	" | head -1 | cut -f2)
+                    warn "skill ${_bold}${name}${_reset} found in multiple locations:\n    ${prev_path}\n    ${skill_path}\n  Using the first one. Remove one copy to resolve."
+                    continue
+                    ;;
+            esac
+            _seen_skills="${_seen_skills}${name}|"
+            _seen_paths="${_seen_paths}${name}	${skill_path}
+"
+
+            # Check requirements (empty summary == all requirements met)
+            local meta eligible=1 missing
+            meta=$(_extract_shelllm_meta "${skill_dir}SKILL.md")
+            missing=$(_missing_summary "$meta")
+            if [[ -n "$missing" ]]; then
+                eligible=0
+            fi
+
+            # Ineligible skills go to the Skipped footer, unless --all
+            # promotes them into the main list annotated with what's missing.
+            if [[ "$eligible" -eq 0 && "$show_all" -eq 0 ]]; then
+                if [[ "$format" != "prompt" ]]; then
+                    [[ ${#desc} -gt 60 ]] && desc="${desc:0:57}..."
+                    skipped+="$(printf "  ${_bold}%-20s${_reset} %-60b ${_cyan}[%s]${_reset} ${_yellow}(missing: %s)${_reset}\n    ${_dim}%s${_reset}\n" \
+                        "$name" "${_dim}${desc}" "$label" "$missing" "$skill_path")
+"
+                fi
+                continue
+            fi
+
+            found=1
+
+            if [[ "$format" == "prompt" ]]; then
+                printf -- '- %s: %s\n' "$name" "$desc"
+            elif [[ "$eligible" -eq 0 ]]; then
+                [[ ${#desc} -gt 60 ]] && desc="${desc:0:57}..."
+                printf "  ${_bold}%-20s${_reset} %-60b ${_cyan}[%s]${_reset} ${_yellow}(missing: %s)${_reset}\n    ${_dim}%s${_reset}\n" \
+                    "$name" "${_dim}${desc}" "$label" "$missing" "$skill_path"
+            else
+                [[ ${#desc} -gt 60 ]] && desc="${desc:0:57}..."
+                printf "  ${_bold}%-20s${_reset} %-60b ${_cyan}[%s]${_reset}\n    ${_dim}%s${_reset}\n" \
+                    "$name" "${_dim}${desc}" "$label" "$skill_path"
+            fi
+        done
+    done < <(_all_skill_dirs)
+
+    if [[ "$format" != "prompt" ]]; then
+        if [[ "$found" -eq 0 ]]; then
+            echo "No skills installed." >&2
+            printf "  Run ${_bold}headlong-skills init${_reset} to create one, or ${_bold}skills <query>${_reset} to search.\n" >&2
+        fi
+
+        # --- Skipped (missing requirements) ---
+        if [[ -n "$skipped" ]]; then
+            printf "\n${_bold}Skipped (missing requirements)${_reset}\n"
+            printf '%b' "$skipped"
+        fi
+    fi
+}
+
+action_list_json() {
+    local dir skill_dir name desc body
+    local first=1
+
+    printf '['
+    while IFS= read -r dir; do
+        [[ -d "$dir" ]] || continue
+        for skill_dir in "$dir"/*/; do
+            [[ -f "${skill_dir}SKILL.md" ]] || continue
+            name=$(frontmatter_field "${skill_dir}SKILL.md" "name")
+            desc=$(frontmatter_field "${skill_dir}SKILL.md" "description")
+            [[ -z "$name" ]] && name=$(basename "$skill_dir")
+            body=$(sed -n '/^---$/,/^---$/d; p' "${skill_dir}SKILL.md")
+
+            [[ "$first" -eq 1 ]] && first=0 || printf ','
+            jq -n --arg n "$name" --arg d "$desc" --arg b "$body" \
+                '{name: $n, description: $d, instructions: $b}'
+        done
+    done < <(_all_skill_dirs)
+    printf ']\n'
+}
+
+
+action_show() {
+    local name="$1"
+    local show_requires="${2:-0}"
+
+    local skill_dir
+    skill_dir=$(find_skill "$name") || die "Skill not found: $name"
+
+    if [[ "$show_requires" -eq 1 ]]; then
+        local meta
+        meta=$(_extract_shelllm_meta "$skill_dir/SKILL.md")
+        if [[ "$meta" == "{}" ]]; then
+            printf "No requirements declared.\n"
+        else
+            printf '%s' "$meta" | jq '.'
+        fi
+    else
+        _process_skill_blocks < "$skill_dir/SKILL.md"
+    fi
+}
+
+
+action_prompt() {
+    # The skills section of the wake prompt: a two-line contract and the list
+    # of skills the mind can load. Nothing is inlined. Until 2026-09-04 the
+    # kernel skills were pasted whole here (chat, goals, mem, trajectory-check,
+    # about 8K), plus a 12-row CLI table, plus a `mem list --short` block that
+    # would have dumped every memory (91K on Audel). Prompt tokens are guarded:
+    # a skill's body costs nothing until `skills show <name>` asks for it.
+    # See design/wake_prompt_cull.md.
+    local skills_dir="${SKILLS_DIR:-}"
+    local kernel_dir="${SKILLS_KERNEL_DIR:-}"
+    local dir skill_dir sname sdesc list="" seen=" "
+    for dir in "$kernel_dir" "$skills_dir"; do
+        [[ -n "$dir" && -d "$dir" ]] || continue
+        for skill_dir in "$dir"/*/; do
+            [[ -f "${skill_dir}SKILL.md" ]] || continue
+            sname=$(frontmatter_field "${skill_dir}SKILL.md" name)
+            [[ -z "$sname" ]] && sname=$(basename "$skill_dir")
+            case "$seen" in *" $sname "*) continue ;; esac
+            seen="$seen$sname "
+            sdesc=$(frontmatter_field "${skill_dir}SKILL.md" description)
+            [[ -z "$sdesc" ]] && sdesc="(no description; run skills show $sname)"
+            list="${list}  - ${sname}: ${sdesc}
+"
+        done
+    done
+    printf '## Skills\n'
+    printf 'Playbooks I load only when a task calls for one: `skills show <name>` prints it, `skills` lists them, `skills init <name>` starts a new one and `skills install <owner/repo>` fetches one. Nothing below is in my context until I ask for it.\n'
+    if [[ -n "$list" ]]; then
+        printf '%s' "$list"
+    else
+        printf '  (none installed)\n'
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Usage, dispatch, and forwarding to the manager
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+skills — list, show, and render the skills the mind can use
+
+Usage:
+  skills                                    List installed skills (eligible only)
+  skills list [--all] [--format=prompt]     List skills; --all includes unmet requirements
+  skills show <name> [--requires]           Print a skill's SKILL.md, or its parsed requirements
+  skills list-json                          List skills as JSON
+  skills prompt                             Print the skills section of the system prompt
+
+Installing, searching, checking, init, promote, kernel and remotes are in
+headlong-skills (tools/). `skills <one of those>` forwards to it when it is
+on PATH.
+
+Options:
+  -a, --all          List all skills including those with unmet requirements
+  --format FORMAT    Output format: default or "prompt" (compact, for system prompts)
+  --requires         Show parsed requirements (with skills show)
+  --dir DIR          Use DIR as the skills directory (default: ./.skills)
+  -v, --verbose      Verbose/debug mode
+  -h, --help         Show help
+  --version          Show version
+
+Requirements:
+  Skills can declare requirements in SKILL.md frontmatter under metadata.shelllm:
+    requires:
+      env: ["VAR1", "VAR2"]       All env vars must be set
+      bins: ["curl", "jq"]        All binaries must exist on PATH
+      anyBins: ["gh", "hub"]      At least one must exist on PATH
+      os: ["darwin", "linux"]     Current OS must be in list
+  By default `skills list` only shows skills whose requirements are met.
+
+Executable blocks:
+  A ```bash block in SKILL.md that starts with `#| eval: true` runs when the
+  skill is shown or rendered into the prompt; `#| echo`, `#| stdout` and
+  `#| stderr` (true/false) control what of it appears. Blocks without
+  `#| eval: true` pass through unchanged.
+
+Environment:
+  SKILLS_DIR              Override skills directory (default: ./.skills)
+  SKILLSRC                Override .skillsrc location (default: ./.skillsrc)
+  SKILLS_KERNEL_DIR       Kernel directory (always-loaded skills)
+  NO_COLOR                Disable color output
+EOF
+    exit 0
+}
+
+# Hand the whole command line to headlong-skills (tools/), which sources this
+# file for its helpers, so every subcommand keeps working from one name.
+_forward() {
+    local mgr
+    mgr=$(command -v headlong-skills 2>/dev/null) \
+        || mgr="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../tools/headlong-skills"
+    [[ -x "$mgr" ]] || die "'$1' is handled by headlong-skills (tools/), which is not on PATH"
+    exec "$mgr" "${_ARGV[@]}"
+}
+
+main() {
+    local action="" show_all=0 format="" show_requires=0
+    local -a _positional=()
+    _ARGV=("$@")
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)      usage ;;
+            --version)      echo "skills $SKILLS_VERSION"; exit 0 ;;
+            -v|--verbose)   VERBOSE=1; shift ;;
+            --dir)          SKILLS_DIR="${2:?--dir requires a path}"; shift 2 ;;
+            -a|--all)       show_all=1; shift ;;
+            --format)       format="${2:?--format requires a value}"; shift 2 ;;
+            --format=*)     format="${1#--format=}"; shift ;;
+            --requires)     show_requires=1; shift ;;
+            --project|--remotes|--force|--name|--description) _forward "$1" ;;
+            -*)             die "Unknown option: $1 (try skills --help)" ;;
+            *)              _positional+=("$1"); shift ;;
+        esac
+    done
+
+    if [[ ${#_positional[@]} -gt 0 ]]; then
+        case "${_positional[0]}" in
+            list|list-json|show|prompt) action="${_positional[0]}"; _positional=("${_positional[@]:1}") ;;
+            *) _forward "${_positional[0]}" ;;
+        esac
+    fi
+    local remaining="${_positional[*]:-}"
+
+    case "$action" in
+        list-json) action_list_json ;;
+        prompt)    action_prompt ;;
+        show)
+            [[ -z "$remaining" ]] && die "show requires a skill name"
+            action_show "$remaining" "$show_requires"
+            ;;
+        *)         action_list "$show_all" "$format" ;;
+    esac
+}
+
+# headlong-skills sources this file for its helpers and runs its own main.
+[[ "${SKILLS_LIB_ONLY:-0}" == 1 ]] || main "$@"

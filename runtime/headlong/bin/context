@@ -1,0 +1,581 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# context — Policy layer that reads a trajectory and outputs a JSON messages
+# array with role assignment driven by flags.  The caller passes the output
+# to `llm -M` and provides its own system prompt via `llm -s`.
+#
+# Only the head, tail, and pinned lines of the trajectory are read and
+# parsed — selection can never keep anything else — so compute cost stays
+# near-flat as trajectories grow: two streaming passes over raw bytes
+# (wc -l and tail) plus jq over ~head+tail rows.
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+
+CTX_HEAD="${CTX_HEAD:-1}"
+CTX_TAIL="${CTX_TAIL:-50}"
+CTX_TAIL_BLOCK="${CTX_TAIL_BLOCK:-1}"
+CTX_PROMPT_LIMIT="${SHELLM_STDOUT_PROMPT_LIMIT:-2048}"
+CTX_BLOCK_LIMIT=""      # empty: same as CTX_PROMPT_LIMIT (no band)
+CTX_WHOLE_BLOCKS=1
+CTX_MAX_BYTES=""
+CTX_ELISION_STYLE="count"  # none|count
+CTX_PINS=()
+
+CTX_ASSISTANT_TYPES=""
+CTX_USER_TYPES=""
+CTX_EXCLUDE_TYPES=""
+CTX_FULL_TYPES=""
+CTX_RUN=""
+CTX_TRAJ_DIR_OPT=""
+CTX_TRAJ_ID_OPT=""
+
+die() { printf 'context: error: %s\n' "$*" >&2; exit 1; }
+usage() {
+    cat <<'EOF'
+Usage: context [options]
+
+Reads a trajectory and outputs a JSON messages array to stdout.
+
+Trajectory targeting:
+  --traj_dir DIR        Trajectory directory.
+  <ID>                  Trajectory ID (UUID or hex prefix, positional).
+                        Falls back to $TRAJ_DIR + $TRAJ_ID env vars.
+
+Role assignment:
+  --assistant-types LIST  Step types that become {"role":"assistant"}.
+  --user-types LIST       Step types that become {"role":"user"}.
+  --exclude-types LIST    Step types to drop entirely.
+  Unrecognized types (not in any list) default to "user" role.
+
+Step selection:
+  --head N              Keep first N steps. Default: 1.
+  --tail N              Keep last N steps. Default: 50.
+  --tail-block B        Move the tail window's start only in steps of B rows,
+                        so it holds N to N+B-1 rows and the rendered prefix
+                        changes once per B appended rows instead of on every
+                        call (keeps provider prompt caches warm). Default: 1.
+  --pin <step_id>       Always include this step. Repeatable.
+  --run RUN_ID          Keep only steps whose run_id is RUN_ID (pins always
+                        stay). Steps of other runs never render and never
+                        count as elided; a gap inside the run renders as
+                        "[earlier steps elided]" with no count.
+
+Per-step content:
+  --prompt-limit BYTES  Per-step field truncation for large values. Default: 2048.
+  --full-types LIST     Step types whose fields are never truncated, e.g.
+                        "prompt": instructions arrive whole or not at all (a
+                        cut prompt leaves the model a stub pointing at its
+                        own instructions on disk).
+  --block-limit BYTES   Truncation limit for rows in the newest --tail-block
+                        block(s) of the file; older rows use --prompt-limit.
+                        A row's block never changes, so a row is rewritten
+                        once, when the newest row crosses into the next
+                        block, which is also when the window start moves.
+                        Default: same as --prompt-limit.
+  --whole-blocks W      How many newest blocks render at --block-limit
+                        (with --tail-block 1: the newest W rows). Default: 1.
+
+Elision:
+  --elision-style S     none|count. Default: count.
+
+Budget:
+  --max-bytes BYTES     Cap total output. Default: unset.
+
+Output:
+  A JSON array: [{"role":"user","content":"..."},{"role":"assistant","content":"..."},...]
+  Consecutive messages with the same role are merged (Anthropic API requires alternation).
+
+Environment:
+  TRAJ_DIR + TRAJ_ID    Default trajectory if no flags given.
+
+EOF
+    exit "${1:-0}"
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --head)             CTX_HEAD="${2:?--head requires N}"; shift 2 ;;
+        --tail)             CTX_TAIL="${2:?--tail requires N}"; shift 2 ;;
+        --tail-block)       CTX_TAIL_BLOCK="${2:?--tail-block requires B}"; shift 2 ;;
+        --pin)              CTX_PINS+=("${2:?--pin requires step_id}"); shift 2 ;;
+        --prompt-limit)     CTX_PROMPT_LIMIT="${2:?--prompt-limit requires BYTES}"; shift 2 ;;
+        --block-limit)      CTX_BLOCK_LIMIT="${2:?--block-limit requires BYTES}"; shift 2 ;;
+        --whole-blocks)     CTX_WHOLE_BLOCKS="${2:?--whole-blocks requires W}"; shift 2 ;;
+        --elision-style)    CTX_ELISION_STYLE="${2:?--elision-style requires a value}"; shift 2 ;;
+        --max-bytes)        CTX_MAX_BYTES="${2:?--max-bytes requires BYTES}"; shift 2 ;;
+        --assistant-types)  CTX_ASSISTANT_TYPES="${2:?--assistant-types requires LIST}"; shift 2 ;;
+        --user-types)       CTX_USER_TYPES="${2:?--user-types requires LIST}"; shift 2 ;;
+        --exclude-types)    CTX_EXCLUDE_TYPES="${2:?--exclude-types requires LIST}"; shift 2 ;;
+        --full-types)       CTX_FULL_TYPES="${2:?--full-types requires LIST}"; shift 2 ;;
+        --run)              CTX_RUN="${2:?--run requires RUN_ID}"; shift 2 ;;
+        --traj_dir)         CTX_TRAJ_DIR_OPT="${2:?--traj_dir requires DIR}"; shift 2 ;;
+        -h|--help)          usage 0 ;;
+        -*)                 die "unknown option: $1" ;;
+        *)
+            if [[ -z "$CTX_TRAJ_ID_OPT" ]]; then
+                CTX_TRAJ_ID_OPT="$1"
+            else
+                die "unexpected argument: $1"
+            fi
+            shift; continue
+            ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Resolve trajectory file
+# ---------------------------------------------------------------------------
+
+# Priority: --traj_dir + positional ID > $TRAJ_DIR + $TRAJ_ID env vars
+RESOLVED_TRAJ_FILE=""
+
+# Resolve traj_id within traj_dir (inline version matching traj's _resolve_traj_id)
+_ctx_resolve_traj_id() {
+    local traj_dir="$1" traj_id="$2"
+
+    # 1. Exact path
+    if [[ -f "$traj_dir/$traj_id" ]]; then
+        printf '%s\n' "$traj_dir/$traj_id"; return
+    fi
+
+    # 2. Directory-based: $traj_dir/$traj_id/trajectory.jsonl
+    if [[ -f "$traj_dir/$traj_id/trajectory.jsonl" ]]; then
+        printf '%s\n' "$traj_dir/$traj_id/trajectory.jsonl"; return
+    fi
+
+    # 3. UUID handling: extract hex prefix
+    local hex_prefix="$traj_id"
+    if [[ "$traj_id" == *-*-*-*-* ]]; then
+        hex_prefix="${traj_id%%-*}"
+    fi
+
+    # 4. Directory glob: find directories named <hex_prefix>-*
+    local match
+    match=$(find "$traj_dir" -type d -name "${hex_prefix}-*" 2>/dev/null | head -1)
+    if [[ -n "$match" && -f "$match/trajectory.jsonl" ]]; then
+        printf '%s\n' "$match/trajectory.jsonl"; return
+    fi
+
+    return 1
+}
+
+if [[ -n "$CTX_TRAJ_DIR_OPT" && -n "$CTX_TRAJ_ID_OPT" ]]; then
+    RESOLVED_TRAJ_FILE=$(_ctx_resolve_traj_id "$CTX_TRAJ_DIR_OPT" "$CTX_TRAJ_ID_OPT") \
+        || die "cannot resolve traj ID '$CTX_TRAJ_ID_OPT' in '$CTX_TRAJ_DIR_OPT'"
+elif [[ -n "${TRAJ_DIR:-}" && -n "${TRAJ_ID:-}" ]]; then
+    RESOLVED_TRAJ_FILE=$(_ctx_resolve_traj_id "$TRAJ_DIR" "$TRAJ_ID") \
+        || die "cannot resolve TRAJ_ID '$TRAJ_ID' in TRAJ_DIR '$TRAJ_DIR'"
+else
+    die "No trajectory specified. Use --traj_dir DIR <ID>, or set TRAJ_DIR + TRAJ_ID env vars."
+fi
+
+[[ -f "$RESOLVED_TRAJ_FILE" ]] || die "trajectory not found: $RESOLVED_TRAJ_FILE"
+
+# ---------------------------------------------------------------------------
+# Always exclude shellm-run and run-summary from context rendering
+# ---------------------------------------------------------------------------
+
+# Append to exclude types (don't override user's --exclude-types)
+if [[ -n "$CTX_EXCLUDE_TYPES" ]]; then
+    CTX_EXCLUDE_TYPES="${CTX_EXCLUDE_TYPES},shellm-run,run-summary"
+else
+    CTX_EXCLUDE_TYPES="shellm-run,run-summary"
+fi
+
+# ---------------------------------------------------------------------------
+# The jq program
+#
+# Two modes:
+#   refs   — print blob refs (stdout_ref/stderr_ref) of selected, non-excluded
+#            steps, one per line, so bash can load the blob files.
+#   render — print the row total, then the pretty-printed messages array.
+#
+# Semantics mirror the original bash implementation, including its
+# command-substitution behavior (trailing newlines stripped from every
+# rendered value).
+# ---------------------------------------------------------------------------
+
+JQ_PROG=$(cat <<'JQEOF'
+def rtrim: sub("\n+$"; "");
+
+def rep($s; $n): if $n <= 0 then "" else ($s * $n) end;
+
+# Pretty-print a JSON value the way `jq -r` prints non-string values
+# (default jq pretty format: 2-space indent).
+def pp:
+  def go($d):
+    if type == "object" then
+      if length == 0 then "{}"
+      else "{\n"
+        + ([to_entries[] | rep("  "; $d+1) + (.key | tojson) + ": " + (.value | go($d+1))] | join(",\n"))
+        + "\n" + rep("  "; $d) + "}"
+      end
+    elif type == "array" then
+      if length == 0 then "[]"
+      else "[\n"
+        + ([.[] | rep("  "; $d+1) + go($d+1)] | join(",\n"))
+        + "\n" + rep("  "; $d) + "]"
+      end
+    else tojson end;
+  go(0);
+
+# Equivalent of val=$(printf row | jq -r '.key // empty'):
+# null/false -> "", non-strings stringified, trailing newlines stripped by $().
+def jqr_empty:
+  if . == null or . == false then ""
+  elif type == "string" then .
+  elif type == "object" or type == "array" then pp
+  else tostring
+  end;
+
+# Byte-aware truncation helpers (limit is in UTF-8 bytes).
+def btrunc_head($n):
+  if utf8bytelength <= $n then .
+  else .[0:$n] | until(utf8bytelength <= $n; .[0:length-1])
+  end;
+def btrunc_tail($n):
+  if utf8bytelength <= $n then .
+  else (if length > $n then .[length-$n:] else . end) | until(utf8bytelength <= $n; .[1:])
+  end;
+
+def truncate_field($limit; $sid):
+  utf8bytelength as $vb |
+  if $vb <= $limit then .
+  elif $limit <= 1 then "[... truncated: \($vb) bytes total. read with: traj show \($sid) --full]"
+  else
+    ([($limit / 2 | floor), 1] | max) as $half |
+    ((btrunc_head($half) | rtrim)
+     + "\n[... truncated: \($vb) bytes total. read with: traj show \($sid) --full]\n"
+     + (btrunc_tail($half) | rtrim))
+  end;
+
+# Metadata keys skipped when rendering step content. The bookkeeping bin/llm
+# and bin/shellm stamp on steps (token counts, latency, run id) is never shown
+# to the model: rendered as "[in_tok]\n31864" after its own code block, the
+# model learned the shape and wrote it back after its next command, followed
+# by an invented next thought and block, sometimes hundreds of times until the
+# stream timed out (Audel on grok, 2026-09).
+def is_meta($k):
+  ($k == "step_id" or $k == "ts" or $k == "type" or $k == "fork_parent")
+  or ($k == "run_id" or $k == "llm_s" or $k == "in_tok" or $k == "out_tok"
+      or $k == "think_tok" or $k == "cache_tok" or $k == "estimated"
+      or $k == "source_url")
+  or ($k == "content_b64")
+  or ($k | endswith("_ref"))
+  or ($k | endswith("_bytes"))
+  or ($k | endswith("_truncated"));
+
+def role_for($t; $A; $U; $E):
+  if ($E | index($t)) != null then "exclude"
+  elif ($A | index($t)) != null then "assistant"
+  elif ($U | index($t)) != null then "user"
+  else "user"
+  end;
+
+# The tail window starts at $N - $tail, rounded down to a multiple of
+# $block: with --tail-block the start moves only every $block rows, so the
+# window holds $tail to $tail+$block-1 rows and calls in between render an
+# identical prefix (the loader reads $tail+$block rows to cover that).
+def window_start($N; $tail; $block):
+  ([$N - $tail, 0] | max) as $raw |
+  if $block > 1 then (($raw / $block) | floor) * $block else $raw end;
+def selected($i; $sid; $N; $head; $tail; $pins):
+  ($i < $head) or ($i >= window_start($N; $tail; $block)) or (($pins | index($sid)) != null);
+
+# Rows in the newest $W blocks of the same grid render at $blocklimit instead
+# of $limit (the band). The grid is fixed to file row indices, so a row's band
+# membership changes exactly once, when the newest row crosses a block
+# boundary: the same call on which window_start moves, so the two rewrites
+# share one prompt-cache reset. With $block <= 1 the band is the newest $W
+# rows.
+def band_start($N; $block; $W):
+  if $block > 1 then (((($N - 1) / $block) | floor) - ($W - 1)) * $block
+  else $N - $W end;
+def row_limit($i; $N; $limit; $blocklimit):
+  if $i >= band_start($N; $block; $whole) then $blocklimit else $limit end;
+
+# Render one step row into message text content. Types in $full (e.g. a
+# prompt) are never truncated, whatever $limit0 says.
+def render_step($limit0; $blobs; $full):
+  . as $row |
+  ($row.step_id | tostring) as $sid |
+  (($row.type // "") | tostring) as $t |
+  (if ($full | index($t)) != null then 1000000000000 else $limit0 end) as $limit |
+  if $t == "fork" then "[Forked child: \($row.child | jqr_empty)]"
+  elif $t == "trajectory" then ""
+  elif $t == "merge" then
+    (($row.from_branch // $row.from_traj) | jqr_empty) as $b |
+    ($row.content | jqr_empty) as $c |
+    if $c != "" then "[Merged from \($b): \($c)]" else "[Merged from \($b)]" end
+  else
+    # Load blob content for truncated stdout/stderr.
+    (reduce ("stdout", "stderr") as $f ($row;
+        (.[$f + "_ref"] // "") as $ref |
+        if ($ref | type) == "string" and $ref != "" and ($blobs | has($ref)) then
+            .[$f] = ($blobs[$ref] | rtrim) | del(.[$f + "_truncated"])
+        else .
+        end
+    )) as $row2 |
+    ($row2 | keys | map(select(is_meta(.) | not))) as $cks |
+    ($cks | length) as $nc |
+    reduce $cks[] as $k ("";
+        . as $acc |
+        ($row2[$k] | jqr_empty | rtrim) as $v0 |
+        if $v0 == "" then $acc
+        else
+            ($v0 | if utf8bytelength > $limit then truncate_field($limit; $sid) else . end) as $v |
+            if $nc == 1 then $v
+            elif $k == "cmd" then $acc + "```bash\n" + $v + "\n```\n\n"
+            elif $k == "thought" then $acc + $v + "\n\n"
+            else $acc + "[" + $k + "]\n" + $v + "\n\n"
+            end
+        end
+    )
+  end;
+
+# $kept: [{i, row, role}] sorted by original line index. Gaps between
+# consecutive kept rows render as "[N steps elided]" markers: raw line
+# distance minus fed-but-dropped rows in between ($skip holds the indices of
+# excluded/malformed rows we DID read). Dropped rows in the unread middle
+# can't be subtracted, so middle markers may overcount by a little — the old
+# whole-file pass excluded them exactly, at the price of parsing everything.
+# In run scope ($run != "") rows of other runs are dropped silently: a gap
+# before the first kept row is never marked (everything earlier is another
+# run's by definition), and a gap inside the run cannot be counted without
+# reading the unread middle, so it renders without a number.
+def build_messages($kept; $limit; $blobs; $elision; $total; $skip; $full; $run):
+  def gap_between($a; $b):
+    ($b - $a - 1) - ([$skip[] | select(. > $a and . < $b)] | length);
+  def marker($gap; $first):
+    if $run == "" then [{role: "user", content: "[\($gap) steps elided]"}]
+    elif $first then []
+    else [{role: "user", content: "[earlier steps elided]"}] end;
+  reduce $kept[] as $it ({msgs: [], last: -1};
+      gap_between(.last; $it.i) as $gap |
+      (if $elision != "none" and $gap > 0
+       then .msgs + marker($gap; .last == -1)
+       else .msgs end) as $m |
+      ($it.row | render_step(row_limit($it.i; $total; $limit; $blocklimit); $blobs; $full) | rtrim) as $c |
+      {msgs: (if $c == "" then $m else $m + [{role: $it.role, content: $c}] end),
+       last: $it.i}
+  ) |
+  (gap_between(.last; $total) as $gap |
+   if $elision != "none" and $gap > 0 and $run == ""
+   then .msgs + [{role: "user", content: "[\($gap) steps elided]"}]
+   else .msgs end);
+
+# Merge consecutive same-role messages (Anthropic API requires alternation).
+def merge_roles:
+  reduce .[] as $msg ([];
+      if (length > 0) and (.[-1].role == $msg.role) then
+          .[-1].content += ("\n---\n" + $msg.content)
+      else . + [$msg]
+      end
+  );
+
+# --- main ---
+($astr | if . == "" then [] else split(",") end) as $A |
+($ustr | if . == "" then [] else split(",") end) as $U |
+($estr | if . == "" then [] else split(",") end) as $E |
+($fullstr | if . == "" then [] else split(",") end) as $FULL |
+($blobsraw[0] // {}) as $blobs |
+# Input lines are "<original line index>\t<raw JSONL line>" — only the head,
+# tail, and pin-candidate lines of the file (see the loader below). $total
+# carries the file's true line count for selection and elision arithmetic.
+(split("\n")
+ | map(capture("^(?<i>[0-9]+)\t(?<j>.*)$")?)
+ | map({i: (.i | tonumber), row: (.j | fromjson? // null)})
+ | map(if .row != null and ((.row.step_id // "") | tostring) == "" then .row = null else . end)
+ | unique_by(.i)) as $fed |
+([$fed[] | select(.row != null)
+         | . + {role: role_for(((.row.type // "") | tostring); $A; $U; $E)}]) as $items |
+($items | length) as $N |
+# Run scope: a row belongs when its run_id matches or it is pinned.
+def in_run: (.row.step_id | tostring) as $sid |
+            $run == "" or ((.row.run_id // "") | tostring) == $run
+            or (($pins | index($sid)) != null);
+([$items[] | select(.role != "exclude") | select(in_run)
+           | select(selected(.i; (.row.step_id | tostring); $total; $head; $tail; $pins))]) as $kept |
+([$fed[] | select(.row == null)] + [$items[] | select(.role == "exclude" or (in_run | not))]
+ | map(.i) | sort) as $skip |
+if $mode == "refs" then
+    [ $kept[].row |
+      ((.stdout_ref // empty), (.stderr_ref // empty)) |
+      select((type == "string") and . != "")
+    ] | unique | .[]
+else
+    $N,
+    (build_messages($kept; $limit; $blobs; $elision; $total; $skip; $FULL; $run) | merge_roles)
+end
+JQEOF
+)
+
+# ---------------------------------------------------------------------------
+# Load candidate rows: head + pinned + tail lines, tagged "<idx>\t<line>"
+#
+# Selection can only ever keep the first $CTX_HEAD lines, the last $CTX_TAIL
+# lines, and pinned steps, so those are all we read and parse. (The previous
+# implementation slurped the whole file through two jq passes — O(file size)
+# per call, 78s on a 532MB trajectory, 2026-08-12.) Tabs cannot occur inside
+# JSONL lines (JSON escapes control characters), so "<idx>\t<line>" tagging
+# is unambiguous.
+# ---------------------------------------------------------------------------
+
+TOTAL_LINES=$(wc -l < "$RESOLVED_TRAJ_FILE" | tr -d '[:space:]')
+# wc -l misses a final unterminated line; count it if present.
+if [[ -s "$RESOLVED_TRAJ_FILE" ]] \
+   && [[ $(tail -c 1 "$RESOLVED_TRAJ_FILE" | wc -l | tr -d '[:space:]') -eq 0 ]]; then
+    TOTAL_LINES=$(( TOTAL_LINES + 1 ))
+fi
+
+_tail_read=$(( CTX_TAIL + CTX_TAIL_BLOCK - 1 ))
+if [[ "$TOTAL_LINES" -le $(( CTX_HEAD + _tail_read )) ]]; then
+    RAW_ROWS=$(awk '{printf "%d\t%s\n", NR-1, $0}' "$RESOLVED_TRAJ_FILE")
+else
+    _head_rows=""
+    [[ "$CTX_HEAD" -gt 0 ]] \
+        && _head_rows=$(head -n "$CTX_HEAD" "$RESOLVED_TRAJ_FILE" \
+            | awk '{printf "%d\t%s\n", NR-1, $0}')
+    _tail_rows=""
+    if [[ "$CTX_TAIL" -gt 0 ]]; then
+        _tail_start=$(( TOTAL_LINES - _tail_read ))
+        _tail_rows=$(tail -n "$_tail_read" "$RESOLVED_TRAJ_FILE" \
+            | awk -v s="$_tail_start" '{printf "%d\t%s\n", s+NR-1, $0}')
+    fi
+    _pin_rows=""
+    if [[ ${#CTX_PINS[@]} -gt 0 ]]; then
+        # Cheap byte scan per pin; jq keeps only rows whose step_id actually
+        # matches, so content that merely mentions the ID is harmless.
+        for _pin in "${CTX_PINS[@]}"; do
+            _pin_match=$(grep -nF -- "$_pin" "$RESOLVED_TRAJ_FILE" | head -50) || continue
+            [[ -z "$_pin_match" ]] && continue
+            _pin_rows+=$(printf '%s\n' "$_pin_match" \
+                | awk -F: '{printf "%d\t%s\n", $1-1, substr($0, length($1)+2)}')$'\n'
+        done
+    fi
+    RAW_ROWS=$(printf '%s\n' "$_head_rows" "$_pin_rows" "$_tail_rows")
+fi
+
+# Pins as a JSON array
+PINS_JSON='[]'
+if [[ ${#CTX_PINS[@]} -gt 0 ]]; then
+    PINS_JSON=$(printf '%s\n' "${CTX_PINS[@]}" | jq -R . | jq -s -c .)
+fi
+
+_ctx_jq() {
+    # _ctx_jq <mode> <prompt_limit> <blobs_file> [block_limit]
+    printf '%s\n' "$RAW_ROWS" | jq -R -s -r \
+        --arg mode "$1" \
+        --argjson head "$CTX_HEAD" \
+        --argjson tail "$CTX_TAIL" \
+        --argjson block "$CTX_TAIL_BLOCK" \
+        --argjson whole "$CTX_WHOLE_BLOCKS" \
+        --argjson total "$TOTAL_LINES" \
+        --argjson limit "$2" \
+        --argjson blocklimit "${4:-$2}" \
+        --argjson pins "$PINS_JSON" \
+        --arg astr "$CTX_ASSISTANT_TYPES" \
+        --arg ustr "$CTX_USER_TYPES" \
+        --arg estr "$CTX_EXCLUDE_TYPES" \
+        --arg fullstr "$CTX_FULL_TYPES" \
+        --arg run "$CTX_RUN" \
+        --arg elision "$CTX_ELISION_STYLE" \
+        --slurpfile blobsraw "$3" \
+        "$JQ_PROG"
+}
+
+# ---------------------------------------------------------------------------
+# Blob prepass: load stdout/stderr blob files referenced by selected steps
+# ---------------------------------------------------------------------------
+
+BLOBS_FILE=/dev/null
+_BLOBS_TMP=""
+cleanup() { if [[ -n "$_BLOBS_TMP" ]]; then rm -f "$_BLOBS_TMP"; fi; }
+trap cleanup EXIT
+
+_blob_base="$(dirname "$RESOLVED_TRAJ_FILE")"
+_refs=$(_ctx_jq refs "$CTX_PROMPT_LIMIT" /dev/null)
+if [[ -n "$_refs" ]]; then
+    _blobs_json='{}'
+    while IFS= read -r _ref; do
+        [[ -n "$_ref" && -f "$_blob_base/$_ref" ]] || continue
+        _blobs_json=$(printf '%s' "$_blobs_json" \
+            | jq --arg k "$_ref" --rawfile v "$_blob_base/$_ref" '. + {($k): $v}')
+    done <<< "$_refs"
+    if [[ "$_blobs_json" != '{}' ]]; then
+        _BLOBS_TMP=$(mktemp)
+        printf '%s' "$_blobs_json" > "$_BLOBS_TMP"
+        BLOBS_FILE="$_BLOBS_TMP"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Render (with optional --max-bytes budget enforcement)
+# ---------------------------------------------------------------------------
+
+# render_at <prompt_limit> [block_limit]: sets RENDER_TOTAL and RENDER_MSGS.
+# The --max-bytes search below passes one limit for both, so the band
+# collapses under budget pressure instead of defeating it.
+render_at() {
+    local out
+    out=$(_ctx_jq render "$1" "$BLOBS_FILE" "${2:-$1}")
+    RENDER_TOTAL="${out%%$'\n'*}"
+    RENDER_MSGS="${out#*$'\n'}"
+}
+
+render_at "$CTX_PROMPT_LIMIT" "${CTX_BLOCK_LIMIT:-$CTX_PROMPT_LIMIT}"
+
+if [[ "$RENDER_TOTAL" -eq 0 ]]; then
+    # Empty trajectory: output empty messages array.
+    printf '[]\n'
+    exit 0
+fi
+
+result="$RENDER_MSGS"
+
+if [[ -z "$CTX_MAX_BYTES" ]]; then
+    printf '%s' "$result"
+    exit 0
+fi
+
+result_bytes=$(printf '%s' "$result" | LC_ALL=C wc -c | tr -d ' ')
+
+if [[ "$result_bytes" -le "$CTX_MAX_BYTES" ]]; then
+    printf '%s' "$result"
+    exit 0
+fi
+
+# Binary search for the right prompt_limit to fit the budget.
+lo=0
+hi="$CTX_PROMPT_LIMIT"
+best_result="$result"
+best_bytes="$result_bytes"
+
+while [[ "$lo" -le "$hi" ]]; do
+    mid=$(( (lo + hi) / 2 ))
+    render_at "$mid"
+    try_result="$RENDER_MSGS"
+    try_bytes=$(printf '%s' "$try_result" | LC_ALL=C wc -c | tr -d ' ')
+
+    if [[ "$try_bytes" -le "$CTX_MAX_BYTES" ]]; then
+        best_result="$try_result"
+        best_bytes="$try_bytes"
+        lo=$((mid + 1))
+    else
+        hi=$((mid - 1))
+    fi
+done
+
+if [[ "$best_bytes" -gt "$CTX_MAX_BYTES" ]]; then
+    printf '%s' "$best_result" | head -c "$CTX_MAX_BYTES"
+    printf '[budget exceeded: trajectory too dense]' >&2
+else
+    printf '%s' "$best_result"
+fi

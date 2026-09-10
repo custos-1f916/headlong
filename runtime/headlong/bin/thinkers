@@ -1,0 +1,1811 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# thinkers — Modular reactive thought process manager
+# Manages thinker lifecycle: start/stop dispatcher, list thinkers, scaffold new ones.
+
+# ---------------------------------------------------------------------------
+# Config from environment
+# ---------------------------------------------------------------------------
+
+IDENTITY_DIR="${IDENTITY_DIR:-}"
+IDENTITY_NAME="${IDENTITY_NAME:-}"
+MEM_DIR="${MEM_DIR:-}"
+SKILLS_DIR="${SKILLS_DIR:-}"
+SKILLS_KERNEL_DIR="${SKILLS_KERNEL_DIR:-}"
+TRAJ_DIR="${TRAJ_DIR:-}"
+TRAJ_ID="${TRAJ_ID:-}"
+THINKERS_DIR="${THINKERS_DIR:-}"
+SHELLM_HOME="${SHELLM_HOME:-}"
+THINK_MODEL="${THINK_MODEL:-${SHELLM_MODEL:-claude-opus-4-7}}"
+THINK_CONTEXT_TAIL="${THINK_CONTEXT_TAIL:-30}"
+THINKERS_MAX_CONCURRENT="${THINKERS_MAX_CONCURRENT:-20}"
+# Liveness watchdog: a trigger_self thinker that has been free of running
+# steps, queued work, and dispatches for this many seconds gets a synthetic
+# idle trigger. Per-thinker override via watchdog_secs in subscriptions.jsonl
+# (0 disables). Default applies only to trigger_self subscriptions — reactive
+# thinkers are legitimately silent for long stretches.
+THINKERS_WATCHDOG_SECS="${THINKERS_WATCHDOG_SECS:-300}"
+VERBOSE=0
+NO_SELF_TRIGGER=0
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+die() { printf 'thinkers: error: %s\n' "$*" >&2; exit 1; }
+
+# Kill a process and all its descendants (depth-first).
+_kill_tree() {
+    local pid="$1" sig="${2:-TERM}"
+    local child
+    for child in $(pgrep -P "$pid" 2>/dev/null); do
+        _kill_tree "$child" "$sig"
+    done
+    kill -"$sig" "$pid" 2>/dev/null || true
+}
+
+# Kill leaked `tail -n 0 -F <traj_file>` feeders by argv pattern. PID-tree
+# kills race against pipeline-wrapper death (orphaned stages reparent to init
+# and escape pgrep -P), so this sweeps by the traj-file list written at
+# dispatcher start. Takes an optional pre-read list (snapshot taken before
+# the dispatcher's own trap cleanup removes the file). Caveat: if another
+# identity's dispatcher tails the same file, its feeder is killed too —
+# acceptable while trajectories are per-identity.
+_kill_traj_tails() {
+    local run_dir="$1" list="${2:-}"
+    if [[ -z "$list" && -f "$run_dir/traj_files" ]]; then
+        list=$(cat "$run_dir/traj_files" 2>/dev/null) || true
+    fi
+    [[ -z "$list" ]] && return 0
+    local tf
+    while IFS= read -r tf; do
+        [[ -n "$tf" ]] && pkill -f "tail -n 0 -F $tf" 2>/dev/null || true
+    done <<< "$list"
+}
+
+
+_warn_stray_tails() {
+    # Vitals check: after stop, warn if any `tail -n 0 -F` feeder
+    # processes survive (indicates a leak in the kill/sweep paths).
+    local stray
+    stray=$(pgrep -f 'tail -n 0 -F' 2>/dev/null) || true
+    if [[ -n "$stray" ]]; then
+        local count
+        count=$(printf '%s\n' "$stray" | grep -c .) || count=0
+        printf '[thinkers] WARNING: %d stray tail feeder process(es) still alive after stop\n' "$count" >&2
+    fi
+}
+
+debug() {
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        printf '[thinkers debug] %s\n' "$*" >&2
+    fi
+}
+
+# True if this process would die with the identity's live dispatcher —
+# i.e. we are an in-flight step of the very mind a stop would kill.
+# Two signals, either one counts:
+#
+#   1. Same headlong-thinkers@ unit cgroup (Linux). When the dispatcher runs
+#      as that unit's main process, its exit makes systemd sweep the WHOLE
+#      cgroup — including steps that are no longer in the dispatcher's
+#      process tree. The 2026-08-12 self-kill went exactly through that
+#      blind spot: a step kicked by `thinkers start` from inside another
+#      step was orphaned to init when its parent exited, passed the
+#      ancestry walk below, stopped the dispatcher, and was swept mid-plan
+#      before it could run the restart half. Scoped to headlong-thinkers@
+#      cgroups — the only unit whose main process is the dispatcher, so
+#      the only cgroup where a stop triggers the sweep. A dispatcher merely
+#      HOSTED in another unit's cgroup (dash debug start inside
+#      headlong-web, legacy bootstrap inside headlong-slack-agent) is not that
+#      unit's main process: same-cgroup callers there survive the stop,
+#      and refusing them would leave the dash unable to stop its own
+#      debug-path dispatcher.
+#
+#   2. Ppid ancestry walk up to the dispatcher pid — the only signal on
+#      hosts without /proc cgroups (macOS dev), still exact for attached
+#      steps everywhere.
+_inside_own_dispatcher() {
+    local run_dir="$1" dpid pid
+    dpid=$(cat "$run_dir/dispatcher.pid" 2>/dev/null) || return 1
+    [[ -n "$dpid" ]] && kill -0 "$dpid" 2>/dev/null || return 1
+    local my_cg their_cg
+    my_cg=$(cat /proc/self/cgroup 2>/dev/null) || my_cg=""
+    their_cg=$(cat "/proc/$dpid/cgroup" 2>/dev/null) || their_cg=""
+    # Scope to THIS identity's unit, not just any headlong-thinkers@ unit:
+    # a different identity running inside our cgroup (e.g. tests, or an
+    # aux identity spawned from our step) would otherwise be a false
+    # positive — stop is refused for a dispatcher that is NOT our own,
+    # leaving its pending dir un-cleaned (2026-08-14 test_cleared_on_stop).
+    local esc
+    esc=$(systemd-escape "$IDENTITY_NAME" 2>/dev/null || printf '%s' "$IDENTITY_NAME")
+    # A guard that silently stops matching the unit name is exactly the
+    # 2026-08-12 failure mode — tests/test_unit_name_couplings.sh pins this
+    # comparison to the shipped unit template.
+    if [[ -n "$my_cg" && "$my_cg" == "$their_cg" ]] \
+        && [[ "$my_cg" == *"headlong-thinkers@${esc}.service"* ]]; then
+        return 0
+    fi
+    pid=$$
+    while [[ -n "$pid" && "$pid" -gt 1 ]]; do
+        [[ "$pid" -eq "$dpid" ]] && return 0
+        pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]') || return 1
+    done
+    return 1
+}
+
+_require_env() {
+    [[ -n "$IDENTITY_DIR" ]] || die "IDENTITY_DIR not set. Run: identity shell <name>"
+    [[ -n "$TRAJ_DIR" ]] || die "TRAJ_DIR not set. Run: identity shell <name>"
+    [[ -n "$TRAJ_ID" ]] || die "TRAJ_ID not set. Run: identity shell <name>"
+
+    # Resolve identity name if not set
+    if [[ -z "$IDENTITY_NAME" ]]; then
+        IDENTITY_NAME=$(grep '^name=' "$IDENTITY_DIR/info.txt" 2>/dev/null | cut -d= -f2-) || true
+        [[ -z "$IDENTITY_NAME" ]] && IDENTITY_NAME=$(basename "$IDENTITY_DIR")
+    fi
+
+    # Default THINKERS_DIR
+    if [[ -z "$THINKERS_DIR" ]]; then THINKERS_DIR="$IDENTITY_DIR/thinkers"; fi
+    [[ -d "$THINKERS_DIR" ]] || die "Thinkers directory not found: $THINKERS_DIR"
+
+    if [[ -z "$MEM_DIR" ]]; then MEM_DIR="$IDENTITY_DIR/memories"; fi
+    if [[ -z "$SKILLS_DIR" ]]; then SKILLS_DIR="$IDENTITY_DIR/skills"; fi
+    if [[ -z "$SKILLS_KERNEL_DIR" ]]; then SKILLS_KERNEL_DIR="$IDENTITY_DIR/kernel"; fi
+    if [[ -z "$SHELLM_HOME" ]]; then SHELLM_HOME="$IDENTITY_DIR/.shellm"; fi
+}
+
+# ---------------------------------------------------------------------------
+# Trajectory file resolution (mirrors traj's _resolve_traj_id)
+# ---------------------------------------------------------------------------
+
+_resolve_traj_file() {
+    local traj_dir="$1" traj_id="$2"
+
+    # 1. Exact path
+    if [[ -f "$traj_dir/$traj_id" ]]; then
+        printf '%s' "$traj_dir/$traj_id"; return
+    fi
+
+    # 2. Directory-based: $traj_dir/$traj_id/trajectory.jsonl
+    if [[ -f "$traj_dir/$traj_id/trajectory.jsonl" ]]; then
+        printf '%s' "$traj_dir/$traj_id/trajectory.jsonl"; return
+    fi
+
+    # 3. UUID handling: extract hex prefix and try directory glob FIRST
+    #    (directory-based takes priority over legacy flat files)
+    local hex_prefix="$traj_id"
+    if [[ "$traj_id" == *-*-*-*-* ]]; then
+        hex_prefix="${traj_id%%-*}"
+    fi
+
+    local match
+    match=$(find "$traj_dir" -type d -name "${hex_prefix}-*" 2>/dev/null | head -1)
+    if [[ -n "$match" && -f "$match/trajectory.jsonl" ]]; then
+        printf '%s' "$match/trajectory.jsonl"; return
+    fi
+
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Thinker discovery
+# ---------------------------------------------------------------------------
+
+# List thinker directories (skip _lib and other non-thinker dirs)
+_list_thinker_dirs() {
+    local dir
+    for dir in "$THINKERS_DIR"/*/; do
+        [[ -d "$dir" ]] || continue
+        local name
+        name=$(basename "$dir")
+        # Skip internal directories
+        [[ "$name" == _* ]] && continue
+        # Skip thinkers disabled via marker file (touch <thinker>/disabled)
+        [[ -f "$dir/disabled" ]] && continue
+        # Must have step and subscriptions.jsonl
+        [[ -f "$dir/step" && -f "$dir/subscriptions.jsonl" ]] || continue
+        printf '%s\n' "$dir"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+
+_start_dispatcher() {
+    local run_dir="$IDENTITY_DIR/run"
+    mkdir -p "$run_dir/logs" "$run_dir/thinkers"
+
+    local fifo="$run_dir/dispatch.fifo"
+    local pid_file="$run_dir/dispatcher.pid"
+    local tail_pids_file="$run_dir/tail_pids"
+
+    # Check if dispatcher already running
+    if [[ -f "$pid_file" ]]; then
+        local old_pid
+        old_pid=$(cat "$pid_file" 2>/dev/null) || true
+        if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+            die "Dispatcher already running (PID $old_pid). Use \`thinkers stop\` first."
+        fi
+        rm -f "$pid_file"
+    fi
+
+    # Create FIFO
+    rm -f "$fifo"
+    mkfifo "$fifo"
+
+    # Fresh pending-trigger flags (steps that arrived while a thinker was busy)
+    rm -rf "$run_dir/pending"
+    mkdir -p "$run_dir/pending"
+    # Fresh salience-injection dedup log (one feedback nudge per message step)
+    rm -f "$run_dir/fb_injected"
+
+    # Ownership token: this instance owns the dispatcher role only while
+    # dispatcher.token still holds its token. A newer start overwrites the
+    # token (and a stop removes it); the old instance notices on its next
+    # heartbeat tick, cleans up its tails, and exits. This makes orphaned
+    # dispatcher instances — which would double-dispatch every step —
+    # self-terminating.
+    local dispatcher_token
+    dispatcher_token="$(date +%s).$$.$RANDOM"
+    printf '%s' "$dispatcher_token" > "$run_dir/dispatcher.token"
+
+    # Build subscription map: thinker_name -> [traj_file, types_pattern, trigger_self]
+    # We store this as lines: THINKER_NAME\tTRAJ_FILE\tTYPES_REGEX\tTRIGGER_SELF
+    local sub_map=""
+    local traj_files=""
+    local thinker_dir
+    while IFS= read -r thinker_dir; do
+        local thinker_name
+        thinker_name=$(basename "$thinker_dir")
+        local sub_file="$thinker_dir/subscriptions.jsonl"
+
+        while IFS= read -r sub_line; do
+            [[ -z "$sub_line" ]] && continue
+
+            # Parse subscription JSON
+            local sub_traj_id sub_types sub_trigger_self
+            sub_traj_id=$(printf '%s' "$sub_line" | jq -r '.traj_id // empty' 2>/dev/null) || true
+            sub_types=$(printf '%s' "$sub_line" | jq -r '(.types // []) | join("|")' 2>/dev/null) || true
+            sub_trigger_self=$(printf '%s' "$sub_line" | jq -r '.trigger_self // false' 2>/dev/null) || true
+
+            # Override trigger_self when --no-self-trigger flag is set
+            if [[ "$NO_SELF_TRIGGER" -eq 1 ]]; then
+                sub_trigger_self="false"
+            fi
+
+            # Watchdog window: explicit watchdog_secs wins; otherwise default
+            # for perpetual-loop (trigger_self) subscriptions, off for the
+            # rest. Resolved AFTER the --no-self-trigger override so a
+            # non-perpetual run does not get watchdog wakeups either.
+            local sub_watchdog
+            sub_watchdog=$(printf '%s' "$sub_line" | jq -r '.watchdog_secs // empty' 2>/dev/null) || true
+            if [[ -z "$sub_watchdog" ]]; then
+                if [[ "$sub_trigger_self" == "true" ]]; then
+                    sub_watchdog="$THINKERS_WATCHDOG_SECS"
+                else
+                    sub_watchdog=0
+                fi
+            fi
+            [[ "$sub_watchdog" =~ ^[0-9]+$ ]] || sub_watchdog=0
+
+            # Default traj_id to $TRAJ_ID
+            if [[ -z "$sub_traj_id" ]]; then sub_traj_id="$TRAJ_ID"; fi
+
+            # Resolve traj file path (handles UUID → directory/flat file)
+            local traj_file
+            traj_file=$(_resolve_traj_file "$TRAJ_DIR" "$sub_traj_id") || {
+                debug "Traj file not found for $thinker_name: $TRAJ_DIR/$sub_traj_id (skipping subscription)"
+                continue
+            }
+
+            # Track unique traj files for tail processes (newline-separated)
+            case "$traj_files" in
+                *"$traj_file"*) ;;
+                *) traj_files="${traj_files}${traj_files:+
+}${traj_file}" ;;
+            esac
+
+            sub_map="${sub_map}${thinker_name}	${traj_file}	${sub_types}	${sub_trigger_self}	${sub_watchdog}
+"
+        done < "$sub_file"
+    done < <(_list_thinker_dirs)
+
+    if [[ -z "$sub_map" ]]; then
+        rm -f "$fifo"
+        die "No valid subscriptions found"
+    fi
+
+    # Write subscription map and traj files list for the dispatcher
+    printf '%s' "$sub_map" > "$run_dir/sub_map"
+    printf '%s\n' "$traj_files" > "$run_dir/traj_files"
+
+    # Export env for dispatcher subprocess
+    export IDENTITY_DIR IDENTITY_NAME MEM_DIR SKILLS_DIR SKILLS_KERNEL_DIR
+    export TRAJ_DIR TRAJ_ID THINKERS_DIR SHELLM_HOME THINK_MODEL THINK_CONTEXT_TAIL
+    export THINKERS_MAX_CONCURRENT NO_SELF_TRIGGER
+
+    # Fresh slate for the death-attribution markers: a stale deliberate_stop
+    # (stop requested while no dispatcher ran) must not launder the next
+    # unclean death, and last_signal only describes the run ahead.
+    rm -f "$run_dir/deliberate_stop" "$run_dir/last_signal"
+
+    # setsid (util-linux) puts each step in its own session + process group,
+    # so a group-directed signal from inside a step tree (kill 0 and
+    # friends) can never reach the dispatcher — the shared-PGID hazard from
+    # the 2026-08-12 unattributed death. The step stays a direct child
+    # (setsid execs without forking here), so _kill_tree sweeps and step_pids
+    # bookkeeping are unaffected. Absent (macOS dev machines) we degrade to
+    # the old shared-group behavior.
+    local _setsid=""
+    if command -v setsid >/dev/null 2>&1; then _setsid="setsid"; fi
+
+    # Start dispatcher in background
+    (
+        trap '_cleanup_dispatcher' EXIT
+        trap '_dispatcher_on_signal INT' INT
+        trap '_dispatcher_on_signal TERM' TERM
+
+        # Start tail -F for each unique traj file, tagged with traj path.
+        # Track our own tail PIDs separately from the shared tail_pids file:
+        # if we lose dispatcher ownership we must kill only OUR tails and
+        # leave the new owner's runtime files alone.
+        printf '' > "$tail_pids_file"
+        _my_tail_pids=""
+        # Live feeders as "pid<TAB>traj_file" lines, so the housekeeping
+        # tick can notice a dead one and respawn it for the right file.
+        _feeder_entries=""
+
+        # Spawn the feeder pipeline for one traj file: tail -F tags each
+        # new line with its traj path and writes it to the fifo. Wrapped in
+        # an explicit subshell so $! owns the WHOLE pipeline: tail is then a
+        # child of $! and _kill_tree reaps it. (Killing a bare pipeline's $!
+        # only kills the last stage — the tail survives and leaks.) fd 3 is
+        # the dispatcher's own fifo handle — close it so a feeder never
+        # holds a stray write end.
+        _spawn_feeder() {
+            local _ftraj="$1"
+            (
+                tail -n 0 -F "$_ftraj" 2>/dev/null | while IFS= read -r line; do
+                    printf '%s\t%s\n' "$_ftraj" "$line"
+                done > "$fifo"
+            ) 3<&- &
+            printf '%s\n' "$!" >> "$tail_pids_file"
+            _my_tail_pids="${_my_tail_pids}${_my_tail_pids:+ }$!"
+            _feeder_entries="${_feeder_entries}$!	${_ftraj}
+"
+        }
+
+        # Respawn feeders whose pipeline died. Nothing did this before, so
+        # when the 2026-08-14 stray SIGTERM killed Audel's feeder, the mind
+        # silently fell back to watchdog-only wakeups. Respawning is safe:
+        # tail -n 0 -F starts at the current end of file, so no step is
+        # replayed and every step appended after the respawn is picked up.
+        _respawn_dead_feeders() {
+            local _fpid _ftraj _live="" _dead=""
+            while IFS=$'\t' read -r _fpid _ftraj; do
+                [[ -z "$_fpid" ]] && continue
+                if kill -0 "$_fpid" 2>/dev/null; then
+                    _live="${_live}${_fpid}	${_ftraj}
+"
+                else
+                    _dead="${_dead}${_ftraj}
+"
+                fi
+            done <<< "$_feeder_entries"
+            [[ -z "$_dead" ]] && return 0
+            _feeder_entries="$_live"
+            # A feeder killed mid-write leaves a partial line that can
+            # never complete — drop it rather than glue it onto the next
+            # (unrelated) line. Worst case one step is lost at the moment
+            # of death, exactly what the old no-respawn world lost forever.
+            _read_buf=""
+            while IFS= read -r _ftraj; do
+                [[ -z "$_ftraj" ]] && continue
+                if [[ -f "$_ftraj" ]]; then
+                    printf '%s [dispatcher] feeder for %s died — respawning\n' \
+                        "$(date -u +%FT%TZ)" "$_ftraj" >&2
+                    _spawn_feeder "$_ftraj"
+                else
+                    printf '%s [dispatcher] feeder for %s died and the traj file is gone — not respawning\n' \
+                        "$(date -u +%FT%TZ)" "$_ftraj" >&2
+                fi
+            done <<< "$_dead"
+        }
+
+        local _traj_file
+        while IFS= read -r _traj_file; do
+            [[ -z "$_traj_file" ]] && continue
+            [[ -f "$_traj_file" ]] || continue
+            _spawn_feeder "$_traj_file"
+        done < "$run_dir/traj_files"
+
+        # Track thinker step PIDs as "name:pid" pairs (space-separated, bash 3.2 compat)
+        _step_entries=""
+        # A new dispatcher starts a fresh ledger, deliberately: the on-disk
+        # prune below rewrites step_pids from _step_entries alone, so a dead
+        # dispatcher's leftover lines would be dropped on the first prune
+        # anyway — silently. Truncating here makes that explicit. Orphaned
+        # steps from a prior dispatcher are outside this generation's drain;
+        # every step_pids reader filters for live PIDs itself.
+        : > "$run_dir/step_pids"
+
+        # Liveness watchdog. The perpetual loop is a chain of triggers, and a
+        # single broken link kills the mind: a step that crashes before
+        # appending, silently consumes its trigger, or is killed leaves no
+        # wake source (the 2026-08-04 stall — an agentic run's outgoing
+        # message re-triggered monolith, the own-message guard consumed it,
+        # and nothing remained to fire). Liveness is therefore guaranteed
+        # HERE, not by thinker code paths: a watched thinker that has been
+        # free of running steps, queued pending work, and dispatches for its
+        # whole watchdog window gets a synthetic idle trigger. The thinker's
+        # own idle pacing (backoff) applies to it like any real idle. At
+        # rest a healthy idle chain re-fires far inside the window, so the
+        # watchdog costs nothing until the chain is actually broken.
+        # _wd_conf: "name:window_secs" for thinkers with a nonzero window
+        # (smallest window wins across a thinker's subscription lines);
+        # _wd_last: "name:SECONDS-stamp" of last observed activity.
+        _wd_conf=""
+        while IFS=$'\t' read -r _wname _ _ _ _wsecs; do
+            [[ -z "$_wname" ]] && continue
+            [[ "${_wsecs:-0}" =~ ^[0-9]+$ ]] || continue
+            [[ "$_wsecs" -eq 0 ]] && continue
+            _wd_new="" _wd_seen=0
+            for _wd_e in $_wd_conf; do
+                if [[ "${_wd_e%%:*}" == "$_wname" ]]; then
+                    _wd_seen=1
+                    [[ "$_wsecs" -lt "${_wd_e#*:}" ]] && _wd_e="${_wname}:${_wsecs}"
+                fi
+                _wd_new="${_wd_new}${_wd_new:+ }${_wd_e}"
+            done
+            [[ "$_wd_seen" -eq 0 ]] && _wd_new="${_wd_new}${_wd_new:+ }${_wname}:${_wsecs}"
+            _wd_conf="$_wd_new"
+        done < "$run_dir/sub_map"
+
+        _wd_last=""
+        _wd_touch() {
+            local _tname="$1" _e _new=""
+            for _e in $_wd_last; do
+                [[ "${_e%%:*}" == "$_tname" ]] && continue
+                _new="${_new}${_new:+ }${_e}"
+            done
+            _wd_last="${_new}${_new:+ }${_tname}:${SECONDS}"
+        }
+
+        # Prune finished step children from the in-memory and on-disk process
+        # lists. The stall this guards against: these prunes used to run
+        # inside command substitution, so the `_step_entries="$_new"` below
+        # happened in a subshell and was discarded — the ledger grew one dead
+        # PID per dispatched step, and once the kernel recycled a stale PID
+        # onto a live same-user process, `kill -0` passed and the thinker
+        # looked busy forever (the watchdog refreshes its quiet timer on
+        # busy, so it never rescued). Pruning in the dispatcher shell bounds
+        # the PID-reuse window to about one tick.
+        _step_alive() {
+            local _pid="$1" _line=""
+            kill -0 "$_pid" 2>/dev/null || return 1
+            # Belt-and-braces only: bash reaps its own background children on
+            # SIGCHLD, so a persistent Z-state child of this dispatcher is
+            # not expected. Builtin read — this runs on the ~1s tick path,
+            # where a fork per tracked PID adds up.
+            if [[ -r "/proc/$_pid/stat" ]]; then
+                read -r _line < "/proc/$_pid/stat" 2>/dev/null || _line=""
+                _line="${_line##*') '}"   # skip pid and (comm); comm may hold ') '
+                [[ "${_line%% *}" == "Z" ]] && return 1
+            fi
+            return 0
+        }
+
+        _prune_finished_steps() {
+            local _entry _pid _new="" _changed=0
+            for _entry in $_step_entries; do
+                _pid="${_entry#*:}"
+                if _step_alive "$_pid"; then
+                    _new="${_new}${_new:+ }${_entry}"
+                else
+                    # bash has normally reaped the child already; this wait
+                    # just clears bash's own job-table entry and returns
+                    # immediately. Ignore failure when there is nothing left
+                    # to wait for.
+                    wait "$_pid" 2>/dev/null || true
+                    _changed=1
+                fi
+            done
+            _step_entries="$_new"
+            if [[ "$_changed" -eq 1 ]]; then
+                : > "$run_dir/step_pids.tmp"
+                for _entry in $_step_entries; do
+                    printf '%s %s\n' "${_entry#*:}" "${_entry%%:*}" >> "$run_dir/step_pids.tmp"
+                done
+                mv "$run_dir/step_pids.tmp" "$run_dir/step_pids"
+            fi
+        }
+
+        _count_active_steps() {
+            _prune_finished_steps
+            _active_step_count=0
+            local _entry
+            for _entry in $_step_entries; do
+                _active_step_count=$((_active_step_count + 1))
+            done
+        }
+
+        # Check if a thinker already has a running step
+        _thinker_busy() {
+            local _check_name="$1" _entry
+            _prune_finished_steps
+            for _entry in $_step_entries; do
+                local _ename="${_entry%%:*}"
+                if [[ "$_ename" == "$_check_name" ]]; then
+                    return 0
+                fi
+            done
+            return 1
+        }
+
+        # Launch a thinker's step in the background with the given step JSON
+        _dispatch_step() {
+            local _dname="$1" _djson="$2"
+            local _dscript="$THINKERS_DIR/$_dname/step"
+            local _dlog="$run_dir/logs/$_dname.log"
+            # SHELLM_LAUNCHED_BY lands as launched_by on any shellm-run the
+            # step script starts, so viewers can attribute runs to thinkers.
+            # $_setsid is deliberately unquoted: "setsid" on Linux, empty
+            # (and word-split away) elsewhere.
+            # shellcheck disable=SC2086
+            (
+                printf '%s' "$_djson" | SHELLM_LAUNCHED_BY="$_dname" $_setsid "$_dscript"
+            ) >> "$_dlog" 2>&1 3<&- &
+            _step_entries="${_step_entries}${_step_entries:+ }${_dname}:$!"
+            printf '%s %s\n' "$!" "$_dname" >> "$run_dir/step_pids"
+            _wd_touch "$_dname"
+        }
+
+        # Fire the watchdog for watched thinkers whose window elapsed with no
+        # activity. Busy thinkers and thinkers with queued pending work are
+        # "active" — their clock refreshes each tick, so the window measures
+        # quiet-while-free time (a long agentic run never triggers a spurious
+        # wake the moment it ends). At the global concurrency cap, defer to a
+        # later tick like _fire_pending does.
+        _watchdog_check() {
+            local _c _cname _csecs _l _last _pf _f
+            for _c in $_wd_conf; do
+                _cname="${_c%%:*}"
+                _csecs="${_c#*:}"
+                grep -qx "$_cname" "$run_dir/active_thinkers" 2>/dev/null || continue
+                _pf=""
+                for _f in "$run_dir/pending/${_cname}."*; do
+                    [[ -f "$_f" ]] && { _pf=1; break; }
+                done
+                if [[ -n "$_pf" ]] || _thinker_busy "$_cname"; then
+                    _wd_touch "$_cname"
+                    continue
+                fi
+                _last=""
+                for _l in $_wd_last; do
+                    [[ "${_l%%:*}" == "$_cname" ]] && _last="${_l#*:}"
+                done
+                if [[ -z "$_last" ]]; then
+                    _wd_touch "$_cname"
+                    continue
+                fi
+                if (( SECONDS - _last >= _csecs )); then
+                    _count_active_steps
+                    if [[ "$_active_step_count" -ge "$THINKERS_MAX_CONCURRENT" ]]; then continue; fi
+                    printf '%s [dispatcher]   watchdog -> %s (quiet %ss)\n' "$(date -u +%FT%TZ)" "$_cname" "$((SECONDS - _last))" >&2
+                    _dispatch_step "$_cname" "$(jq -nc --arg source "$_cname" \
+                        '{type:"idle", content:"idle", source:$source, synthetic:"watchdog"}')"
+                fi
+            done
+        }
+
+        # Fire pending re-triggers for thinkers that have freed up.
+        # run/pending/<name>.<type>.<epoch>.<seq> files queue message/action
+        # steps that matched <name> while it was busy (FIFO per thinker+type,
+        # capped); <name>.<type>.coalesced holds the latest self-wake step of
+        # other types (last-wins). Fixed-width epoch+seq means glob order ==
+        # arrival order, and firing a step makes the thinker busy again, so
+        # at most one queued step fires per thinker per pass. Thinker names
+        # and step types must not contain dots. Message triggers are globbed
+        # first (then action) so a freed slot answers a waiting human before
+        # it services a coalesced self-wake; an unmatched pattern stays
+        # literal and fails the -f guard, and a file revisited by the
+        # catch-all pass is already fired (rm-ed or its thinker busy again).
+        _fire_pending() {
+            local _pfile _pbase _pname _ptype _pjson _pactive
+            for _pfile in "$run_dir/pending"/*.message.* \
+                          "$run_dir/pending"/*.action.* \
+                          "$run_dir/pending"/*; do
+                [[ -f "$_pfile" ]] || continue
+                _pbase=$(basename "$_pfile")
+                _pname="${_pbase%%.*}"
+                _ptype="${_pbase#*.}"
+                _ptype="${_ptype%%.*}"
+                # Thinker no longer active: discard the flag
+                if ! grep -qx "$_pname" "$run_dir/active_thinkers" 2>/dev/null; then
+                    rm -f "$_pfile"
+                    continue
+                fi
+                # Still busy: leave the flag for a later tick
+                if _thinker_busy "$_pname"; then continue; fi
+                # At global cap: defer to a later tick
+                _count_active_steps
+                _pactive=$_active_step_count
+                if [[ "$_pactive" -ge "$THINKERS_MAX_CONCURRENT" ]]; then return 0; fi
+                _pjson=$(cat "$_pfile")
+                rm -f "$_pfile"
+                printf '%s [dispatcher]   fire pending -> %s (type=%s, active=%s)\n' "$(date -u +%FT%TZ)" "$_pname" "$_ptype" "$_pactive" >&2
+                _dispatch_step "$_pname" "$_pjson"
+            done
+        }
+
+        # Housekeeping tick: verify we still own the dispatcher role, fire
+        # pending re-triggers, run the watchdog, and respawn dead feeders.
+        # Called from the main loop at most once per second — on the read
+        # timeout when the trajectory is quiet, between steps when it is
+        # busy. This replaces the old TICK ticker process: the loop now
+        # wakes itself, so liveness no longer depends on a child process
+        # that could die silently.
+
+        # Scheduled spontaneity wake (see design/monolith_backoff.md). A thinker
+        # asks to be re-fired at a future time by writing that epoch to
+        # run/<name>.wake_at instead of spawning its own timer process — the
+        # dispatcher is always alive on this 1s tick, so it owns the clock. When
+        # the time arrives and the thinker is active + not busy + a slot is free,
+        # fire it with a scheduled-wake step and consume the file. This replaces
+        # the monolith's old per-step `setsid` background timer, which never ran
+        # on macOS (no setsid) so spontaneity silently died. Generic over any
+        # thinker; the monolith is the only current writer.
+        _scheduled_wake_check() {
+            local _wf _wname _wat _now
+            _now=$(date +%s)
+            for _wf in "$run_dir"/*.wake_at; do
+                [[ -f "$_wf" ]] || continue
+                _wname=$(basename "$_wf" .wake_at)
+                grep -qx "$_wname" "$run_dir/active_thinkers" 2>/dev/null || { rm -f "$_wf"; continue; }
+                _wat=$(cat "$_wf" 2>/dev/null) || _wat=""
+                [[ "$_wat" =~ ^[0-9]+$ ]] || { rm -f "$_wf"; continue; }
+                (( _now < _wat )) && continue
+                # Due. Don't fire while busy or without a free slot — retry next
+                # tick (leave the file). The step re-arms wake_at on its way out.
+                _thinker_busy "$_wname" && continue
+                _count_active_steps
+                if [[ "$_active_step_count" -ge "$THINKERS_MAX_CONCURRENT" ]]; then continue; fi
+                rm -f "$_wf"
+                printf '%s [dispatcher]   scheduled wake -> %s (due %ss ago)\n' "$(date -u +%FT%TZ)" "$_wname" "$((_now - _wat))" >&2
+                _dispatch_step "$_wname" "$(jq -nc --arg source monolith-timer \
+                    '{type:"monolith-wake", content:"wake", source:$source}')"
+            done
+        }
+
+        _tick() {
+            if [[ "$(cat "$run_dir/dispatcher.token" 2>/dev/null)" != "$dispatcher_token" ]]; then
+                printf '%s [dispatcher] ownership lost (newer start or stop) — exiting\n' "$(date -u +%FT%TZ)" >&2
+                # Kill only OUR tails (whole trees — a bare kill leaves the
+                # tail stage of the pipeline alive); the shared runtime
+                # files (fifo, sub_map, tail_pids, pending) belong to the
+                # new owner now — leave them untouched.
+                trap - EXIT INT TERM
+                local _mtp
+                for _mtp in $_my_tail_pids; do
+                    _kill_tree "$_mtp" TERM
+                done
+                exit 0
+            fi
+            _fire_pending
+            _watchdog_check
+            _scheduled_wake_check
+            _respawn_dead_feeders
+        }
+        _last_tick=$SECONDS
+        _spin_mark=$SECONDS
+        _spin_count=0
+
+        # Main dispatch loop: read tagged step lines from the fifo with a
+        # 1s timeout so the loop keeps ticking while the trajectory is
+        # quiet. The dispatcher holds its own write end open (<>), so the
+        # read can never hit EOF — even with every feeder dead it times
+        # out instead, and the tick brings the feeders back.
+        #
+        # The read goes into ONE variable and splits on tab afterwards: a
+        # timeout regularly catches a writer mid-line (tail -F polls on the
+        # same 1s cadence as the timeout, so arrivals cluster right at the
+        # deadline), and bash then returns the partial input. Splitting in
+        # read itself would tear that partial across two variables; with a
+        # single buffer the partial is kept and the rest of the line is
+        # stitched on when it completes.
+        exec 3<> "$fifo"
+        _read_buf=""
+        _tab=$'\t'
+        while :; do
+            _line="" _read_rc=0
+            IFS= read -r -t 1 -u 3 _line || _read_rc=$?
+            if (( SECONDS - _last_tick >= 1 )); then
+                _last_tick=$SECONDS
+                _tick
+            fi
+            if (( _read_rc != 0 )); then
+                # `read -t` timeout return code is bash-version-specific: bash
+                # >=4 returns >128, but macOS's /bin/bash 3.2 returns 1. fd 3
+                # holds the fifo's OWN write end (exec 3<> above), so a genuine
+                # EOF is impossible — every non-zero read is a timeout. (The old
+                # `>128`-only check misread bash 3.2's rc=1 timeout as a fatal
+                # "fifo read failed" and the dispatcher died on its first idle
+                # second on macOS.) Keep any partial line and loop.
+                #
+                # Spin guard: a real -t 1 timeout takes ~1s, so at most a few
+                # per second. If non-zero reads pile up WITHIN one second the fd
+                # is actually broken (returning instantly, not timing out) —
+                # exit rather than hot-loop.
+                if (( SECONDS == _spin_mark )); then
+                    if (( ++_spin_count > 50 )); then
+                        printf '%s [dispatcher] fifo read failing fast (rc=%s) — exiting\n' "$(date -u +%FT%TZ)" "$_read_rc" >&2
+                        break
+                    fi
+                else
+                    _spin_mark=$SECONDS
+                    _spin_count=0
+                fi
+                _read_buf="${_read_buf}${_line}"
+                continue
+            fi
+            _line="${_read_buf}${_line}"
+            _read_buf=""
+            _traj_file="${_line%%"$_tab"*}"
+            _step_json="${_line#*"$_tab"}"
+            [[ "$_step_json" == "$_line" ]] && _step_json=""
+            if [[ -z "$_step_json" ]]; then continue; fi
+
+            # Fire pending re-triggers first so a step flagged while its
+            # thinker was busy is delivered before this newer step
+            _fire_pending
+
+            # Parse step
+            _step_type=$(printf '%s' "$_step_json" | jq -r '.type // empty' 2>/dev/null) || continue
+            _step_source=$(printf '%s' "$_step_json" | jq -r '.source // empty' 2>/dev/null) || true
+
+            if [[ -z "$_step_type" ]]; then continue; fi
+
+            printf '%s [dispatcher] step: type=%s source=%s\n' "$(date -u +%FT%TZ)" "$_step_type" "$_step_source" >&2
+
+            # Find matching thinkers by scanning sub_map
+            while IFS=$'\t' read -r _name _straj _stypes _sself _swd; do
+                if [[ -z "$_name" ]]; then continue; fi
+
+                # Check traj match
+                if [[ "$_straj" != "$_traj_file" ]]; then continue; fi
+
+                # Check type match (empty means all types)
+                if [[ -n "$_stypes" ]]; then
+                    _matched=0
+                    _old_ifs="$IFS"
+                    IFS='|'
+                    for _t in $_stypes; do
+                        if [[ "$_t" == "$_step_type" ]]; then _matched=1; break; fi
+                    done
+                    IFS="$_old_ifs"
+                    if [[ "$_matched" -eq 0 ]]; then continue; fi
+                fi
+
+                # Self-trigger check
+                # Even with trigger_self:true, never re-trigger on own
+                # error/log_error steps — that creates a feedback loop
+                # (thinker errors → error step → re-trigger → errors again
+                # → ...). Own errors are a failure signal to the operator,
+                # not a wake-up signal to the thinker.
+                if [[ "$_step_source" == "$_name" ]]; then
+                    if [[ "$_sself" != "true" ]]; then
+                        printf '%s [dispatcher]   skip %s (self-trigger)\n' "$(date -u +%FT%TZ)" "$_name" >&2
+                        continue
+                    fi
+                    case "$_step_type" in
+                        log_error|error)
+                            printf '%s [dispatcher]   skip %s (self error — would loop)\n' "$(date -u +%FT%TZ)" "$_name" >&2
+                            continue
+                            ;;
+                    esac
+                fi
+
+                # Check if thinker is active
+                if ! grep -qx "$_name" "$run_dir/active_thinkers" 2>/dev/null; then
+                    continue
+                fi
+
+                # Per-thinker concurrency while busy: semantics depend on the
+                # step type. message/action steps each carry a distinct
+                # payload that deserves its own wakeup — queue them FIFO
+                # (capped) so none is silently lost. Everything else (idle,
+                # observation, thought, ...) is a self-wake signal where only
+                # "wake again" matters — last-wins, one pending file, so a
+                # perpetual-loop thinker never builds a backlog of stale
+                # wakeups it then burns tokens draining.
+                if _thinker_busy "$_name"; then
+                    case "$_step_type" in
+                        message|action)
+                            _pend_count=0
+                            for _pend_file in "$run_dir/pending/${_name}.${_step_type}."*; do
+                                [[ -f "$_pend_file" ]] && _pend_count=$((_pend_count + 1))
+                            done
+                            if [[ "$_pend_count" -ge 16 ]]; then
+                                for _pend_file in "$run_dir/pending/${_name}.${_step_type}."*; do
+                                    printf '%s [dispatcher]   pending %s.%s queue full — dropping oldest\n' "$(date -u +%FT%TZ)" "$_name" "$_step_type" >&2
+                                    rm -f "$_pend_file"
+                                    _pend_count=$((_pend_count - 1))
+                                    break
+                                done
+                            fi
+                            _pend_seq=$(( ${_pend_seq:-0} + 1 ))
+                            _pend_file="$run_dir/pending/${_name}.${_step_type}.$(date +%s).$(printf '%06d' "$_pend_seq")"
+                            printf '%s' "$_step_json" > "$_pend_file"
+                            printf '%s [dispatcher]   pending -> %s (type=%s, queued=%d)\n' "$(date -u +%FT%TZ)" "$_name" "$_step_type" "$((_pend_count + 1))" >&2
+                            # Salience injection: an inbound chat message that
+                            # queues behind a busy agentic run ALSO lands as a
+                            # feedback step in the traj that run is reading, so
+                            # the model can answer mid-run instead of the
+                            # sender waiting out the whole run. Inbound only —
+                            # our own outgoing replies are context, not
+                            # something to answer. feedback matches no
+                            # subscription, so this append never re-dispatches.
+                            if [[ "$_step_type" == "message" ]]; then
+                                _fb_from=$(printf '%s' "$_step_json" | jq -r '.from // empty' 2>/dev/null) || _fb_from=""
+                                _fb_to=$(printf '%s' "$_step_json" | jq -r '.to // empty' 2>/dev/null) || _fb_to=""
+                                _fb_id=$(printf '%s' "$_step_json" | jq -r '.step_id // empty' 2>/dev/null) || _fb_id=""
+                                # Dedup: this block runs once per busy subscribed
+                                # thinker, but one inbound message deserves ONE
+                                # nudge — three subscribers meant three identical
+                                # feedback steps (2026-08-17 triple reply).
+                                if [[ -n "$_fb_from" && -n "$_fb_id" && "$_fb_to" == "$IDENTITY_NAME" && "$_fb_from" != "$IDENTITY_NAME" ]] \
+                                    && ! grep -qxF "$_fb_id" "$run_dir/fb_injected" 2>/dev/null; then
+                                    printf '%s\n' "$_fb_id" >> "$run_dir/fb_injected"
+                                    _fb_snip=$(printf '%s' "$_step_json" | jq -r '(.content // "") | tostring | .[0:300]' 2>/dev/null) || _fb_snip=""
+                                    jq -nc \
+                                        --arg content "A chat message from $_fb_from arrived while you are mid-task (message step $_fb_id): \"$_fb_snip\". You may answer it inline without stopping your work: if a brief accurate answer is possible from what you already know, run \`chat reply --reply-to $_fb_id '$_fb_from' \"<your reply>\"\` now, then continue the task. If a real answer needs the work you are doing, send one short line the same way saying you are on it and will follow up. One reply at most; if a reply from you to this message already appears later in the log, ignore this note. Do not abandon or restart your current task." \
+                                        --arg trigger "$_fb_id" \
+                                        '{type:"feedback", content:$content, source:"dispatcher"}
+                                         + (if $trigger == "" then {} else {trigger_step:$trigger} end)' \
+                                        | traj append --traj_dir "$TRAJ_DIR" "${_straj#"$TRAJ_DIR"/}" >/dev/null 2>&1 || true
+                                fi
+                            fi
+                            ;;
+                        *)
+                            _pend_file="$run_dir/pending/${_name}.${_step_type}.coalesced"
+                            if [[ -f "$_pend_file" ]]; then
+                                printf '%s [dispatcher]   pending %s.%s superseded (last-wins)\n' "$(date -u +%FT%TZ)" "$_name" "$_step_type" >&2
+                            fi
+                            printf '%s' "$_step_json" > "$_pend_file"
+                            printf '%s [dispatcher]   pending -> %s (type=%s, coalesced)\n' "$(date -u +%FT%TZ)" "$_name" "$_step_type" >&2
+                            ;;
+                    esac
+                    continue
+                fi
+
+                # Global concurrency limit
+                while true; do
+                    _count_active_steps
+                    _active=$_active_step_count
+                    if [[ "$_active" -lt "$THINKERS_MAX_CONCURRENT" ]]; then
+                        break
+                    fi
+                    sleep 0.5
+                done
+
+                # Run thinker step in background
+                printf '%s [dispatcher]   dispatch -> %s (active=%s)\n' "$(date -u +%FT%TZ)" "$_name" "$_active" >&2
+                _dispatch_step "$_name" "$_step_json"
+            done < "$run_dir/sub_map"
+        done
+    ) >> "$run_dir/logs/dispatcher.log" 2>&1 &
+
+    local dispatcher_pid=$!
+    printf '%s' "$dispatcher_pid" > "$pid_file"
+    debug "Dispatcher started (PID $dispatcher_pid)"
+    printf '%s' "$dispatcher_pid"
+}
+
+# Tear down a dispatcher's run-dir state, shared by _cleanup_dispatcher and
+# _stop_dispatcher: kill tail feeder trees (a bare kill leaves the pipeline's
+# tail alive), then sweep feeders that escaped the PID-tree kill — the kill
+# races against wrapper death, and once the pipeline wrapper dies its
+# tail/tagger stages reparent to init and escape pgrep -P (_kill_traj_tails
+# kills by the traj file path embedded in the tail's argv). Finally remove
+# the FIFO, sub_map, traj_files, pending-trigger flags, and ownership token
+# (removing the token also makes any stray dispatcher instance exit on its
+# next heartbeat).
+_cleanup_run_state() {
+    local run_dir="$1"
+    local tail_pids_file="$run_dir/tail_pids"
+    if [[ -f "$tail_pids_file" ]]; then
+        local pid
+        while IFS= read -r pid; do
+            [[ -n "$pid" ]] && _kill_tree "$pid" TERM
+        done < "$tail_pids_file"
+        rm -f "$tail_pids_file"
+    fi
+    _kill_traj_tails "$run_dir" ${2:+"$2"}
+    rm -f "$run_dir/dispatch.fifo" "$run_dir/sub_map" "$run_dir/traj_files" "$run_dir/dispatcher.token"
+    rm -rf "$run_dir/pending"
+}
+
+_cleanup_dispatcher() {
+    _cleanup_run_state "$IDENTITY_DIR/run"
+}
+
+# Dispatcher INT/TERM handler. Sanctioned stops announce themselves:
+# _stop_dispatcher touches run/deliberate_stop right before its kill -TERM,
+# and finding a fresh marker here means "this stop was requested" — exit 0
+# so systemd sees a clean exit (no Restart=, no alert). Any other INT/TERM
+# is unsanctioned: record WHICH signal hit us to dispatcher.log, journald,
+# and run/last_signal (read by deploy/thinkers-death-alert.sh), then exit
+# 130 so systemd restarts the mind and posts the death alert. Split from a
+# single 'INT TERM' trap after the 2026-08-12 unattributed death, where
+# signal identity was the first forensic question and a shared exit 130
+# couldn't answer it.
+_dispatcher_on_signal() {
+    local sig="$1"
+    local run_dir="$IDENTITY_DIR/run"
+    local marker="$run_dir/deliberate_stop"
+    if [[ -f "$marker" ]]; then
+        local _now _mt
+        _now=$(date +%s)
+        _mt=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null) || _mt=0
+        rm -f "$marker"
+        if (( _now - _mt < 60 )); then
+            printf '%s [dispatcher] caught SIG%s from a deliberate stop — exiting clean\n' \
+                "$(date -u +%FT%TZ)" "$sig" >&2
+            _cleanup_dispatcher
+            exit 0
+        fi
+        # Stale marker (>60s old): a stop was requested long ago and never
+        # reached us — don't let it launder whatever is signaling us now.
+    fi
+    printf '%s [dispatcher] caught unsanctioned SIG%s (pid %s) — exiting 130\n' \
+        "$(date -u +%FT%TZ)" "$sig" "$$" >&2
+    printf 'SIG%s\n' "$sig" > "$run_dir/last_signal" 2>/dev/null || true
+    logger -t headlong-thinkers \
+        "dispatcher(${IDENTITY_NAME:-unknown}) pid $$ caught unsanctioned SIG${sig}" \
+        2>/dev/null || true
+    _cleanup_dispatcher
+    exit 130
+}
+
+_stop_dispatcher() {
+    local run_dir="$IDENTITY_DIR/run"
+    local pid_file="$run_dir/dispatcher.pid"
+
+    # Snapshot the traj-file list now: the dispatcher's trap cleanup removes
+    # run/traj_files, and we need it below to sweep leaked tail feeders.
+    local traj_files_snapshot=""
+    if [[ -f "$run_dir/traj_files" ]]; then
+        traj_files_snapshot=$(cat "$run_dir/traj_files" 2>/dev/null) || true
+    fi
+
+    # Stop dispatcher process
+    if [[ -f "$pid_file" ]]; then
+        local pid
+        pid=$(cat "$pid_file" 2>/dev/null) || true
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            printf 'Stopping dispatcher (PID %s)...\n' "$pid" >&2
+            # Announce the stop so the dispatcher's TERM trap exits 0
+            # (sanctioned) instead of 130 (unsanctioned — systemd would
+            # restart and alert). The trap removes the marker; a fresh
+            # start clears any stale one.
+            touch "$run_dir/deliberate_stop" 2>/dev/null || true
+            kill -TERM "$pid" 2>/dev/null || true
+            for _ in 1 2 3 4 5 6 7 8; do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.25
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -KILL "$pid" 2>/dev/null || true
+            fi
+            printf 'Dispatcher stopped.\n' >&2
+        else
+            printf 'Dispatcher not running (cleaned up stale PID).\n' >&2
+        fi
+        rm -f "$pid_file"
+    else
+        printf 'No dispatcher running.\n' >&2
+    fi
+
+    _cleanup_run_state "$run_dir" "$traj_files_snapshot"
+
+    # Vitals check: warn if any tail feeders survived the kill/sweep
+    _warn_stray_tails
+}
+
+# After starting a fresh dispatcher, tell the mind if it was dead: when the
+# newest trajectory step is older than THINKERS_WAKE_NOTE_MIN_GAP seconds
+# (default 300; 0 disables), append an observation recording the gap. A mind
+# that dies never observes the consequence — the log just stops — so the
+# lesson can only enter its experience at wake-up (2026-08-12: Audel stopped
+# its own dispatcher mid-restart-plan and woke an hour later with no trace
+# of having been down). The note also carries the safe self-restart command,
+# so the teaching lands exactly when it is relevant. Failure-open on
+# purpose: a malformed ts or missing traj must never block the start.
+_append_wake_gap_note() {
+    local min_gap="${THINKERS_WAKE_NOTE_MIN_GAP:-300}"
+    [[ "$min_gap" =~ ^[0-9]+$ && "$min_gap" -gt 0 ]] || return 0
+    local traj_file last_epoch gap
+    traj_file=$(_resolve_traj_file "$TRAJ_DIR" "$TRAJ_ID") || return 0
+    last_epoch=$(tail -n 1 "$traj_file" 2>/dev/null \
+        | jq -r '(.ts // empty) | sub("\\.[0-9]+"; "") | sub("\\+0000$"; "Z") | fromdateiso8601? // empty' 2>/dev/null) || last_epoch=""
+    [[ "$last_epoch" =~ ^[0-9]+$ ]] || return 0
+    gap=$(( $(date +%s) - last_epoch ))
+    [[ "$gap" -ge "$min_gap" ]] || return 0
+    local gap_h=$(( gap / 3600 )) gap_m=$(( (gap % 3600) / 60 ))
+    local gap_str="${gap_m}m"
+    [[ "$gap_h" -gt 0 ]] && gap_str="${gap_h}h ${gap_m}m"
+    jq -nc --arg name "$IDENTITY_NAME" --arg gap "$gap_str" \
+        '{type:"observation", source:"system",
+          content:("Wake-up note: your dispatcher just started, and the previous step in this log is about \($gap) old — your mind was not running in between. If you did not expect this downtime, investigate it (run/logs/dispatcher.log; systemctl status headlong-thinkers@\($name)) before resuming other plans. Reminder: `thinkers stop` from inside your own mind kills you mid-step and nothing restarts you. To restart yourself safely (e.g. to register a new thinker), run: sudo headlong-thinkersctl restart \($name) — systemd completes the restart even though your current step dies with the old dispatcher.")}' \
+        | traj append --traj_dir "$TRAJ_DIR" "${traj_file#"$TRAJ_DIR"/}" >/dev/null 2>&1 || true
+}
+
+# Guard against shadowed tools. The shellm CLIs live together next to this
+# script, so our own resolved location is the canonical bin dir. Prepend it (so
+# our tools beat same-named system binaries — macOS ships /usr/sbin/chat,
+# /usr/bin/view, ...), then VERIFY each critical tool on PATH actually resolves
+# to OUR copy. Fail loudly rather than silently running the wrong program — the
+# /usr/sbin/chat shadow silently broke every chat reply on 2026-08-14.
+_ensure_shellm_bins() {
+    local self bindir
+    # BASH_SOURCE, not `command -v thinkers`: PATH is the very thing this
+    # guard distrusts, and under absolute-path invocation the PATH lookup can
+    # resolve a different copy than the one executing — the guard would then
+    # prepend and verify the wrong directory.
+    self="${BASH_SOURCE[0]:-$0}"
+    # realpath's failure must be checked on its own: inlined, a failed
+    # substitution feeds "" to dirname, which yields "." — `cd .` then
+    # succeeds and bindir silently becomes $PWD, prepending and verifying
+    # whatever directory the dispatcher happened to start in.
+    local rp
+    rp=$(realpath "$self" 2>/dev/null) || rp=""
+    if [[ -z "$rp" ]] || ! bindir=$(cd "$(dirname "$rp")" 2>/dev/null && pwd); then
+        echo "thinkers: warn: cannot resolve own bin dir from '$self' — PATH-shadow guard skipped" >&2
+        return 0
+    fi
+
+    # Prepend our dir unless it's already first (a later copy still loses to a
+    # system dir, so presence isn't enough — it must be first).
+    [[ "$PATH" == "$bindir:"* ]] || { PATH="$bindir:$PATH"; export PATH; }
+
+    local tool resolved want bad=()
+    for tool in chat traj llm mem context skills recap identity thinkers; do
+        [[ -x "$bindir/$tool" ]] || continue          # only tools we actually ship
+        resolved=$(command -v "$tool" 2>/dev/null) || resolved=""
+        want=$(realpath "$bindir/$tool" 2>/dev/null)
+        if [[ -z "$resolved" || "$(realpath "$resolved" 2>/dev/null)" != "$want" ]]; then
+            bad+=("$tool -> ${resolved:-<not found on PATH>}")
+        fi
+    done
+    if (( ${#bad[@]} )); then
+        printf 'thinkers: error: these tools on PATH are NOT the shellm ones next to this command (%s):\n' "$bindir" >&2
+        printf '  %s\n' "${bad[@]}" >&2
+        printf 'A system binary is shadowing them. Put %s ahead of system dirs (e.g. /usr/sbin) in PATH.\n' "$bindir" >&2
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+cmd_start() {
+    _require_env
+    _ensure_shellm_bins
+
+    # Parse start-specific flags
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-self-trigger) NO_SELF_TRIGGER=1; shift ;;
+            -*) die "Unknown flag for start: $1" ;;
+            *) break ;;
+        esac
+    done
+
+    local run_dir="$IDENTITY_DIR/run"
+    mkdir -p "$run_dir"
+
+    if [[ $# -gt 0 ]]; then
+        # --- Start named thinkers ---
+
+        # Validate all names first
+        local name
+        for name in "$@"; do
+            local thinker_dir="$THINKERS_DIR/$name"
+            [[ -d "$thinker_dir" ]] || die "Thinker not found: $name"
+            [[ -f "$thinker_dir/disabled" ]] && \
+                die "Thinker '$name' is disabled (remove $thinker_dir/disabled to enable)"
+            [[ -f "$thinker_dir/step" && -f "$thinker_dir/subscriptions.jsonl" ]] || \
+                die "Thinker '$name' missing step or subscriptions.jsonl"
+        done
+
+        # Add to active list and run start scripts
+        for name in "$@"; do
+            local thinker_dir="$THINKERS_DIR/$name"
+
+            # Add to active_thinkers if not already there
+            if ! grep -qx "$name" "$run_dir/active_thinkers" 2>/dev/null; then
+                printf '%s\n' "$name" >> "$run_dir/active_thinkers"
+            fi
+
+            # Run start script if present
+            if [[ -x "$thinker_dir/start" ]]; then
+                "$thinker_dir/start" || printf 'Warning: %s start script failed\n' "$name" >&2
+                if [[ -f "$thinker_dir/pid" ]]; then
+                    mkdir -p "$run_dir/thinkers"
+                    cp "$thinker_dir/pid" "$run_dir/thinkers/$name.pid"
+                fi
+            fi
+        done
+
+        # Start dispatcher if not running
+        local pid_file="$run_dir/dispatcher.pid"
+        local need_dispatcher=1
+        if [[ -f "$pid_file" ]]; then
+            local old_pid
+            old_pid=$(cat "$pid_file" 2>/dev/null) || true
+            if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+                need_dispatcher=0
+            fi
+        fi
+
+        if [[ "$need_dispatcher" -eq 1 ]]; then
+            printf 'Starting dispatcher...\n' >&2
+            local dispatcher_pid
+            dispatcher_pid=$(_start_dispatcher)
+            printf 'Dispatcher started (PID %s)\n' "$dispatcher_pid" >&2
+            _append_wake_gap_note
+        fi
+
+        # Kick each thinker once (dispatcher only sees new steps). The kick
+        # goes through the dispatcher's pending queue — fired on its next
+        # heartbeat tick (~1s) — instead of spawning the step here: a step
+        # spawned by a short-lived CLI call is orphaned outside dispatcher
+        # supervision (untracked by busy/concurrency accounting, invisible
+        # to drain stops, and — when the CLI itself ran inside another
+        # step, as on 2026-08-12 — able to slip past the self-stop guard's
+        # ancestry walk and kill the mind).
+        local kick_seq=0
+        local trigger_json
+        trigger_json=$(jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%S%z)" \
+            '{type:"manual-trigger", source:"thinkers-cli", ts:$ts}')
+        mkdir -p "$run_dir/pending"
+        for name in "$@"; do
+            kick_seq=$((kick_seq + 1))
+            printf '%s' "$trigger_json" \
+                > "$run_dir/pending/${name}.manual-trigger.$(date +%s).$(printf '%06d' "$kick_seq")"
+            printf 'Started thinker: %s (wake queued)\n' "$name" >&2
+        done
+    else
+        # --- Start all thinkers ---
+
+        # Write all thinker names to active_thinkers and call start scripts
+        : > "$run_dir/active_thinkers"
+        local thinker_dir
+        while IFS= read -r thinker_dir; do
+            local name_all
+            name_all=$(basename "$thinker_dir")
+            printf '%s\n' "$name_all" >> "$run_dir/active_thinkers"
+            if [[ -x "$thinker_dir/start" ]]; then
+                printf 'Starting thinker: %s\n' "$name_all" >&2
+                "$thinker_dir/start" || printf 'Warning: %s start script failed\n' "$name_all" >&2
+                if [[ -f "$thinker_dir/pid" ]]; then
+                    mkdir -p "$run_dir/thinkers"
+                    cp "$thinker_dir/pid" "$run_dir/thinkers/$name_all.pid"
+                fi
+            fi
+        done < <(_list_thinker_dirs)
+
+        # Start dispatcher
+        printf 'Starting dispatcher...\n' >&2
+        local dispatcher_pid
+        dispatcher_pid=$(_start_dispatcher)
+        _append_wake_gap_note
+
+        # Show status
+        local thinker_count=0
+        while IFS= read -r _; do
+            thinker_count=$((thinker_count + 1))
+        done < <(_list_thinker_dirs)
+
+        printf '\n' >&2
+        printf 'Identity:    %s\n' "$IDENTITY_NAME" >&2
+        printf 'Dispatcher:  running (PID %s)\n' "$dispatcher_pid" >&2
+        printf 'Thinkers:    %d\n' "$thinker_count" >&2
+        printf 'Concurrency: %s\n' "$THINKERS_MAX_CONCURRENT" >&2
+        printf 'Logs:        %s/run/logs/\n' "$IDENTITY_DIR" >&2
+    fi
+}
+
+# Wait for pids to exit on their own (up to timeout seconds), then escalate
+# TERM -> KILL on survivors. Defensive style: this runs detached under
+# set -e, so any bare failing command would silently kill the reaper.
+_wait_or_kill() {
+    local timeout="$1"; shift
+    local deadline=$(( $(date +%s) + timeout ))
+    local p alive
+    while :; do
+        alive=0
+        for p in "$@"; do
+            if kill -0 "$p" 2>/dev/null; then alive=1; break; fi
+        done
+        [[ "$alive" -eq 0 ]] && return 0
+        if [[ $(date +%s) -ge "$deadline" ]]; then
+            for p in "$@"; do
+                if kill -0 "$p" 2>/dev/null; then _kill_tree "$p" TERM; fi
+            done
+            sleep 1
+            for p in "$@"; do
+                if kill -0 "$p" 2>/dev/null; then _kill_tree "$p" KILL; fi
+            done
+            return 0
+        fi
+        sleep 2
+    done
+}
+
+# Detached reaper for one thinker: let in-flight steps finish (a mid-flight
+# actor step gets to append its observation instead of leaving a dangling
+# action in the mind log), then run the stop script and clean up. Detached
+# so `thinkers stop` — and the web request behind it — returns immediately;
+# fds are redirected so a captured stdout can't keep the caller alive.
+_drain_then_finish() {
+    local run_dir="$1" thinker_dir="$2" name="$3" timeout="$4"; shift 4
+    (
+        _wait_or_kill "$timeout" "$@"
+        if [[ -x "$thinker_dir/stop" ]]; then "$thinker_dir/stop" || true; fi
+        rm -f "$run_dir/thinkers/$name.pid"
+    ) </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
+
+# Detached reaper for stop-all: drain every in-flight step, then run all
+# stop scripts and clear the step ledger.
+_drain_all_then_finish() {
+    local run_dir="$1" timeout="$2"; shift 2
+    (
+        _wait_or_kill "$timeout" "$@"
+        local thinker_dir
+        while IFS= read -r thinker_dir; do
+            if [[ -x "$thinker_dir/stop" ]]; then "$thinker_dir/stop" || true; fi
+            rm -f "$run_dir/thinkers/$(basename "$thinker_dir").pid"
+        done < <(_list_thinker_dirs)
+        rm -f "$run_dir/step_pids"
+    ) </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
+
+cmd_stop() {
+    _require_env
+
+    local run_dir="$IDENTITY_DIR/run"
+    local force=0 self_ok=0 drain_timeout="${THINKERS_DRAIN_TIMEOUT:-180}"
+    local names=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force) force=1; shift ;;
+            --self) self_ok=1; shift ;;
+            --drain-timeout)
+                drain_timeout="${2:?--drain-timeout requires seconds}"; shift 2 ;;
+            -*) die "stop: unknown option: $1" ;;
+            *) names+=("$1"); shift ;;
+        esac
+    done
+    [[ "$drain_timeout" =~ ^[0-9]+$ ]] || die "stop: --drain-timeout must be a number of seconds"
+
+    # Refuse to stop from inside our own dispatcher's tree or cgroup: the
+    # stop kills the caller mid-command (directly, or via systemd's cgroup
+    # sweep when the unit's main process exits), so the mind goes down with
+    # nothing left to notice or restart it. Two ways to get here: a step
+    # that meant to stop a DIFFERENT identity but whose env switch never
+    # took (e.g. `source .../activate | head` sources in a subshell), and a
+    # step trying to stop-then-restart its own dispatcher — which can never
+    # work from inside, because the stop reaps the process that would run
+    # the start (the 2026-08-12 incident).
+    if [[ "$self_ok" -ne 1 ]] && _inside_own_dispatcher "$run_dir"; then
+        die "stop: refusing — this process would die with the $IDENTITY_NAME dispatcher it is asking to stop, leaving the mind down with nothing to restart it. To restart your own mind safely (e.g. to pick up a new thinker): sudo headlong-thinkersctl restart $IDENTITY_NAME — systemd completes the restart even after this step dies with the old dispatcher. To stop another identity: bash -c 'source <identities>/<name>/activate && thinkers stop'. To really stop your own mind, pass --self."
+    fi
+
+    # Drop any pending scheduled-wake requests (design/monolith_backoff.md) when
+    # stopping the monolith or all thinkers, so a stale wake_at can't fire a
+    # thinker the operator just stopped. These are plain timestamp files (the
+    # dispatcher tick owns the clock now — no timer process to kill).
+    if [[ ${#names[@]} -eq 0 ]]; then
+        rm -f "$run_dir"/*.wake_at 2>/dev/null || true
+    else
+        local _wn
+        for _wn in "${names[@]}"; do rm -f "$run_dir/$_wn.wake_at" 2>/dev/null || true; done
+    fi
+
+    # Default is a drain stop: deactivate (no new triggers), let in-flight
+    # steps finish, escalate to kill only after --drain-timeout. --force
+    # kills in-flight steps immediately (the old behavior).
+
+    if [[ ${#names[@]} -gt 0 ]]; then
+        # --- Stop named thinkers ---
+        local name
+        for name in "${names[@]}"; do
+            local thinker_dir="$THINKERS_DIR/$name"
+            [[ -d "$thinker_dir" ]] || die "Thinker not found: $name"
+
+            # Deactivate first: the dispatcher stops routing new triggers
+            if [[ -f "$run_dir/active_thinkers" ]]; then
+                grep -vx "$name" "$run_dir/active_thinkers" > "$run_dir/active_thinkers.tmp" 2>/dev/null || true
+                mv "$run_dir/active_thinkers.tmp" "$run_dir/active_thinkers"
+            fi
+
+            # Collect this thinker's live in-flight steps
+            local pids=() step_pid _step_name
+            if [[ -f "$run_dir/step_pids" ]]; then
+                while read -r step_pid _step_name; do
+                    if [[ "$_step_name" == "$name" && -n "$step_pid" ]] && kill -0 "$step_pid" 2>/dev/null; then
+                        pids+=("$step_pid")
+                    fi
+                done < "$run_dir/step_pids"
+            fi
+
+            if [[ ${#pids[@]} -eq 0 || "$force" -eq 1 ]]; then
+                local p
+                for p in ${pids[@]+"${pids[@]}"}; do
+                    _kill_tree "$p" TERM
+                done
+                if [[ -x "$thinker_dir/stop" ]]; then
+                    "$thinker_dir/stop" || true
+                fi
+                rm -f "$run_dir/thinkers/$name.pid"
+                printf 'Stopped thinker: %s\n' "$name" >&2
+            else
+                _drain_then_finish "$run_dir" "$thinker_dir" "$name" "$drain_timeout" "${pids[@]}"
+                printf 'Stopped thinker: %s (draining %d in-flight step(s), max %ss)\n' \
+                    "$name" "${#pids[@]}" "$drain_timeout" >&2
+            fi
+        done
+
+        # If no active thinkers left, stop dispatcher entirely (draining
+        # steps are independent processes and finish on their own)
+        local remaining
+        remaining=$(grep -c . "$run_dir/active_thinkers" 2>/dev/null) || remaining=0
+        if [[ "$remaining" -eq 0 ]]; then
+            printf 'No active thinkers remain — stopping dispatcher.\n' >&2
+            _stop_dispatcher
+        fi
+        return
+    fi
+
+    # --- Stop all (no name given) ---
+    _stop_dispatcher
+
+    # Collect all live in-flight steps
+    local step_pids_file="$run_dir/step_pids"
+    local all_pids=() step_pid _step_name
+    if [[ -f "$step_pids_file" ]]; then
+        while read -r step_pid _step_name; do
+            if [[ -n "$step_pid" ]] && kill -0 "$step_pid" 2>/dev/null; then
+                all_pids+=("$step_pid")
+            fi
+        done < "$step_pids_file"
+    fi
+
+    if [[ ${#all_pids[@]} -gt 0 && "$force" -eq 0 ]]; then
+        _drain_all_then_finish "$run_dir" "$drain_timeout" "${all_pids[@]}"
+        rm -f "$run_dir/active_thinkers"
+        printf 'All thinkers deactivated — draining %d in-flight step(s) (max %ss), stop scripts run after.\n' \
+            "${#all_pids[@]}" "$drain_timeout" >&2
+        return
+    fi
+
+    # Force (or nothing in flight): kill immediately
+    if [[ ${#all_pids[@]} -gt 0 ]]; then
+        local p
+        for p in "${all_pids[@]}"; do
+            _kill_tree "$p" TERM
+        done
+        printf 'Killed %d in-flight step process(es).\n' "${#all_pids[@]}" >&2
+        # Give them a moment, then force-kill survivors
+        sleep 1
+        for p in "${all_pids[@]}"; do
+            if kill -0 "$p" 2>/dev/null; then
+                _kill_tree "$p" KILL
+            fi
+        done
+    fi
+    rm -f "$step_pids_file"
+
+    # Call stop scripts on thinkers that have them
+    local thinker_dir
+    while IFS= read -r thinker_dir; do
+        local name_all
+        name_all=$(basename "$thinker_dir")
+        if [[ -x "$thinker_dir/stop" ]]; then
+            printf 'Stopping thinker: %s\n' "$name_all" >&2
+            "$thinker_dir/stop" || true
+        fi
+        # Clean up thinker PIDs
+        rm -f "$run_dir/thinkers/$name_all.pid"
+    done < <(_list_thinker_dirs)
+
+    rm -f "$run_dir/active_thinkers"
+    printf 'All thinkers stopped.\n' >&2
+}
+
+cmd_status() {
+    _require_env
+
+    local run_dir="$IDENTITY_DIR/run"
+    local pid_file="$run_dir/dispatcher.pid"
+
+    printf 'Identity:   %s\n' "$IDENTITY_NAME"
+
+    # Dispatcher status
+    local dispatcher_state="stopped"
+    if [[ -f "$pid_file" ]]; then
+        local pid
+        pid=$(cat "$pid_file" 2>/dev/null) || true
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            dispatcher_state="running (PID $pid)"
+        fi
+    fi
+    printf 'Dispatcher: %s\n' "$dispatcher_state"
+    if [[ "$dispatcher_state" != "stopped" ]]; then
+        printf 'Concurrency: %s max\n' "$THINKERS_MAX_CONCURRENT"
+    fi
+    printf '\n'
+
+    # Build map of active step processes per thinker
+    local step_pids_file="$run_dir/step_pids"
+    # Associative-style tracking using name matching (bash 3.2 compat)
+    local _active_steps=""
+    if [[ -f "$step_pids_file" ]]; then
+        local _sp _sn
+        while read -r _sp _sn; do
+            if [[ -n "$_sp" ]] && kill -0 "$_sp" 2>/dev/null; then
+                _active_steps="${_active_steps}${_active_steps:+ }${_sn}"
+            fi
+        done < "$step_pids_file"
+    fi
+
+    # Per-thinker status
+    printf 'Thinkers:\n'
+    local thinker_dir
+    while IFS= read -r thinker_dir; do
+        local name
+        name=$(basename "$thinker_dir")
+        local status
+        if [[ "$dispatcher_state" == "stopped" ]] || ! grep -qx "$name" "$run_dir/active_thinkers" 2>/dev/null; then
+            status="stopped"
+        else
+            # Count active step processes for this thinker
+            local _step_count=0
+            local _w
+            for _w in $_active_steps; do
+                if [[ "$_w" == "$name" ]]; then
+                    _step_count=$((_step_count + 1))
+                fi
+            done
+            if [[ "$_step_count" -gt 0 ]]; then
+                status="active (${_step_count} step(s))"
+            else
+                status="idle"
+            fi
+        fi
+
+        # Check if thinker has a running start process
+        local thinker_pid_file="$run_dir/thinkers/$name.pid"
+        if [[ -f "$thinker_pid_file" ]]; then
+            local tpid
+            tpid=$(cat "$thinker_pid_file" 2>/dev/null) || true
+            if [[ -n "$tpid" ]] && kill -0 "$tpid" 2>/dev/null; then
+                status="running (PID $tpid)"
+            fi
+        fi
+
+        # Read subscription types
+        local types="all"
+        if [[ -f "$thinker_dir/subscriptions.jsonl" ]]; then
+            types=$(head -1 "$thinker_dir/subscriptions.jsonl" | jq -r '(.types // ["all"]) | join(", ")' 2>/dev/null) || types="all"
+        fi
+
+        # Log size
+        local log_info=""
+        local log_file="$run_dir/logs/$name.log"
+        if [[ -f "$log_file" ]]; then
+            local log_lines
+            log_lines=$(wc -l < "$log_file" 2>/dev/null | tr -d ' ') || log_lines=0
+            log_info=" (${log_lines} log lines)"
+        fi
+
+        # Pending re-trigger queue (count per step type)
+        local pending_info=""
+        local _pf _pbase _ptype
+        for _pf in "$run_dir/pending/$name".*; do
+            [[ -f "$_pf" ]] || continue
+            _pbase=$(basename "$_pf")
+            _ptype="${_pbase#*.}"
+            pending_info="${pending_info}${pending_info:+ }${_ptype%%.*}"
+        done
+        if [[ -n "$pending_info" ]]; then
+            pending_info=$(printf '%s\n' $pending_info | sort | uniq -c \
+                | awk '{printf "%s%s x%d", (NR>1?", ":""), $2, $1}')
+            pending_info=" (pending: ${pending_info})"
+        fi
+
+        printf '  %-30s %s  [%s]%s%s\n' "$name" "$status" "$types" "$log_info" "$pending_info"
+    done < <(_list_thinker_dirs)
+}
+
+cmd_list() {
+    _require_env
+
+    local thinker_dir
+    while IFS= read -r thinker_dir; do
+        [[ -z "$thinker_dir" ]] && continue
+        local name
+        name=$(basename "$thinker_dir")
+
+        # Read subscription info
+        local types="all"
+        local trigger_self="false"
+        if [[ -f "$thinker_dir/subscriptions.jsonl" ]]; then
+            types=$(head -1 "$thinker_dir/subscriptions.jsonl" | jq -r '(.types // ["all"]) | join(", ")' 2>/dev/null) || types="all"
+            trigger_self=$(head -1 "$thinker_dir/subscriptions.jsonl" | jq -r '.trigger_self // false' 2>/dev/null) || trigger_self="false"
+        fi
+
+        # Check for optional files
+        local extras=""
+        [[ -f "$thinker_dir/prompt.md" ]] && extras="${extras} prompt.md"
+        [[ -x "$thinker_dir/start" ]] && extras="${extras} start"
+        [[ -x "$thinker_dir/stop" ]] && extras="${extras} stop"
+
+        printf '%-30s types=[%s]' "$name" "$types"
+        [[ "$trigger_self" == "true" ]] && printf '  trigger_self=true'
+        [[ -n "$extras" ]] && printf '  files:%s' "$extras"
+        printf '\n'
+    done < <(_list_thinker_dirs)
+}
+
+cmd_new() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && die "Usage: thinkers new <name>"
+
+    _require_env
+
+    # Validate name
+    if [[ ! "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+        die "Invalid thinker name: '$name' (use lowercase alphanumeric + hyphens)"
+    fi
+
+    local thinker_dir="$THINKERS_DIR/$name"
+    [[ -d "$thinker_dir" ]] && die "Thinker '$name' already exists at $thinker_dir"
+
+    mkdir -p "$thinker_dir"
+
+    # Create step script
+    cat > "$thinker_dir/step" <<STEP
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ${name}/step — Custom thinker
+# Receives step JSON on stdin. Identity env vars are set.
+
+THINKER_NAME="$name"
+SCRIPT_DIR="\$(cd "\$(dirname "\$(realpath "\$0")")" && pwd)"
+
+# shellcheck disable=SC1091
+source "\$SCRIPT_DIR/../_lib/common.sh"
+
+_require_env
+
+THINK_MODEL="\${THINK_MODEL:-\${SHELLM_MODEL:-claude-opus-4-7}}"
+
+# Read the triggering step from stdin
+step_json=\$(cat)
+
+# TODO: Implement your thinker logic here
+# Example: load prompt, get context, call shellm
+#
+# prompt_file="\$SCRIPT_DIR/prompt.md"
+# goals=\$(get_goals "\$MEM_DIR")
+# tp_prompt=\$(load_prompt "\$prompt_file" "\$IDENTITY_NAME" "\$goals")
+# ...
+
+printf '[%s] step received (type=%s)\n' "\$THINKER_NAME" \\
+    "\$(printf '%s' "\$step_json" | jq -r '.type // "unknown"' 2>/dev/null)" >&2
+STEP
+    chmod +x "$thinker_dir/step"
+
+    # Create subscriptions
+    cat > "$thinker_dir/subscriptions.jsonl" <<'SUBS'
+{"types":["thought","action","observation","merge"]}
+SUBS
+
+    # Create prompt template
+    cat > "$thinker_dir/prompt.md" <<PROMPT
+You are the "$name" process for {{identity_name}}. Your job is to [describe what this thinker does].
+
+## Triage
+
+First, check recent thoughts:
+\`\`\`bash
+traj tail -n 10
+\`\`\`
+
+If there is nothing for you to do, output an empty FINAL and stop.
+
+## If you should run
+
+[Describe what the thinker does when it should run]
+
+Write a tp-thought:
+\`\`\`bash
+printf '{"type":"tp-thought","content":%s,"source":"$name"}' \\
+  "\$(printf '%s' "Your thought here" | jq -Rsa .)" \\
+  | traj append
+\`\`\`
+
+Your FINAL output should summarize what you did, or empty if you triaged out.
+PROMPT
+
+    printf 'Created thinker: %s\n' "$name" >&2
+    printf 'Directory: %s\n' "$thinker_dir" >&2
+    printf 'Files:\n' >&2
+    printf '  step                  (executable — implement your logic)\n' >&2
+    printf '  subscriptions.jsonl   (edit to change which step types trigger this thinker)\n' >&2
+    printf '  prompt.md             (prompt template — edit for your use case)\n' >&2
+}
+
+# ---------------------------------------------------------------------------
+# run — manually trigger a thinker's step script
+# ---------------------------------------------------------------------------
+
+cmd_step() {
+    _require_env
+
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "run requires <thinker-name>"
+
+    local thinker_dir="$THINKERS_DIR/$name"
+    [[ -d "$thinker_dir" ]] || die "Thinker not found: $name"
+    [[ -x "$thinker_dir/step" ]] || die "No executable step script in $thinker_dir"
+
+    local run_dir="$IDENTITY_DIR/run"
+    mkdir -p "$run_dir/logs"
+    local log_file="$run_dir/logs/$name.log"
+
+    # Build a synthetic trigger step
+    local trigger_json
+    trigger_json=$(jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%S%z)" \
+        '{type:"manual-trigger", source:"thinkers-cli", ts:$ts}')
+
+    printf 'Running %s/step ...\n' "$name" >&2
+    printf '%s' "$trigger_json" | "$thinker_dir/step" 2>&1 | tee -a "$log_file"
+}
+
+# ---------------------------------------------------------------------------
+# watch — stream new steps from the root trajectory
+# ---------------------------------------------------------------------------
+
+cmd_watch() {
+    _require_env
+
+    local n=0
+    [[ -n "${1:-}" ]] && n="$1"
+
+    trap 'exit 0' INT TERM
+    traj tail -f -n "$n" --raw 2>/dev/null \
+    | while IFS= read -r line; do
+        local step_type source content
+        step_type=$(printf '%s' "$line" | jq -r '.type // empty' 2>/dev/null)
+        source=$(printf '%s' "$line" | jq -r '.source // empty' 2>/dev/null)
+        content=$(printf '%s' "$line" | jq -r '.content // empty' 2>/dev/null)
+        [[ -z "$step_type" ]] && continue
+
+        local label="$step_type"
+        [[ -n "$source" ]] && label="$step_type ($source)"
+
+        printf '[%s] %s\n' "$label" "$content"
+    done
+}
+
+cmd_logs() {
+    _require_env
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "logs requires <thinker-name>"
+
+    local log_file="$IDENTITY_DIR/run/logs/$name.log"
+    [[ -f "$log_file" ]] || die "No log file for thinker: $name (has it been started?)"
+
+    # Follow mode with -f flag
+    if [[ "${2:-}" == "-f" ]]; then
+        tail -f "$log_file"
+    else
+        cat "$log_file"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+cmd_repl() {
+    # Prefer the renamed TUI binary; fall back to a pre-rename build.
+    if command -v headlong-tui >/dev/null 2>&1; then
+        exec headlong-tui thinkers "$@"
+    fi
+    exec shellm-tui thinkers "$@"
+}
+
+usage() {
+    cat <<'EOF'
+thinkers — Modular reactive thought process manager
+
+Usage:
+  thinkers start [--no-self-trigger] [name ...]
+                               Start all thinkers (or specific ones by name)
+  thinkers stop [name ...] [--force] [--self] [--drain-timeout N]
+                               Stop all thinkers (or specific ones by name).
+                               Refuses to run from inside the identity's own
+                               dispatcher tree or systemd cgroup unless --self
+                               is given (a stop from there kills the caller
+                               too; use `sudo headlong-thinkersctl restart` to
+                               restart your own mind).
+                               Default is a drain stop: no new triggers, but
+                               in-flight steps finish (killed only after
+                               --drain-timeout, default 180s / $THINKERS_DRAIN_TIMEOUT).
+                               --force kills in-flight steps immediately.
+  thinkers status              Show dispatcher and per-thinker status
+  thinkers list                List installed thinkers with subscriptions
+  thinkers step <name>          Manually trigger a thinker's step
+  thinkers watch [N]           Stream new steps (show last N first, default 0)
+  thinkers new <name>          Scaffold a new thinker
+  thinkers logs <name> [-f]   Show logs for a thinker (-f to follow)
+  thinkers repl                Interactive thinkers TUI
+
+Options:
+  --no-self-trigger   Disable self-triggering for all started thinkers
+  -v, --verbose       Verbose/debug mode
+  -h, --help          Show this help
+
+Environment (set by `identity shell`):
+  IDENTITY_DIR, IDENTITY_NAME, MEM_DIR, SKILLS_DIR,
+  SKILLS_KERNEL_DIR, TRAJ_DIR, TRAJ_ID, THINKERS_DIR,
+  SHELLM_HOME, THINK_MODEL, THINK_CONTEXT_TAIL,
+  THINKERS_MAX_CONCURRENT (default: 4)
+EOF
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing & dispatch
+# ---------------------------------------------------------------------------
+
+# Parse global flags
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage ;;
+        -v|--verbose) VERBOSE=1; shift ;;
+        -*) break ;;
+        *) break ;;
+    esac
+done
+
+cmd="${1:-}"
+[[ -n "$cmd" ]] && shift
+
+case "$cmd" in
+    start)    cmd_start "$@" ;;
+    stop)     cmd_stop "$@" ;;
+    status)   cmd_status ;;
+    list)     cmd_list ;;
+    step)     cmd_step "$@" ;;
+    watch)    cmd_watch "$@" ;;
+    new)      cmd_new "$@" ;;
+    logs)     cmd_logs "$@" ;;
+    repl)     cmd_repl "$@" ;;
+    help)     usage ;;
+    "")       usage ;;
+    *)        die "Unknown command: $cmd (try thinkers --help)" ;;
+esac

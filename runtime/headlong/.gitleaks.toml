@@ -1,0 +1,37 @@
+# gitleaks config — CI scans the FULL git history on every push to main and
+# every PR (see .github/workflows/ci.yml, job "gitleaks"). Run the same scan
+# locally with:  gitleaks git . -c .gitleaks.toml
+#
+# Every entry below is a triaged, known finding. Add to this file only after
+# deciding the secret is fake or already revoked; a rotated key is still a
+# leak in history, so rotate first, then allowlist.
+
+title = "headlong"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Root commit carried a developer .env (2026-04-07). Triaged 2026-08-21: keys rotated/revoked."
+commits = ["531a18fc3516808475e84075051fc9cdd6db44c7"]
+
+[[allowlists]]
+description = "Fake OpenAI key used as a test fixture in web/tests"
+regexes = ['''sk-oai-9876543210abcdef''']
+
+[[allowlists]]
+description = "Fake OpenRouter keys used as test fixtures (tests/test_persona_bugreport.sh, tests/test_status.sh) and the 2026-08-22 CI alert probe. Convention: build fake sk-or-v1- keys from repeats of 0123456789abcdef (or its reverse) and no new entry is needed."
+regexes = ['''sk-or-v1-(0123456789abcdef|fedcba9876543210){2,4}''']
+
+# A bot token inside a Bot API URL. The default telegram rule only matches
+# `telegram... = <token>` assignments, so `api.telegram.org/bot<token>/...`
+# in a test fixture went through CI green (44fe2f4, 2026-09-03).
+[[rules]]
+id = "telegram-bot-token-in-url"
+description = "Telegram bot token embedded in an api.telegram.org URL"
+regex = '''api\.telegram\.org/bot([0-9]{5,16}:A[A-Za-z0-9_\-]{34})'''
+keywords = ["api.telegram.org"]
+
+[[allowlists]]
+description = "Real Telegram bot token in telegram/tests/test_logging.py (2026-09-03). Rotated 2026-09-04 (old token returns 401); fixture replaced with a fake."
+commits = ["44fe2f48491f66d59f8a7aa7b265cccded3df995"]

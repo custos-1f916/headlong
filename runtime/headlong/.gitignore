@@ -1,0 +1,35 @@
+*.swp
+.DS_Store
+.env
+__pycache__/
+.chatrc
+.harbor-jobs/
+.headlong/
+.memories/
+.skills/
+.skillsrc
+
+# Identity instances are runtime data (logs, trajectories, memories, etc.)
+.identities/
+web/src/headlong_web/static/
+web/viewer/build/
+web/viewer/node_modules/
+web/.venv/
+web/viewer/.react-router/
+.web-push/
+
+# Pulled usage data + rendered reports (deploy/scripts/audel-usage)
+.usage/
+
+# Pulled metrics data + snapshots (deploy/scripts/audel-metrics)
+.metrics/
+
+# Box-commit review log (deploy/scripts/audel-commits)
+.audel-pulled
+
+# Claude Code session handoff docs (local working notes)
+handoff/
+
+# stray backup files
+*.bak
+*.bak.*

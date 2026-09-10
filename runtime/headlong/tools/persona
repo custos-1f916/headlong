@@ -1,0 +1,745 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# persona — talk to and manage a Headlong identity by name, from anywhere.
+# No cd, no `identity shell` needed.
+#
+# headlong-init links each identity's name to this tool (e.g. `ada`), so the
+# name IS the command:
+#
+#   ada                    chat with them (TUI if built, simple loop otherwise)
+#   ada say <message>      send one message and wait briefly for the reply
+#   ada start / stop       resume / pause their mind (the thinkers) and the dash
+#   ada status             mind + dash status
+#   ada dash               start the dashboard if needed and open it
+#   ada shell              subshell with their environment (advanced)
+#   ada bugreport          bundle logs + trajectory (secrets scrubbed) to share
+#
+#   persona <name> ...     the same, for any identity, without the name link
+#   persona ...            ...or the default identity
+
+die() { printf 'persona: error: %s\n' "$*" >&2; exit 1; }
+
+# HEADLONG_* env names win; the SHELLM_* internal names stay because the
+# tools underneath (thinkers, llm, shellm) still read them.
+# State home: HEADLONG_HOME/SHELLM_HOME if set; else ~/.headlong.
+SHELLM_HOME="${HEADLONG_HOME:-${SHELLM_HOME:-$HOME/.headlong}}"
+SHELLM_APP_DIR="${HEADLONG_APP_DIR:-${SHELLM_APP_DIR:-}}"
+SHELLM_WEB_ARGS="${HEADLONG_WEB_ARGS:-${SHELLM_WEB_ARGS:-}}"
+
+# ---------------------------------------------------------------------------
+# Locate the checkout and the identity
+# ---------------------------------------------------------------------------
+
+_resolve_app_dir() {
+    if [[ -n "${SHELLM_APP_DIR:-}" ]]; then
+        printf '%s' "$SHELLM_APP_DIR"
+        return 0
+    fi
+    local script_dir
+    script_dir="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
+    if [[ -f "$script_dir/../bin/shellm" ]]; then
+        (cd "$script_dir/.." && pwd)
+        return 0
+    fi
+    local recorded
+    recorded=$(cat "$SHELLM_HOME/app_dir" 2>/dev/null || true)
+    if [[ -n "$recorded" && -f "$recorded/bin/shellm" ]]; then
+        printf '%s' "$recorded"
+        return 0
+    fi
+    if [[ -f "$SHELLM_HOME/app/bin/shellm" ]]; then
+        printf '%s' "$SHELLM_HOME/app"
+        return 0
+    fi
+    return 1
+}
+
+APP_DIR=$(_resolve_app_dir) || die "can't find the headlong checkout. Set HEADLONG_APP_DIR=/path/to/headlong"
+export PATH="$APP_DIR/bin:$APP_DIR/tools:$PATH"
+IDENTITY_ROOT="$APP_DIR/.identities"
+
+# Env files, real environment first (same layering as llm and headlong-init).
+# Without this, activate's THINK_MODEL fallback can't see SHELLM_MODEL and
+# the mind starts on the wrong model.
+_load_env() {
+    local envfile="$1"
+    [[ -f "$envfile" ]] || return 1
+    local key val
+    while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
+        [[ -n "${!key+x}" ]] && continue
+        # shellcheck disable=SC1090
+        val=$(set -a; . "$envfile" >/dev/null 2>&1; printf '%s' "${!key}") || { printf '%s: warning: could not read %s; ignoring it\n' "${0##*/}" "$envfile" >&2; return 0; }
+        export "$key=$val"
+    done < <(sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*=.*/\2/p' "$envfile")
+    return 0
+}
+_load_env "$APP_DIR/.env" || true
+_load_env "$SHELLM_HOME/.env" || true
+
+SELF=$(basename "$0")
+NAME=""
+if [[ "$SELF" == "persona" ]]; then
+    # First arg is the identity name if it matches one; otherwise fall through
+    # to the default identity and treat the arg as a subcommand.
+    if [[ -n "${1:-}" && -d "$IDENTITY_ROOT/${1:-}" ]]; then
+        NAME="$1"; shift
+    fi
+else
+    NAME="$SELF"
+fi
+if [[ -z "$NAME" && -L "$IDENTITY_ROOT/default" ]]; then
+    NAME=$(basename "$(readlink "$IDENTITY_ROOT/default")")
+fi
+[[ -n "$NAME" ]] || die "no identity given and no default set. Usage: persona <name> [command]"
+[[ -d "$IDENTITY_ROOT/$NAME" ]] || die "no identity named '$NAME' in $IDENTITY_ROOT"
+
+# The command name to show in messages (`ada stop` vs `persona ada stop`):
+# the bare name only if it actually resolves to a persona link — it may
+# instead be an unrelated command or a headlong tool (e.g. an identity named
+# "chat").
+CMD="persona $NAME"
+if [[ "$(readlink "$(command -v "$NAME" 2>/dev/null)" 2>/dev/null)" == *"/persona" ]]; then
+    CMD="$NAME"
+fi
+
+# ---------------------------------------------------------------------------
+# Identity environment (what `identity shell` would give you, in-process)
+# ---------------------------------------------------------------------------
+
+_activate() {
+    [[ -n "${IDENTITY_NAME:-}" ]] && return 0
+    # activate is written for interactive shells; its internal greps may
+    # legitimately fail, which would be fatal under set -e — relax around it.
+    set +eu
+    set +o pipefail
+    # shellcheck disable=SC1090,SC1091
+    source "$IDENTITY_ROOT/$NAME/activate" >/dev/null 2>&1
+    set -eu
+    set -o pipefail
+    [[ -n "${IDENTITY_NAME:-}" ]] || die "activate did not set IDENTITY_NAME"
+    # `chat send` needs a sender name in the identity's chatrc
+    if [[ -n "${CHATRC:-}" ]] && ! grep -q '^default_send_from=' "$CHATRC" 2>/dev/null; then
+        mkdir -p "$(dirname "$CHATRC")"
+        printf 'default_send_from=operator\n' >> "$CHATRC"
+    fi
+}
+
+# _llm_health_warn — if the last LLM call (any thinker, any tool) failed,
+# say so, loudly, with what to do. Reads the marker bin/llm keeps at
+# $SHELLM_HOME/run/llm_health.json. Returns 0 if something was printed.
+_llm_health_warn() {
+    local f="$SHELLM_HOME/run/llm_health.json" ok kind code msg ts provider hint
+    [[ -f "$f" ]] || return 1
+    ok=$(jq -r '.ok' "$f" 2>/dev/null || echo true)
+    [[ "$ok" == "false" ]] || return 1
+    IFS=$'\t' read -r kind code msg ts provider < <(jq -r '[(.kind // "other"), (.http_code // "" | tostring), (.message // ""), (.ts // ""), (.provider // "")] | @tsv' "$f" 2>/dev/null)
+    case "$provider" in
+        openrouter) hint="https://openrouter.ai/settings/credits" ;;
+        anthropic)  hint="https://console.anthropic.com/settings/billing" ;;
+        openai)     hint="https://platform.openai.com/settings/organization/billing" ;;
+        gemini)     hint="https://aistudio.google.com/ (quota / billing)" ;;
+        *)          hint="your provider's billing page" ;;
+    esac
+    echo
+    case "$kind" in
+        credit)
+            echo "!! LLM: OUT OF CREDIT — the API key has no money left (${provider:-provider}${code:+, HTTP $code}, last tried $ts)."
+            echo "   $NAME's mind keeps trying but every thought fails until the key has credit."
+            echo "   Top up at $hint (or put a new key in $SHELLM_HOME/.env), then: $CMD start"
+            ;;
+        auth)
+            echo "!! LLM: KEY REJECTED — the API key is invalid or revoked (${provider:-provider}${code:+, HTTP $code}, last tried $ts)."
+            echo "   Put a working key in $SHELLM_HOME/.env, then: $CMD start"
+            ;;
+        rate)
+            echo "!! LLM: RATE LIMITED by ${provider:-the provider}${code:+ (HTTP $code)}, last tried $ts. Usually clears on its own."
+            ;;
+        *)
+            echo "!! LLM: the last call failed (${provider:-provider}${code:+, HTTP $code}, last tried $ts)."
+            ;;
+    esac
+    [[ -n "$msg" ]] && echo "   provider said: ${msg:0:200}"
+    echo
+    return 0
+}
+
+_dispatcher_pid() {
+    local pid
+    pid=$(cat "$IDENTITY_ROOT/$NAME/run/dispatcher.pid" 2>/dev/null || true)
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && printf '%s' "$pid" && return 0
+    return 1
+}
+
+# Messages in the root trajectory, one JSON object per line
+_messages() {
+    _activate
+    traj cat "${ROOT_TRAJ_ID:-$TRAJ_ID}" --filter type=message --raw 2>/dev/null \
+        | jq -c '.' 2>/dev/null || true
+}
+
+_incoming() {  # stdin: message JSON lines; passes through the identity's own
+    jq -c --arg me "$NAME" 'select(.from == $me)' 2>/dev/null || true
+}
+
+# _print_incoming — stdin: the identity's message JSON lines; one reply per
+# block: blank line, "name> first line", continuation lines indented to the
+# same column, blank line. Multi-paragraph replies stay readable.
+_print_incoming() {
+    local pad; pad=$(printf '%*s' $(( ${#NAME} + 2 )) '')
+    jq -r --arg me "$NAME" --arg pad "$pad" \
+        '"\n" + $me + "> " + (.content | rtrimstr("\n") | gsub("\n(?=[^\n])"; "\n" + $pad))' 2>/dev/null || true
+    echo
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_start() {
+    _activate
+    _llm_health_warn || true
+    if _dispatcher_pid >/dev/null; then
+        echo "$NAME's mind is already running."
+    else
+        # Keep this set in step with headlong-init: the responder is what
+        # answers the human. Starting only the monolith leaves every message
+        # waiting on its long reasoning loop, so a stop/start cycle silently
+        # destroys interactive latency until the next headlong-init.
+        thinkers start monolith responder
+        echo "$NAME is thinking again."
+    fi
+    local url
+    if url=$(_dash_start); then
+        echo "dash: $url"
+    fi
+}
+
+cmd_stop() {
+    _activate
+    if ! _dispatcher_pid >/dev/null; then
+        echo "$NAME's mind is already stopped."
+    else
+        thinkers stop
+    fi
+    _dash_stop
+    echo "$NAME is paused. Resume with: $CMD start"
+}
+
+cmd_status() {
+    _activate
+    local pid
+    if pid=$(_dispatcher_pid); then
+        echo "mind: running (dispatcher pid $pid)"
+    else
+        echo "mind: stopped   (resume with: $CMD start)"
+    fi
+    local wpid
+    wpid=$(cat "$SHELLM_HOME/run/web.pid" 2>/dev/null || true)
+    if [[ -n "$wpid" ]] && kill -0 "$wpid" 2>/dev/null; then
+        echo "dash: $(grep -o 'http://[^ ]*' "$SHELLM_HOME/logs/web.log" 2>/dev/null | tail -1)"
+    else
+        echo "dash: stopped   (open with: $CMD dash)"
+    fi
+    _llm_health_warn || true
+    echo
+    thinkers status 2>/dev/null || true
+}
+
+cmd_shell() {
+    exec env IDENTITY_DIR="$IDENTITY_ROOT" identity shell "$NAME"
+}
+
+# _dash_start — start the dash if it isn't running; print its URL on stdout.
+# Progress goes to stderr. Returns non-zero (with a reason on stderr) if it
+# can't be started, so callers decide whether that's fatal.
+_dash_start() {
+    local log="$SHELLM_HOME/logs/web.log" pidfile="$SHELLM_HOME/run/web.pid" pid url
+    mkdir -p "$SHELLM_HOME/logs" "$SHELLM_HOME/run"
+    pid=$(cat "$pidfile" 2>/dev/null || true)
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+        command -v uv >/dev/null 2>&1 || { echo "the dash needs uv — run headlong-init to set it up" >&2; return 1; }
+        # In a container, bind on all interfaces so a published port works
+        if [[ -z "${SHELLM_WEB_ARGS:-}" && ( -f /.dockerenv || -f /run/.containerenv ) ]]; then
+            SHELLM_WEB_ARGS="--host 0.0.0.0"
+        fi
+        echo "Starting the dash..." >&2
+        : > "$log"
+        # shellcheck disable=SC2086
+        nohup headlong-web "$APP_DIR" ${SHELLM_WEB_ARGS:-} >>"$log" 2>&1 &
+        printf '%s\n' "$!" > "$pidfile"
+        local _
+        for _ in $(seq 1 300); do
+            grep -qE '(shellm|shelly|headlong)-web serving' "$log" 2>/dev/null && break
+            kill -0 "$(cat "$pidfile")" 2>/dev/null || { tail -20 "$log" >&2; echo "the dash failed to start (log: $log)" >&2; return 1; }
+            sleep 1
+        done
+    fi
+    url=$(grep -o 'http://[^ ]*' "$log" 2>/dev/null | tail -1)
+    [[ -n "$url" ]] || { echo "dash is running but no URL found in $log" >&2; return 1; }
+    printf '%s\n' "$url"
+}
+
+# _dash_wait_ready URL — the "serving" log line is printed just before the
+# server binds, so a browser opened on it can land on a connection error or a
+# stale service-worker page. Poll until the URL answers (30s cap); never fails.
+_dash_wait_ready() {
+    local url="$1" _
+    command -v curl >/dev/null 2>&1 || { sleep 2; return 0; }
+    for _ in $(seq 1 60); do
+        curl -fsS -o /dev/null --max-time 2 "$url" 2>/dev/null && return 0
+        sleep 0.5
+    done
+    return 0
+}
+
+# _dash_stop — stop the dash started by _dash_start (or headlong-init). The
+# pid file holds the `headlong-web` wrapper; take its whole process tree so
+# the uv/python server underneath goes too.
+_dash_stop() {
+    local pidfile="$SHELLM_HOME/run/web.pid" pid
+    pid=$(cat "$pidfile" 2>/dev/null || true)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        echo "Stopping the dash (PID $pid)..."
+        _kill_tree "$pid" TERM
+        local _
+        for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
+        kill -0 "$pid" 2>/dev/null && _kill_tree "$pid" KILL
+    fi
+    rm -f "$pidfile"
+    return 0
+}
+
+_kill_tree() {  # _kill_tree PID SIGNAL — signal PID and all its descendants
+    local c
+    for c in $(pgrep -P "$1" 2>/dev/null); do _kill_tree "$c" "$2"; done
+    kill -s "$2" "$1" 2>/dev/null || true
+}
+
+cmd_dash() {
+    local url
+    url=$(_dash_start) || die "couldn't start the dash"
+    echo "$url"
+    _dash_wait_ready "$url"
+    case "$(uname -s)" in
+        Darwin) open "$url" 2>/dev/null || true ;;
+        Linux)
+            if command -v xdg-open >/dev/null 2>&1 && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+                xdg-open "$url" 2>/dev/null || true
+            fi
+            ;;
+    esac
+}
+
+cmd_say() {
+    [[ $# -gt 0 ]] || die "usage: $CMD say <message>"
+    _activate
+    _dispatcher_pid >/dev/null || echo "(note: $NAME's mind is stopped — they won't answer until you run: $CMD start)"
+    _llm_health_warn || true
+    local before
+    before=$(_messages | _incoming | wc -l | tr -d ' ')
+    chat send "$*" >/dev/null 2>&1
+    printf 'sent — waiting for %s (Ctrl-C to stop waiting; replies also show in the dash)\n' "$NAME"
+    local _
+    for _ in $(seq 1 60); do
+        sleep 2
+        local now
+        now=$(_messages | _incoming | wc -l | tr -d ' ')
+        if [[ "$now" -gt "$before" ]]; then
+            _messages | _incoming | tail -n "$((now - before))" | _print_incoming
+            return 0
+        fi
+    done
+    echo
+    echo "no reply yet — it will show up in '$CMD' (chat) or the dash."
+    _llm_health_warn || true
+}
+
+cmd_chat() {
+    _activate
+    if command -v headlong-tui >/dev/null 2>&1 || command -v shellm-tui >/dev/null 2>&1; then
+        exec chat repl
+    fi
+    # Simple fallback loop when the Rust TUI isn't built
+    _dispatcher_pid >/dev/null || echo "(note: $NAME's mind is stopped — they won't answer until you run: $CMD start)"
+    echo "(simple chat — Ctrl-C or Ctrl-D to leave; build the TUI with cargo + install.sh for the full experience)"
+    chat history 10 2>/dev/null || true
+    local seen watcher
+    seen=$(_messages | wc -l | tr -d ' ')
+    (
+        # Watch for new messages from the identity and print them as they land
+        local_seen=$seen
+        while :; do
+            sleep 2
+            total=$(_messages | wc -l | tr -d ' ')
+            if [[ "$total" -gt "$local_seen" ]]; then
+                # New rows include our own sends; only redraw for real replies
+                # (otherwise every message we type costs a stray blank "you> ").
+                fresh=$(_messages | tail -n "$((total - local_seen))" | _incoming)
+                if [[ -n "$fresh" ]]; then
+                    printf '%s\n' "$fresh" | _print_incoming
+                    printf 'you> '
+                fi
+                local_seen=$total
+            fi
+        done
+    ) &
+    watcher=$!
+    # Expand the function-local PID while it is still in scope.
+    # shellcheck disable=SC2064
+    trap "kill $watcher 2>/dev/null || true" EXIT
+    local line
+    while IFS= read -r -p "you> " line; do
+        [[ -z "$line" ]] && continue
+        chat send "$line" >/dev/null 2>&1
+    done
+    echo
+}
+
+# ---------------------------------------------------------------------------
+# bugreport — one file to attach to a bug report
+# ---------------------------------------------------------------------------
+
+# Collects the identity dir (trajectory, rollups, memories, thinker logs,
+# persona files), the state-home logs and a report.txt with versions and
+# status, into ~/headlong-bugreport-<name>-<stamp>.tgz. The agent's workdir
+# is left out (arbitrary user files, can be large). Every text file in the
+# bundle goes through _redact_tree first: the literal values of every
+# credential-looking variable from the env files and the live environment,
+# `--var NAME=VALUE` for credential-looking names (older shellm-run rows still
+# carry those), and anything shaped like an sk-... API key.
+cmd_bugreport() {
+    local out=""
+    BUGREPORT_INCLUDE_WORKDIR=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --out)             out="${2:?--out requires a path}"; shift 2 ;;
+            --include-workdir) BUGREPORT_INCLUDE_WORKDIR=1; shift ;;
+            -h|--help)
+                cat <<EOF
+Usage: $CMD bugreport [--out FILE] [--include-workdir]
+
+Bundle what a developer needs to debug $NAME into one .tgz you can attach to
+a bug report: the identity (trajectory, rollups, memories, thinker logs),
+the Headlong logs, and a report.txt with versions, status and the layout.
+API keys and other credential-looking values are scrubbed; your .env is not
+included. Look inside before sending if you are unsure:
+    tar tzf FILE            # list
+    tar xzf FILE            # unpack; then read headlong-bugreport-*/report.txt
+EOF
+                return 0 ;;
+            *) die "bugreport: unknown option: $1" ;;
+        esac
+    done
+    command -v python3 >/dev/null 2>&1 || die "bugreport requires python3 for secret scrubbing"
+    local stamp; stamp=$(date +%Y%m%d-%H%M%S)
+    [[ -n "$out" ]] || out="$HOME/headlong-bugreport-$NAME-$stamp.tgz"
+    local iddir="$IDENTITY_ROOT/$NAME"
+    local stage; stage=$(mktemp -d "${TMPDIR:-/tmp}/headlong-bugreport.XXXXXX")
+    # shellcheck disable=SC2064
+    trap "rm -rf '$stage'" EXIT RETURN
+    local top="$stage/headlong-bugreport-$NAME-$stamp"
+    mkdir -p "$top/identity" "$top/home"
+
+    echo "Collecting $NAME's identity..." >&2
+    # macOS bsdtar warns "Could not pack extended attributes" on files that
+    # carry com.apple.provenance; we don't want xattrs in the bundle anyway.
+    local -a tarq=()
+    case "$(tar --version 2>/dev/null)" in *bsdtar*) tarq=(--no-xattrs --no-mac-metadata) ;; esac
+    local excl=(--exclude='./.env')
+    [[ "$BUGREPORT_INCLUDE_WORKDIR" -eq 1 ]] || excl+=(--exclude='./workdir')
+    # Follow the default -> name symlink; copy files, not the symlink itself.
+    # Skip single files over 50MB (noted in report.txt) so a runaway blob
+    # doesn't turn the bundle into a gigabyte.
+    local -a big=()
+    while IFS= read -r -d '' f; do big+=("${f#./}"); done \
+        < <(cd "$iddir" && find . -type f -size +50M -print0 2>/dev/null)
+    local f; for f in "${big[@]+"${big[@]}"}"; do excl+=(--exclude="./$f"); done
+    (cd "$iddir" && tar "${tarq[@]+"${tarq[@]}"}" -cf - "${excl[@]+"${excl[@]}"}" .) | tar -xf - -C "$top/identity"
+
+    # State-home bits: logs, status, app_dir pointer. Never .env.
+    local h; for h in logs status.json app_dir; do
+        if [[ -e "$SHELLM_HOME/$h" ]]; then cp -R "$SHELLM_HOME/$h" "$top/home/" 2>/dev/null || true; fi
+    done
+
+    # report.txt — what a developer asks for in the first reply, all at once.
+    # Best effort: nothing in it may abort the bundle (no git, no df, ...).
+    ( set +e; set +o pipefail; _bugreport_text "$iddir" "${big[@]+"${big[@]}"}" ) > "$top/report.txt" 2>&1 || true
+
+    echo "Scrubbing secrets..." >&2
+    _redact_tree "$top" || die "bugreport: secret scrubbing failed; no archive was written"
+
+    tar "${tarq[@]+"${tarq[@]}"}" -czf "$out" -C "$stage" "$(basename "$top")"
+    cat >&2 <<EOF
+
+Wrote $(du -h "$out" | cut -f1 | tr -d ' ') to
+
+  $out
+
+Attach that file to your bug report.
+
+  * It has no API keys: your .env is left out, and credential-looking
+    values are replaced with <redacted ...>.
+  * To see what is inside:  tar tzf "$out"
+
+EOF
+    # The bare path on stdout is for scripts (`open "$(ada bugreport)"`); at a
+    # terminal it would just repeat the line above.
+    [[ -t 1 ]] || printf '%s\n' "$out"
+}
+
+# _bugreport_text IDDIR [BIGFILE...] — the body of report.txt on stdout.
+# Runs with set -e / pipefail off (see the caller).
+_bugreport_text() {
+    local iddir="$1"; shift
+    local -a big=("$@")
+    echo "headlong bug report bundle"
+    echo "generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "identity: $NAME"
+    echo "identity dir: $iddir"
+    echo "state home: $SHELLM_HOME"
+    echo "app dir: $APP_DIR"
+    echo
+    echo "== versions"
+    echo "headlong commit: $(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null || echo '(not a git checkout)')"
+    echo "headlong branch: $(git -C "$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+    local dirty; dirty=$(git -C "$APP_DIR" status --short 2>/dev/null | wc -l | tr -d ' ')
+    echo "local edits in checkout: ${dirty:-?} file(s)"
+    echo "os: $(uname -srm 2>/dev/null)"
+    echo "bash: $BASH_VERSION   shell: ${SHELL:-?}"
+    echo "install prefix on PATH: $(command -v persona 2>/dev/null || echo '(persona not on PATH)')"
+    local t; for t in jq curl uv docker cargo python3 git; do
+        if command -v "$t" >/dev/null 2>&1; then
+            printf '%s: %s\n' "$t" "$("$t" --version 2>&1 | head -1)"
+        else
+            printf '%s: missing\n' "$t"
+        fi
+    done
+    echo
+    echo "== model / env (values hidden)"
+    echo "SHELLM_MODEL=${SHELLM_MODEL:-(unset)}"
+    echo "SHELLM_ENV=${SHELLM_ENV:-(unset)}"
+    local e; for e in "$SHELLM_HOME/.env" "$APP_DIR/.env"; do
+        [[ -f "$e" ]] || continue
+        echo "-- $e"
+        sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*=.*/\2=<hidden>/p' "$e"
+    done
+    echo
+    echo "== status"
+    ( cmd_status ) 2>&1 || true
+    echo
+    echo "== identity files"
+    cat "$iddir/info.txt" 2>/dev/null || true
+    echo
+    (cd "$iddir" && du -sh -- * 2>/dev/null) || true
+    echo
+    echo "== trajectories"
+    local tj; for tj in "$iddir"/trajectories/*/trajectory.jsonl; do
+        [[ -f "$tj" ]] || continue
+        printf '%s: %s rows, %s\n' "${tj#"$iddir"/}" "$(wc -l <"$tj" | tr -d ' ')" "$(du -h "$tj" | cut -f1)"
+    done
+    if [[ "${#big[@]}" -gt 0 ]]; then
+        echo
+        echo "== left out (over 50MB)"
+        printf '%s\n' "${big[@]}"
+    fi
+    [[ "${BUGREPORT_INCLUDE_WORKDIR:-0}" -eq 1 ]] || { echo; echo "== left out: workdir/ (pass --include-workdir to add it)"; }
+    echo
+    echo "== disk"
+    df -h "$SHELLM_HOME" 2>/dev/null | tail -1 || true
+    echo
+    echo "== recent thinker log tails"
+    local lg; for lg in "$iddir"/run/logs/*.log; do
+        [[ -f "$lg" ]] || continue
+        echo "-- ${lg#"$iddir"/} (last 30 lines)"
+        tail -30 "$lg" 2>/dev/null
+    done
+}
+
+# _redact_tree DIR — in-place scrub of every text file under DIR. Three
+# passes, in order: literal credential values, `--var NAME=VALUE`, sk- keys.
+# API keys and tokens keep their first and last 4 characters
+# (`<redacted sk-o...cdef>`) so two keys can be told apart; passwords and
+# anything under 20 characters are masked whole.
+_redact_tree() (
+    local root="$1"
+    local -a values=() replacements=() files=()
+    local tmp=""
+    trap '[[ -z "$tmp" ]] || rm -f "$tmp"' EXIT
+    trap 'exit 1' HUP INT TERM
+    # Literal values: private-looking names from the env files and the
+    # current environment (the env files were loaded into it at startup).
+    local n v e
+    for e in "$SHELLM_HOME/.env" "$APP_DIR/.env"; do
+        [[ -f "$e" ]] || continue
+        while IFS= read -r n; do
+            [[ -n "$n" ]] || continue
+            _is_secret_name "$n" || continue
+            # shellcheck disable=SC1090
+            v=$(set -a; . "$e" 2>/dev/null; printf '%s' "${!n}") || continue
+            if [[ "${#v}" -ge 8 ]]; then
+                values+=("$v")
+                replacements+=("$(_redact_hint "$n" "$v")")
+            fi
+        done < <(sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*=.*/\2/p' "$e")
+    done
+    while IFS= read -r n; do
+        _is_secret_name "$n" || continue
+        v="${!n:-}"
+        if [[ "${#v}" -ge 8 ]]; then
+            values+=("$v")
+            replacements+=("$(_redact_hint "$n" "$v")")
+        fi
+    done < <(compgen -e)
+    # Text files only (tar'd dirs can carry binaries in blobs/).
+    while IFS= read -r -d '' f; do files+=("$f"); done \
+        < <(find "$root" -type f \( -name '*.jsonl' -o -name '*.json' -o -name '*.log' \
+                -o -name '*.txt' -o -name '*.md' -o -name '*.sh' -o -name '*.yaml' -o -name '*.yml' \
+                -o -name '*.toml' -o -name '*.env' -o -name '*.cfg' -o -name '*.ini' \) -print0 2>/dev/null)
+    [[ "${#files[@]}" -gt 0 ]] || return 0
+    # A length-framed stdin stream keeps literals out of argv and the
+    # filesystem. Python's byte replacement handles embedded newlines and
+    # regex metacharacters literally; any helper failure aborts the report.
+    # The --var pass masks through the next --var (or JSON quote/end of line),
+    # because old unquoted command records cannot distinguish a value with
+    # spaces from the command words after it. Hiding too much is safer than
+    # retaining a password suffix.
+    local f i
+    for f in "${files[@]}"; do
+        tmp=$(mktemp "$root/.redact-output.XXXXXX") || return 1
+        if {
+            printf '%s\n' "${#values[@]}"
+            for ((i=0; i<${#values[@]}; i++)); do
+                LC_ALL=C
+                printf '%s\n' "${#values[$i]}"
+                printf '%s\n' "${values[$i]}"
+                printf '%s\n' "${#replacements[$i]}"
+                printf '%s\n' "${replacements[$i]}"
+            done
+            cat "$f"
+        } | python3 -c '
+import json, re, sys
+
+source = sys.stdin.buffer
+def framed():
+    size = int(source.readline())
+    value = source.read(size)
+    if source.read(1) != b"\n":
+        raise ValueError("invalid redaction input")
+    return value
+
+pairs = [(framed(), framed()) for _ in range(int(source.readline()))]
+expanded = []
+def json_inner(value):
+    try:
+        text = value.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return json.dumps(text, ensure_ascii=False)[1:-1].encode("utf-8")
+
+for needle, replacement in pairs:
+    if not needle:
+        continue
+    expanded.append((needle, replacement))
+    json_needle = json_inner(needle)
+    if json_needle is not None and json_needle != needle:
+        json_replacement = json_inner(replacement)
+        expanded.append((json_needle, json_replacement or b"<redacted>"))
+pairs = expanded
+pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
+data = source.read()
+for needle, replacement in pairs:
+    data = data.replace(needle, replacement)
+
+credential = re.compile(br"(?:SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|KEY|TOKEN)")
+endpoint = re.compile(br"(?:^|_)(?:URL|URI|ENDPOINT|DSN)(?:_|$)")
+var = re.compile(br"(--var ([A-Za-z_][A-Za-z0-9_]*)=)((?:\\.|[^\"\\])*?)(?= --var |\"|$)", re.M)
+def mask(match):
+    name = match.group(2).upper()
+    value = match.group(3)
+    if value.startswith(b"<") or not (credential.search(name) or endpoint.search(name)):
+        return match.group(0)
+    token = value.split(None, 1)[0]
+    if (b"KEY" in name or b"TOKEN" in name) and not re.search(
+            br"SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?", name) \
+            and not endpoint.search(name) and len(token) >= 20:
+        replacement = b"<redacted " + token[:4] + b"..." + token[-4:] + b">"
+    else:
+        replacement = b"<redacted>"
+    return match.group(1) + replacement
+
+data = var.sub(mask, data)
+data = re.sub(br"sk-([A-Za-z0-9_-]{4})[A-Za-z0-9_-]{12,}([A-Za-z0-9_-]{4})", br"<redacted sk-\1...\2>", data)
+data = re.sub(br"sk-[A-Za-z0-9_-]{8,}", b"<redacted sk-...>", data)
+sys.stdout.buffer.write(data)
+' > "$tmp" 2>/dev/null; then
+            mv -f "$tmp" "$f"
+            tmp=""
+        else
+            rm -f "$tmp"
+            tmp=""
+            return 1
+        fi
+    done
+)
+
+# _redact_hint NAME VALUE — the replacement for VALUE: first/last 4 chars for
+# keys and tokens of 20+ chars, a plain <redacted> otherwise.
+# _upper STRING — uppercase via tr. Not ${1^^}: that is a bash-4 expansion and
+# macOS's /bin/bash is 3.2, where it is a fatal "bad substitution".
+_upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+
+_redact_hint() {
+    local u v="$2"
+    u=$(_upper "$1")
+    if [[ "$u" =~ (KEY|TOKEN) \
+       && ! "$u" =~ (SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?) \
+       && ! "$u" =~ (^|_)(URL|URI|ENDPOINT|DSN)(_|$) \
+       && "${#v}" -ge 20 ]]; then
+        printf '<redacted %s...%s>' "${v:0:4}" "${v: -4}"
+    else
+        printf '<redacted>'
+    fi
+}
+
+_is_secret_name() {  # same notion as shellm's trajectory masking
+    local u
+    u=$(_upper "$1")
+    [[ "$u" =~ (KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?) \
+        || "$u" =~ (^|_)(URL|URI|ENDPOINT|DSN)(_|$) ]]
+}
+
+usage() {
+    cat <<EOF
+$CMD — talk to and manage the identity '$NAME'
+
+Usage:
+  $CMD                 chat with them
+  $CMD "<message>"     send one message and wait briefly for the reply
+                       (quote it if it has a ' or ? in it)
+  $CMD say <message>   the same, explicitly (for messages starting with a
+                       word like 'stop' or 'status')
+  $CMD start           resume their mind (and the dash)
+  $CMD stop            pause their mind and stop the dash
+  $CMD status          mind + dash status
+  $CMD dash            start the dashboard if needed and open it
+  $CMD shell           subshell with their environment (advanced)
+  $CMD bugreport       bundle logs + trajectory (secrets scrubbed) into one
+                       .tgz to attach to a bug report
+EOF
+}
+
+case "${1:-}" in
+    "")          cmd_chat ;;
+    say)         shift; cmd_say "$@" ;;
+    start)       cmd_start ;;
+    stop)        cmd_stop ;;
+    status)      cmd_status ;;
+    dash)        cmd_dash ;;
+    shell)       cmd_shell ;;
+    bugreport)   shift; cmd_bugreport "$@" ;;
+    -h|--help|help) usage ;;
+    -*)          die "unknown option: $1 (try: $CMD --help)" ;;
+    *)           cmd_say "$@" ;;   # `ada hello there` just talks to them
+esac

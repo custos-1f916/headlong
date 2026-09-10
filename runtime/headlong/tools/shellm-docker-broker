@@ -1,0 +1,1198 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() { echo "shellm-docker-broker: error: $*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+Usage:
+  shellm-docker-broker start --env NAME --workdir DIR --dir DIR --transport socket|filesystem --pid-file FILE --log FILE
+  shellm-docker-broker stop --pid-file FILE
+  shellm-docker-broker serve-one
+  shellm-docker-broker serve-filesystem
+
+This is a host-side broker for shellm's constrained Docker access mode.
+EOF
+}
+
+log_msg() {
+    local log="${SHELLM_BROKER_LOG:-}"
+    [[ -n "$log" ]] || return 0
+    mkdir -p "$(dirname "$log")"
+    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$log"
+}
+
+json_response() {
+    local exit_code="$1"
+    local stdout_file="$2"
+    local stderr_file="$3"
+    jq -n \
+        --argjson exit_code "$exit_code" \
+        --rawfile stdout "$stdout_file" \
+        --rawfile stderr "$stderr_file" \
+        '{exit_code:$exit_code,stdout:$stdout,stderr:$stderr}'
+}
+
+json_error() {
+    local exit_code="$1"
+    local message="$2"
+    log_msg "reject exit=$exit_code $message"
+    jq -n --argjson exit_code "$exit_code" --arg message "$message" \
+        '{exit_code:$exit_code,stdout:"",stderr:("shellm-docker: " + $message + "\n")}'
+}
+
+valid_image() {
+    [[ "$1" != -* && "$1" =~ ^[A-Za-z0-9._/:@-]+$ ]]
+}
+
+# Read the request's args array into the caller's `args` (dynamic scoping;
+# also reads the caller's `request`).
+_read_request_args() {
+    local arg
+    while IFS= read -r arg; do
+        args+=("$arg")
+    done < <(request_args "$request")
+}
+
+valid_tag() {
+    [[ "$1" != -* && "$1" =~ ^[A-Za-z0-9._/:@-]+$ ]]
+}
+
+valid_container_ref() {
+    [[ "$1" =~ ^[A-Za-z0-9_.-]+$ ]]
+}
+
+valid_env_key() {
+    [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]
+}
+
+valid_compose_project_name() {
+    [[ "$1" =~ ^[a-z0-9][a-z0-9_-]*$ ]]
+}
+
+path_under() {
+    local path="$1"
+    local root="$2"
+    [[ "$path" == "$root" || "$path" == "$root"/* ]]
+}
+
+# sandbox_ro_dirs - directories the operator has chosen to expose to the
+# sandbox read-only, newline-separated. Configured as a colon-separated list
+# in HEADLONG_SANDBOX_RO_DIRS, either in the environment or in the state
+# .env. These are mounted :ro into every run AND accepted as symlink targets.
+# Everything else outside the app checkout stays refused, so the agent cannot
+# widen its own view by planting a symlink.
+sandbox_ro_dirs() {
+    local raw="${HEADLONG_SANDBOX_RO_DIRS:-}" home_env
+    if [[ -z "$raw" ]]; then
+        home_env="${HEADLONG_HOME:-$HOME/.headlong}/.env"
+        [[ -r "$home_env" ]] && raw=$(sed -n 's/^HEADLONG_SANDBOX_RO_DIRS=//p' "$home_env" | tail -1)
+    fi
+    raw="${raw%\"}"; raw="${raw#\"}"
+    [[ -z "$raw" ]] && return 0
+    local d
+    # `|| [[ -n "$d" ]]` so a list with no trailing newline still yields its
+    # last entry -- read returns non-zero at EOF even when it read a value.
+    while IFS= read -r d || [[ -n "$d" ]]; do
+        [[ -n "$d" && -d "$d" ]] || continue
+        readlink -f "$d" 2>/dev/null || printf '%s\n' "$d"
+    done < <(printf '%s' "$raw" | tr ':' '\n') | sort -u
+}
+
+# symlink_allow_root WORKDIR - the only tree whose symlink targets may be
+# mounted: the app checkout (the directory holding .identities), which is
+# where every symlink Headlong itself creates points - thinkers, skills and
+# kernel entries. Falls back to the workdir, i.e. allow nothing outside it,
+# when no checkout can be identified.
+symlink_allow_root() {
+    local p="$1"
+    while [[ "$p" != "/" && "$p" != "." && -n "$p" ]]; do
+        [[ -d "$p/.identities" ]] && { printf '%s\n' "$p"; return 0; }
+        p=$(dirname "$p")
+    done
+    printf '%s\n' "$1"
+}
+
+# Resolve a host path for containment without requiring it to exist: compose
+# marks missing bind sources create_host_path, so demanding existence would
+# reject work the sandbox is allowed to do. `realpath -m` would do this in one
+# call but is GNU-only, and this broker runs on macOS too, so walk up to the
+# deepest existing ancestor, resolve THAT (which is what follows symlinks),
+# and re-attach the tail. Callers reject `..` before calling, so the tail
+# cannot climb back out.
+#
+# The walk stops at a symlink as well as at anything that exists, because `-e`
+# is false for a DANGLING one. Without the `-L` test a dangling link reads as a
+# missing component: the walk strips it, resolves the parent it sits in, and
+# re-attaches the name, so the link is judged at its own location while the
+# daemon would follow it to the target. Stopping here hands the link to
+# realpath, which fails on a dangling target, and a path that cannot be
+# resolved is rejected.
+resolve_for_containment() {
+    local path="$1"
+    local tail="" base resolved
+    while [[ ! -e "$path" && ! -L "$path" && "$path" == */?* ]]; do
+        base="${path##*/}"
+        [[ -n "$base" ]] && tail="$base${tail:+/$tail}"
+        path="${path%/*}"
+        [[ -n "$path" ]] || path=/
+    done
+    resolved=$(realpath "$path" 2>/dev/null) || return 1
+    [[ -n "$tail" ]] && resolved="${resolved%/}/$tail"
+    printf '%s\n' "$resolved"
+}
+
+# One host path from a compose model, checked the way every other path in this
+# file is checked. Lexical containment is not enough here: `docker compose
+# config` leaves `..` in an ABSOLUTE bind source unnormalized (verified against
+# compose 2.40.3), and it never resolves symlinks, so a purely textual prefix
+# test blesses a string the daemon then resolves somewhere else entirely.
+#
+# A relative candidate (compose leaves a cache_to dest relative where it
+# resolves every other path field) is taken against `base`, the project
+# directory, which safe_cwd has already confined to the workdir; with no base
+# it is rejected. The `..` test runs after the join, so a relative climb is
+# refused the same way an absolute one is.
+path_contained() {
+    local path="$1"
+    local root="$2"
+    local base="${3:-}"
+    [[ -n "$path" ]] || return 1   # an empty candidate must not join to base
+    if [[ "$path" != /* ]]; then
+        [[ -n "$base" ]] || return 1
+        path="$base/$path"
+    fi
+    case "/$path/" in */../*) return 1 ;; esac
+    local resolved
+    resolved=$(resolve_for_containment "$path") || return 1
+    path_under "$resolved" "$root"
+}
+
+symlink_mounts() {
+    local workdir="$1"
+    # The agent has write access to its own workdir, so every symlink in there
+    # is a path IT may have chosen - and this function mounts the target's
+    # *parent directory*. Following an arbitrary target therefore hands the
+    # sandbox whole host directories: `ln -s ~/.ssh/id_ed25519 x` would mount
+    # ~/.ssh, `ln -s ~/.headlong/.env x` the state home. Confine targets to the
+    # app checkout, which is where all of Headlong's own symlinks point.
+    local allow_root allowed ro_dir
+    allow_root=$(symlink_allow_root "$workdir")
+    # Targets arrive canonicalized (readlink -f), so the root must be too, or
+    # a symlink anywhere in the install path -- /var -> /private/var on macOS,
+    # say -- makes every legitimate target look like it is outside the tree.
+    allow_root=$(readlink -f "$allow_root" 2>/dev/null || printf '%s' "$allow_root")
+    # Same reasoning for the workdir: uncanonicalized, a symlinked install path
+    # makes targets already inside the workdir look external and re-mounts it.
+    workdir=$(readlink -f "$workdir" 2>/dev/null || printf '%s' "$workdir")
+
+    # bash 3.2 lacks associative arrays, so dedupe via sort -u.
+    local -a mount_dirs=()
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && mount_dirs+=("$line")
+    done < <(
+        while IFS= read -r -d '' link; do
+            local target mount_dir
+            target=$(readlink -f "$link" 2>/dev/null) || continue
+            path_under "$target" "$workdir" && continue
+            [[ -e "$target" ]] || continue
+            # The sandbox mounts the target's PARENT directory, so containment
+            # must be checked on that parent, not on the target itself. A
+            # symlink to the checkout root passes a target-only check yet
+            # mounts dirname(checkout) — the checkout's parent, often $HOME —
+            # re-opening the very escape this function is meant to close.
+            mount_dir=$(dirname "$target")
+            allowed=0
+            path_under "$mount_dir" "$allow_root" && allowed=1
+            if [[ "$allowed" -eq 0 ]]; then
+                while IFS= read -r ro_dir; do
+                    [[ -n "$ro_dir" ]] || continue
+                    path_under "$mount_dir" "$ro_dir" && { allowed=1; break; }
+                done < <(sandbox_ro_dirs)
+            fi
+            if [[ "$allowed" -eq 0 ]]; then
+                log_msg "symlink refused (mount dir $mount_dir outside $allow_root and the read-only allowlist): $link -> $target"
+                continue
+            fi
+            printf '%s\n' "$mount_dir"
+        done < <(find "$workdir" -type l -print0 2>/dev/null) \
+        | sort -u
+    )
+
+    [[ "${#mount_dirs[@]}" -eq 0 ]] && return 0
+
+    # Remove dirs that are subdirs of other dirs in the set
+    local dir other dominated
+    for dir in "${mount_dirs[@]}"; do
+        dominated=0
+        for other in "${mount_dirs[@]}"; do
+            [[ "$dir" == "$other" ]] && continue
+            if path_under "$dir" "$other"; then
+                dominated=1
+                break
+            fi
+        done
+        [[ "$dominated" -eq 0 ]] && printf -- '-v\n%s:%s:ro\n' "$dir" "$dir"
+    done
+}
+
+safe_cwd() {
+    local requested="$1"
+    local workdir="$2"
+    local resolved
+    resolved=$(realpath "$requested" 2>/dev/null || true)
+    if [[ -n "$resolved" ]] && path_under "$resolved" "$workdir"; then
+        printf '%s\n' "$resolved"
+    else
+        printf '%s\n' "$workdir"
+    fi
+}
+
+resolve_under_workdir() {
+    local path="$1"
+    local base="$2"
+    local workdir="$3"
+    local candidate resolved
+    if [[ "$path" == /* ]]; then
+        candidate="$path"
+    else
+        candidate="$base/$path"
+    fi
+    resolved=$(realpath "$candidate" 2>/dev/null || true)
+    [[ -n "$resolved" ]] || return 1
+    path_under "$resolved" "$workdir" || return 1
+    printf '%s\n' "$resolved"
+}
+
+container_belongs_to_env() {
+    local ref="$1"
+    local env_name="$2"
+    local label
+    label=$(docker inspect -f '{{ index .Config.Labels "shellm.broker.env" }}' "$ref" 2>/dev/null || true)
+    [[ "$label" == "$env_name" ]]
+}
+
+run_capture() {
+    local out err rc
+    out=$(mktemp)
+    err=$(mktemp)
+    set +e
+    "$@" >"$out" 2>"$err"
+    rc=$?
+    set -e
+    json_response "$rc" "$out" "$err"
+    rm -f "$out" "$err"
+}
+
+apply_request_env() {
+    local request="$1"
+    local encoded key value
+    while IFS= read -r encoded; do
+        key=$(jq -nr --arg encoded "$encoded" '$encoded | @base64d | fromjson | .key')
+        value=$(jq -nr --arg encoded "$encoded" '$encoded | @base64d | fromjson | .value')
+        valid_env_key "$key" || continue
+        case "$key" in
+            BASH*|EUID|HOME|OLDPWD|PATH|PPID|PWD|SHELL|SHELLOPTS|UID) continue ;;
+            COMPOSE_*|DOCKER_*) continue ;;
+        esac
+        export "$key=$value"
+    done < <(printf '%s' "$request" | jq -r '(.env // {}) | to_entries[] | @base64')
+}
+
+run_capture_with_request_env() {
+    local request="$1"
+    local cwd="$2"
+    shift 2
+    local out err rc
+    out=$(mktemp)
+    err=$(mktemp)
+    set +e
+    (
+        cd "$cwd" || exit 1
+        apply_request_env "$request"
+        "$@"
+    ) >"$out" 2>"$err"
+    rc=$?
+    set -e
+    json_response "$rc" "$out" "$err"
+    rm -f "$out" "$err"
+}
+
+request_args() {
+    local request="$1"
+    printf '%s' "$request" | jq -r '.args[]?'
+}
+
+handle_run() {
+    local request="$1"
+    local env_name="$SHELLM_BROKER_ENV"
+    local workdir="$SHELLM_BROKER_WORKDIR"
+    local requested_cwd cwd
+    requested_cwd=$(printf '%s' "$request" | jq -r '.cwd // empty')
+    cwd=$(safe_cwd "$requested_cwd" "$workdir")
+
+    local -a args=()
+    _read_request_args
+    [[ "${#args[@]}" -ge 1 ]] || { json_error 64 "run requires IMAGE"; return; }
+
+    local image="${args[0]}"
+    valid_image "$image" || { json_error 64 "rejected invalid image name: $image"; return; }
+
+    local -a command=()
+    local start=1
+    [[ "${args[1]:-}" == "--" ]] && start=2
+    local i
+    for ((i=start; i<${#args[@]}; i++)); do
+        command+=("${args[$i]}")
+    done
+
+    local cpus="${SHELLM_BROKER_CPUS:-2}"
+    local memory="${SHELLM_BROKER_MEMORY:-2g}"
+    local pids="${SHELLM_BROKER_PIDS_LIMIT:-512}"
+
+    local -a symlink_vols=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && symlink_vols+=("$line")
+    done < <(symlink_mounts "$workdir")
+
+    local -a ro_vols=()
+    local ro_dir
+    while IFS= read -r ro_dir; do
+        [[ -n "$ro_dir" ]] || continue
+        path_under "$ro_dir" "$workdir" && continue
+        ro_vols+=(-v "$ro_dir:$ro_dir:ro")
+    done < <(sandbox_ro_dirs)
+
+    local -a cmd=(
+        docker run --rm
+        --label "shellm.broker=1"
+        --label "shellm.broker.env=$env_name"
+        --security-opt no-new-privileges
+        --cpus "$cpus"
+        --memory "$memory"
+        --pids-limit "$pids"
+        -v "$workdir:$workdir"
+        ${symlink_vols[@]+"${symlink_vols[@]}"}
+        ${ro_vols[@]+"${ro_vols[@]}"}
+        -w "$cwd"
+        -e "SHELLM_WORKDIR=$workdir"
+        "$image"
+    )
+    if [[ "${#command[@]}" -gt 0 ]]; then
+        cmd+=("${command[@]}")
+    fi
+    log_msg "run image=$image cwd=$cwd argc=${#command[@]}"
+    run_capture "${cmd[@]}"
+}
+
+handle_build() {
+    local request="$1"
+    local env_name="$SHELLM_BROKER_ENV"
+    local workdir="$SHELLM_BROKER_WORKDIR"
+    local requested_cwd cwd
+    requested_cwd=$(printf '%s' "$request" | jq -r '.cwd // empty')
+    cwd=$(safe_cwd "$requested_cwd" "$workdir")
+    local -a args=()
+    _read_request_args
+    [[ "${#args[@]}" -eq 2 ]] || { json_error 64 "build requires DIR TAG"; return; }
+
+    local context="${args[0]}"
+    local tag="${args[1]}"
+    valid_tag "$tag" || { json_error 64 "rejected invalid tag: $tag"; return; }
+
+    local abs_context
+    abs_context=$(resolve_under_workdir "$context" "$cwd" "$workdir" 2>/dev/null || true)
+    [[ -n "$abs_context" && -d "$abs_context" ]] || { json_error 64 "build context does not exist: $context"; return; }
+
+    log_msg "build context=$abs_context tag=$tag"
+    run_capture docker build \
+        --label "shellm.broker=1" \
+        --label "shellm.broker.env=$env_name" \
+        -t "$tag" \
+        "$abs_context"
+}
+
+handle_ps() {
+    local env_name="$SHELLM_BROKER_ENV"
+    log_msg "ps"
+    run_capture docker ps --filter "label=shellm.broker.env=$env_name"
+}
+
+handle_logs() {
+    local request="$1"
+    local env_name="$SHELLM_BROKER_ENV"
+    local -a args=()
+    _read_request_args
+    [[ "${#args[@]}" -eq 1 ]] || { json_error 64 "logs requires CONTAINER"; return; }
+    local ref="${args[0]}"
+    valid_container_ref "$ref" || { json_error 64 "rejected invalid container ref"; return; }
+    container_belongs_to_env "$ref" "$env_name" || { json_error 65 "container is not managed by this shellm broker"; return; }
+    log_msg "logs ref=$ref"
+    run_capture docker logs "$ref"
+}
+
+handle_rm() {
+    local request="$1"
+    local env_name="$SHELLM_BROKER_ENV"
+    local -a args=()
+    _read_request_args
+    [[ "${#args[@]}" -eq 1 ]] || { json_error 64 "rm requires CONTAINER"; return; }
+    local ref="${args[0]}"
+    valid_container_ref "$ref" || { json_error 64 "rejected invalid container ref"; return; }
+    container_belongs_to_env "$ref" "$env_name" || { json_error 65 "container is not managed by this shellm broker"; return; }
+    log_msg "rm ref=$ref"
+    run_capture docker rm -f "$ref"
+}
+
+handle_info() {
+    local request="$1"
+    local -a args=()
+    _read_request_args
+    log_msg "info"
+    local -a cmd=(docker info)
+    if [[ "${#args[@]}" -gt 0 ]]; then
+        cmd+=("${args[@]}")
+    fi
+    run_capture "${cmd[@]}"
+}
+
+handle_version() {
+    local request="$1"
+    local -a args=()
+    _read_request_args
+    log_msg "version argc=${#args[@]}"
+    if [[ "${#args[@]}" -eq 1 && ( "${args[0]}" == "-v" || "${args[0]}" == "--version" ) ]]; then
+        run_capture docker "${args[0]}"
+        return
+    fi
+    local -a cmd=(docker version)
+    if [[ "${#args[@]}" -gt 0 ]]; then
+        cmd+=("${args[@]}")
+    fi
+    run_capture "${cmd[@]}"
+}
+
+# The host paths a compose model names, emitted as NUL-terminated
+# "name<TAB>kind<TAB>path" records for the bash containment check below. A
+# missing or non-string path becomes an empty string so it is rejected rather
+# than skipped: the old jq predicate only flagged strings, so a null passed.
+#
+# The bind sources and build contexts are not the whole surface. A named volume
+# with driver_opts.device, a secret or config with `file:`, an extra build
+# context, a build ssh key, a local build cache, and a develop.watch path all
+# name a host path too, and none of them passes through .services[].volumes.
+# Verified by execution before this was written: a volume device and a secret
+# file each mounted a host file from outside SHELLM_WORKDIR into a brokered
+# container while the bind check was already in force, and compose 2.40.3
+# renders a develop.watch path and a `type=local,src=` cache entry pointing
+# anywhere on the host.
+#
+# What this program does NOT cover, and why:
+#   - env_file and label_file: the default render consumes both, so their paths
+#     survive only in the uninterpolated render. RAW_PATHS_PROGRAM below reads
+#     them from there, and compose_validate_model checks them before the render
+#     that would read the files.
+#   - extends.file and top-level include: compose merges them away, so no path
+#     reaches either render. What they pull in becomes ordinary services, whose
+#     paths this program then checks (an extends.file naming /etc as a bind
+#     source is rejected as a bind). The residual is that compose reads the
+#     named YAML while rendering, which is why a render failure no longer
+#     relays compose's stderr to the caller.
+#   - build.env_file: not in the 2.40.3 schema; compose rejects the model.
+#
+# A value is skipped only when it cannot be a host path. additional_contexts
+# shares its map with `docker-image://`, `service:` and git or http(s)/ssh
+# URLs, and those are the only values passed over. An `oci-layout://` context
+# is NOT one of them: it names a local OCI layout directory on the host, so
+# the scheme is stripped and the remainder checked. Everything else,
+# absolute or not, goes to path_contained to accept or reject. Compose 2.40.3
+# resolves a relative additional context against the project directory before
+# this sees it, but a filter that drops what it does not recognise is the wrong
+# default in a gate, so the recognising is done on the non-paths instead. Same
+# reason a driver_opts.device is always checked: a device that is not an
+# absolute path (an NFS "host:/export", say) is not something this broker
+# should hand out either, and path_contained rejects it.
+# `read -d ''` returns nonzero at EOF, which set -e would treat as fatal.
+read -r -d '' PATHS_PROGRAM <<'JQ' || true
+
+            def build_contexts($b):
+              if $b == null then []
+              elif ($b | type) == "string" then [$b]
+              elif ($b | type) == "object" then [$b.context // ""]
+              else [] end;
+            def build_dockerfiles($b):
+              if ($b | type) == "object" and (($b.dockerfile // "") | startswith("/")) then [$b.dockerfile]
+              else [] end;
+            def non_path($v):
+              ["docker-image://", "service:", "git://",
+               "http://", "https://", "ssh://"] | any(. as $p | $v | startswith($p));
+            def extra_contexts($b):
+              if ($b | type) == "object" and (($b.additional_contexts // null) | type) == "object"
+              then [$b.additional_contexts[]
+                    | if type == "string" then . else "" end
+                    | select(non_path(.) | not)
+                    | sub("^oci-layout://"; "")]
+              else [] end;
+            def ssh_keys($b):
+              if ($b | type) != "object" then []
+              else [(($b.ssh // []) | if type == "object" then [.[]] else . end)[]
+                    | if type != "string" then ""
+                      elif index("=") then sub("^[^=]*="; "")
+                      elif startswith("/") then .
+                      else empty end
+                    | select(. != "")]
+              end;
+            def cache_paths($b; $field):
+              if ($b | type) != "object" then []
+              else [(($b[$field] // []) | if type == "array" then . else [.] end)[]
+                    | if type != "string" then ""
+                      else (split(",")[]
+                            | select(startswith("src=") or startswith("dest="))
+                            | sub("^[^=]*="; ""))
+                      end]
+              end;
+            def watch_paths($s):
+              [((($s.develop // {}) | if type == "object" then (.watch // []) else [] end)
+                | if type == "array" then . else [] end)[]
+               | if type == "object" then (.path // "") else "" end
+               | if type == "string" then . else "" end];
+            def emit($name; $kind; $p):
+              "\($name)\t\($kind)\t\(if ($p | type) == "string" then $p else "" end)\u0000";
+
+            (.services // {} | to_entries[] as $svc |
+             ($svc.value // {}) as $s |
+             (build_contexts($s.build // null)[] | emit($svc.key; "context"; .)),
+             (build_dockerfiles($s.build // null)[] | emit($svc.key; "dockerfile"; .)),
+             (extra_contexts($s.build // null)[] | emit($svc.key; "extra-context"; .)),
+             (ssh_keys($s.build // null)[] | emit($svc.key; "ssh-key"; .)),
+             (cache_paths($s.build // null; "cache_from")[] | emit($svc.key; "cache"; .)),
+             (cache_paths($s.build // null; "cache_to")[] | emit($svc.key; "cache"; .)),
+             (watch_paths($s)[] | emit($svc.key; "watch"; .)),
+             (($s.volumes // [])[] | select(.type == "bind") | emit($svc.key; "bind"; .source // ""))),
+            (.volumes // {} | to_entries[]
+             | select((.value.driver_opts // null) | type == "object")
+             | select(.value.driver_opts | has("device"))
+             | emit(.key; "volume-device"; .value.driver_opts.device)),
+            (.secrets // {} | to_entries[] | select(.value | has("file")) | emit(.key; "secret"; .value.file)),
+            (.configs // {} | to_entries[] | select(.value | has("file")) | emit(.key; "config"; .value.file))
+JQ
+
+# env_file and label_file are the host paths `docker compose config` destroys
+# before the validator sees them: the default render reads each file and inlines
+# what it finds (values into `environment`, labels into `labels`), leaving the
+# path fields null, so they are simply not in the model (checked against compose
+# 2.40.3; --no-env-resolution does not preserve them either). --no-interpolate
+# does keep them, with relative paths already resolved against the project
+# directory, so they come from a second render of the same model. A path
+# spelled with an unexpanded ${VAR} stays literal here while the default
+# render interpolates it and reads the real target, so
+# compose_containment_message rejects any variable in these records outright —
+# an absolute spelling like /workdir/${FILE} would otherwise resolve as
+# contained and then be read from anywhere at all.
+#
+# Re-verified against compose 5.2.0: --no-interpolate does not schema-reject a
+# legitimate ${VAR} in a typed field (mem_limit, deploy.replicas), and env_file
+# paths still survive this render, resolved absolute.
+read -r -d '' RAW_PATHS_PROGRAM <<'JQ' || true
+
+            def emit($name; $kind; $p):
+              "\($name)\t\($kind)\t\(if ($p | type) == "string" then $p else "" end)\u0000";
+            .services // {} | to_entries[] as $svc |
+            ((($svc.value.env_file // []) | if type == "array" then . else [.] end)[]
+             | emit($svc.key; "env-file"; (if type == "object" then (.path // "") else . end))),
+            ((($svc.value.label_file // []) | if type == "array" then . else [.] end)[]
+             | emit($svc.key; "label-file"; .))
+JQ
+
+# A compose render that fails says why in compose's own words, and those words
+# can carry the contents of a host file: point env_file at any file on the host
+# and an unterminated quote comes back as `unterminated quoted value "<the
+# value>"` (compose 2.40.3, verified). The requester is not trusted with that,
+# so the caller gets a fixed message — and the log gets only a withheld notice
+# by default, because the same words would otherwise persist on disk. An
+# operator debugging a render sets HEADLONG_BROKER_LOG_COMPOSE_STDERR=1 to log
+# the raw text.
+compose_render_failed() {
+    local err="$1" message="$2"
+    if [[ -n "${HEADLONG_BROKER_LOG_COMPOSE_STDERR:-}" ]]; then
+        log_msg "compose render failed: $(tr '\n' ' ' < "$err" | cut -c1-500)"
+    else
+        log_msg "compose render failed ($(wc -c < "$err" | tr -d ' ') bytes of compose stderr withheld; set HEADLONG_BROKER_LOG_COMPOSE_STDERR=1 to log it)"
+    fi
+    printf '%s\n' "$message" >&2
+}
+
+# The first path in `paths` that is not inside `root`, as the message to reject
+# the request with. Prints nothing when every path is contained. Relative
+# candidates resolve against `base`, the project directory.
+compose_containment_message() {
+    local paths="$1" root="$2" base="$3"
+    local svc kind candidate
+    while IFS=$'\t' read -r -d '' svc kind candidate; do
+        # The uninterpolated render keeps ${VAR} literal. An absolute prefix
+        # under the workdir with a variable tail passes containment here and is
+        # then interpolated to anywhere at all before the file is read, because
+        # the path field is gone from the render that reads it.
+        case "$kind" in
+            env-file|label-file)
+                case "$candidate" in
+                    *'$'*)
+                        printf 'service %s names a %s path with an uninterpolated variable\n' "$svc" "$kind"
+                        return 0 ;;
+                esac ;;
+        esac
+        path_contained "$candidate" "$root" "$base" && continue
+        case "$kind" in
+            context) printf 'service %s builds from a context outside SHELLM_WORKDIR\n' "$svc" ;;
+            dockerfile) printf 'service %s uses a Dockerfile outside SHELLM_WORKDIR\n' "$svc" ;;
+            extra-context) printf 'service %s uses an additional build context outside SHELLM_WORKDIR\n' "$svc" ;;
+            ssh-key) printf 'service %s builds with an ssh key outside SHELLM_WORKDIR\n' "$svc" ;;
+            cache) printf 'service %s uses a build cache outside SHELLM_WORKDIR\n' "$svc" ;;
+            watch) printf 'service %s watches a path outside SHELLM_WORKDIR\n' "$svc" ;;
+            env-file) printf 'service %s reads an env file outside SHELLM_WORKDIR\n' "$svc" ;;
+            label-file) printf 'service %s reads a label file outside SHELLM_WORKDIR\n' "$svc" ;;
+            volume-device) printf 'volume %s mounts a host path outside SHELLM_WORKDIR\n' "$svc" ;;
+            secret) printf 'secret %s reads a file outside SHELLM_WORKDIR\n' "$svc" ;;
+            config) printf 'config %s reads a file outside SHELLM_WORKDIR\n' "$svc" ;;
+            *) printf 'service %s bind-mounts a host path outside SHELLM_WORKDIR\n' "$svc" ;;
+        esac
+        return 0
+    done < "$paths"
+}
+
+compose_validate_model() {
+    local request="$1"
+    local cwd="$2"
+    shift 2
+    local config config_raw paths err rc message root
+    config=$(mktemp)
+    config_raw=$(mktemp)
+    paths=$(mktemp)
+    err=$(mktemp)
+
+    # Resolve the root as well as the candidates. start_broker realpaths the
+    # workdir before exporting it, but a check whose whole job is to distrust a
+    # spelling must not depend on its caller having done that: where /tmp or
+    # /var is itself a symlink (macOS), an unresolved root makes every path
+    # inside the workdir compare as outside it.
+    root=$(realpath "$SHELLM_BROKER_WORKDIR" 2>/dev/null) || root="$SHELLM_BROKER_WORKDIR"
+    # This function is now the single containment gate, and path_under with an
+    # empty root contains every absolute path. An unconfigured workdir must
+    # fail loudly, not silently pass everything.
+    if [[ -z "$root" || "$root" == / ]]; then
+        rm -f "$config" "$config_raw" "$paths" "$err"
+        printf 'broker workdir is not configured\n' >&2
+        return 65
+    fi
+
+    # The uninterpolated render runs FIRST because it is the only one that still
+    # names the env_file and label_file paths, and the render below READS those
+    # files. Checking them afterwards would be checking a file compose has
+    # already opened and quoted back in its errors. Its failure is a rejection
+    # rather than a shrug: without it that surface goes unchecked.
+    rc=0
+    (
+        cd "$cwd" || exit 1
+        apply_request_env "$request"
+        docker compose "$@" config --format json --no-interpolate
+    ) >"$config_raw" 2>"$err" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        compose_render_failed "$err" "compose model could not be inspected for the files it reads"
+        rm -f "$config" "$config_raw" "$paths" "$err"
+        return 65
+    fi
+    if ! jq -j "$RAW_PATHS_PROGRAM" "$config_raw" > "$paths" 2>/dev/null; then
+        rm -f "$config" "$config_raw" "$paths" "$err"
+        printf 'compose model could not be inspected for host paths\n' >&2
+        return 65
+    fi
+    message=$(compose_containment_message "$paths" "$root" "$cwd")
+    if [[ -n "$message" ]]; then
+        rm -f "$config" "$config_raw" "$paths" "$err"
+        printf '%s\n' "$message" >&2
+        return 65
+    fi
+
+    rc=0
+    (
+        cd "$cwd" || exit 1
+        apply_request_env "$request"
+        docker compose "$@" config --format json
+    ) >"$config" 2>"$err" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        compose_render_failed "$err" "compose model could not be rendered"
+        rm -f "$config" "$config_raw" "$paths" "$err"
+        return 65
+    fi
+
+    message=$(jq -r '
+        .services // {} | to_entries[] as $svc |
+        ($svc.value // {}) as $s |
+        if ($s.privileged == true) then
+          "service \($svc.key) requests privileged mode"
+        elif (($s.cap_add // []) | length) > 0 then
+          "service \($svc.key) requests cap_add"
+        elif (($s.devices // []) | length) > 0 then
+          "service \($svc.key) requests devices"
+        elif (($s.security_opt // []) | map(tostring) | any(. == "seccomp=unconfined" or . == "apparmor=unconfined")) then
+          "service \($svc.key) disables container security policy"
+        elif (($s.network_mode // "") | tostring) == "host" then
+          "service \($svc.key) requests host networking"
+        elif (($s.pid // "") | tostring) == "host" then
+          "service \($svc.key) requests host pid namespace"
+        elif (($s.ipc // "") | tostring) == "host" then
+          "service \($svc.key) requests host ipc namespace"
+        elif (($s.cgroup // "") | tostring) == "host" then
+          "service \($svc.key) requests host cgroup namespace"
+        elif (($s.volumes // []) | map(select((.source // "") == "/var/run/docker.sock" or (.target // "") == "/var/run/docker.sock")) | length) > 0 then
+          "service \($svc.key) tries to mount the Docker socket"
+        else
+          empty
+        end
+    ' "$config" | head -1)
+
+    # The host paths the rendered model names, one NUL-terminated
+    # "service<TAB>kind<TAB>path" record each, checked in bash against the
+    # resolved workdir. Collect first and check jq's status: a failure here must
+    # not read as "no paths to object to".
+    if [[ -z "$message" ]]; then
+        if ! jq -j "$PATHS_PROGRAM" "$config" > "$paths" 2>/dev/null; then
+            rm -f "$config" "$config_raw" "$paths" "$err"
+            printf 'compose model could not be inspected for host paths\n' >&2
+            return 65
+        fi
+        message=$(compose_containment_message "$paths" "$root" "$cwd")
+    fi
+
+    rm -f "$config" "$config_raw" "$paths" "$err"
+    [[ -z "$message" ]] || { printf '%s\n' "$message" >&2; return 65; }
+    return 0
+}
+
+compose_validate_cp_paths() {
+    local cwd="$1"
+    shift
+    shift
+    local workdir="$SHELLM_BROKER_WORKDIR"
+    local -a operands=()
+    local arg
+    while [[ $# -gt 0 ]]; do
+        arg="$1"
+        shift
+        case "$arg" in
+            --index)
+                [[ $# -gt 0 ]] || { printf '%s\n' "compose cp --index requires a value" >&2; return 64; }
+                shift
+                ;;
+            --archive|--follow-link|--all|-a|-L)
+                ;;
+            -*)
+                printf '%s\n' "unsupported compose cp option: $arg" >&2
+                return 64
+                ;;
+            *)
+                operands+=("$arg")
+                ;;
+        esac
+    done
+    [[ "${#operands[@]}" -eq 2 ]] || { printf '%s\n' "compose cp requires SRC DEST" >&2; return 64; }
+
+    local operand ref path abs parent
+    for operand in "${operands[@]}"; do
+        if [[ "$operand" == *:* ]]; then
+            ref="${operand%%:*}"
+            path="${operand#*:}"
+            valid_container_ref "$ref" || { printf '%s\n' "invalid compose cp service: $ref" >&2; return 64; }
+            [[ "$path" == /* ]] || { printf '%s\n' "compose cp container paths must be absolute" >&2; return 64; }
+        else
+            abs=$(resolve_under_workdir "$operand" "$cwd" "$workdir" 2>/dev/null || true)
+            if [[ -z "$abs" ]]; then
+                parent=$(dirname "$operand")
+                abs=$(resolve_under_workdir "$parent" "$cwd" "$workdir" 2>/dev/null || true)
+            fi
+            [[ -n "$abs" ]] || { printf '%s\n' "compose cp host paths must stay under SHELLM_WORKDIR" >&2; return 64; }
+        fi
+    done
+}
+
+compose_validate_exec() {
+    shift
+    local arg service=""
+    while [[ $# -gt 0 ]]; do
+        arg="$1"
+        shift
+        case "$arg" in
+            --privileged)
+                printf '%s\n' "compose exec --privileged is not allowed" >&2
+                return 65
+                ;;
+            -w|--workdir|-e|--env|-u|--user|--index)
+                [[ $# -gt 0 ]] || { printf '%s\n' "compose exec $arg requires a value" >&2; return 64; }
+                shift
+                ;;
+            -T|--no-TTY|--detach|-d)
+                ;;
+            -*)
+                printf '%s\n' "unsupported compose exec option: $arg" >&2
+                return 64
+                ;;
+            *)
+                service="$arg"
+                break
+                ;;
+        esac
+    done
+    [[ -n "$service" ]] || { printf '%s\n' "compose exec requires SERVICE" >&2; return 64; }
+    valid_container_ref "$service" || { printf '%s\n' "invalid compose exec service: $service" >&2; return 64; }
+}
+
+handle_compose() {
+    local request="$1"
+    local workdir="$SHELLM_BROKER_WORKDIR"
+    local requested_cwd cwd
+    requested_cwd=$(printf '%s' "$request" | jq -r '.cwd // empty')
+    cwd=$(safe_cwd "$requested_cwd" "$workdir")
+
+    local -a args=()
+    _read_request_args
+    [[ "${#args[@]}" -ge 1 ]] || { json_error 64 "compose requires a subcommand"; return; }
+
+    local -a global_args=()
+    local -a command_args=()
+    local project_dir="$cwd"
+    local subcommand=""
+    local i=0 arg value abs
+    while [[ "$i" -lt "${#args[@]}" ]]; do
+        arg="${args[$i]}"
+        case "$arg" in
+            -f|--file)
+                i=$((i + 1))
+                [[ "$i" -lt "${#args[@]}" ]] || { json_error 64 "$arg requires a value"; return; }
+                value="${args[$i]}"
+                abs=$(resolve_under_workdir "$value" "$cwd" "$workdir" 2>/dev/null || true)
+                [[ -n "$abs" && -f "$abs" ]] || { json_error 64 "compose file must be under SHELLM_WORKDIR: $value"; return; }
+                global_args+=("$arg" "$abs")
+                ;;
+            --project-directory)
+                i=$((i + 1))
+                [[ "$i" -lt "${#args[@]}" ]] || { json_error 64 "$arg requires a value"; return; }
+                value="${args[$i]}"
+                abs=$(resolve_under_workdir "$value" "$cwd" "$workdir" 2>/dev/null || true)
+                [[ -n "$abs" && -d "$abs" ]] || { json_error 64 "compose project directory must be under SHELLM_WORKDIR: $value"; return; }
+                project_dir="$abs"
+                global_args+=("$arg" "$abs")
+                ;;
+            -p|--project-name)
+                i=$((i + 1))
+                [[ "$i" -lt "${#args[@]}" ]] || { json_error 64 "$arg requires a value"; return; }
+                value="${args[$i]}"
+                valid_compose_project_name "$value" || { json_error 64 "invalid compose project name: $value"; return; }
+                global_args+=("$arg" "$value")
+                ;;
+            --env-file)
+                i=$((i + 1))
+                [[ "$i" -lt "${#args[@]}" ]] || { json_error 64 "$arg requires a value"; return; }
+                value="${args[$i]}"
+                abs=$(resolve_under_workdir "$value" "$cwd" "$workdir" 2>/dev/null || true)
+                [[ -n "$abs" && -f "$abs" ]] || { json_error 64 "compose env-file must be under SHELLM_WORKDIR: $value"; return; }
+                global_args+=("$arg" "$abs")
+                ;;
+            --ansi|--progress|--profile)
+                i=$((i + 1))
+                [[ "$i" -lt "${#args[@]}" ]] || { json_error 64 "$arg requires a value"; return; }
+                global_args+=("$arg" "${args[$i]}")
+                ;;
+            --compatibility|--verbose)
+                global_args+=("$arg")
+                ;;
+            -v|--version)
+                subcommand="version"
+                command_args=("version")
+                break
+                ;;
+            -*)
+                json_error 64 "unsupported compose global option: $arg"
+                return
+                ;;
+            *)
+                subcommand="$arg"
+                while [[ "$i" -lt "${#args[@]}" ]]; do
+                    command_args+=("${args[$i]}")
+                    i=$((i + 1))
+                done
+                break
+                ;;
+        esac
+        i=$((i + 1))
+    done
+
+    [[ -n "$subcommand" ]] || { json_error 64 "compose requires a subcommand"; return; }
+
+    case "$subcommand" in
+        version)
+            log_msg "compose version"
+            local -a version_cmd=(docker compose)
+            if [[ "${#command_args[@]}" -gt 0 ]]; then
+                version_cmd+=("${command_args[@]}")
+            fi
+            run_capture "${version_cmd[@]}"
+            return
+            ;;
+        build|down|up|exec|cp|stop|config) ;;
+        *) json_error 64 "unsupported compose operation: $subcommand"; return ;;
+    esac
+
+    case "$subcommand" in
+        cp)
+            if ! compose_validate_cp_paths "$cwd" "${command_args[@]}"; then
+                json_error 64 "rejected compose cp request"
+                return
+            fi
+            ;;
+        exec)
+            if ! compose_validate_exec "${command_args[@]}"; then
+                json_error 64 "rejected compose exec request"
+                return
+            fi
+            ;;
+    esac
+
+    # `config` is validated like every other subcommand. It renders the model
+    # back to the caller and compose inlines the contents of every env_file
+    # into that render, so exempting it hands out host files verbatim.
+    local validation_out validation_err validation_rc
+    validation_out=$(mktemp)
+    validation_err=$(mktemp)
+    set +e
+    if [[ "${#global_args[@]}" -gt 0 ]]; then
+        compose_validate_model "$request" "$cwd" "${global_args[@]}" >"$validation_out" 2>"$validation_err"
+    else
+        compose_validate_model "$request" "$cwd" >"$validation_out" 2>"$validation_err"
+    fi
+    validation_rc=$?
+    set -e
+    if [[ "$validation_rc" -ne 0 ]]; then
+        json_response "$validation_rc" "$validation_out" "$validation_err"
+        rm -f "$validation_out" "$validation_err"
+        return
+    fi
+    rm -f "$validation_out" "$validation_err"
+
+    log_msg "compose project_dir=$project_dir subcommand=$subcommand argc=${#args[@]}"
+    local -a cmd=(docker compose)
+    if [[ "${#global_args[@]}" -gt 0 ]]; then
+        cmd+=("${global_args[@]}")
+    fi
+    if [[ "${#command_args[@]}" -gt 0 ]]; then
+        cmd+=("${command_args[@]}")
+    fi
+    run_capture_with_request_env "$request" "$cwd" "${cmd[@]}"
+}
+
+process_request() {
+    local request="$1"
+    if ! printf '%s' "$request" | jq -e '.op and (.args | type == "array")' >/dev/null 2>&1; then
+        json_error 64 "invalid broker request"
+        return
+    fi
+
+    local op
+    op=$(printf '%s' "$request" | jq -r '.op')
+    case "$op" in
+        run) handle_run "$request" ;;
+        build) handle_build "$request" ;;
+        ps) handle_ps ;;
+        logs) handle_logs "$request" ;;
+        rm) handle_rm "$request" ;;
+        info) handle_info "$request" ;;
+        version) handle_version "$request" ;;
+        compose) handle_compose "$request" ;;
+        *) json_error 64 "unsupported operation: $op" ;;
+    esac
+}
+
+serve_one() {
+    local request
+    request=$(cat)
+    process_request "$request"
+}
+
+discard_stale_filesystem_request() {
+    local file="$1"
+    local res_dir="$2"
+    local base response tmp
+    base=$(basename "$file")
+    response="$res_dir/$base"
+    tmp="$response.tmp"
+    json_error 70 "discarded stale broker request after broker restart" > "$tmp"
+    mv "$tmp" "$response"
+    rm -f "$file"
+}
+
+process_filesystem_request() {
+    local processing="$1"
+    local response="$2"
+    local tmp="$3"
+    if ! "$0" serve-one < "$processing" > "$tmp" 2>>"${SHELLM_BROKER_LOG:-/dev/null}"; then
+        json_error 70 "broker request crashed" > "$tmp"
+    fi
+    mv "$tmp" "$response"
+    rm -f "$processing"
+}
+
+serve_filesystem() {
+    local dir="$SHELLM_BROKER_DIR"
+    local req_dir="$dir/requests"
+    local res_dir="$dir/responses"
+    local processing_dir="$dir/processing"
+    mkdir -p "$req_dir" "$res_dir" "$processing_dir"
+    rm -f "$res_dir"/*.tmp 2>/dev/null || true
+    local stale
+    for stale in "$processing_dir"/*.json "$req_dir"/*.json; do
+        [[ -e "$stale" ]] || continue
+        discard_stale_filesystem_request "$stale" "$res_dir"
+    done
+    log_msg "filesystem broker started env=$SHELLM_BROKER_ENV workdir=$SHELLM_BROKER_WORKDIR"
+
+    while true; do
+        local req
+        for req in "$req_dir"/*.json; do
+            [[ -e "$req" ]] || continue
+            local base processing response tmp
+            base=$(basename "$req")
+            processing="$processing_dir/$base"
+            response="$res_dir/$base"
+            tmp="$response.tmp"
+            mv "$req" "$processing" 2>/dev/null || continue
+            process_filesystem_request "$processing" "$response" "$tmp" &
+        done
+        sleep 0.2
+    done
+}
+
+stop_pid_file() {
+    local pid_file="$1"
+    if [[ -f "$pid_file" ]]; then
+        local pid session
+        pid=$(cat "$pid_file" 2>/dev/null || true)
+        case "$pid" in
+            tmux:*)
+                session="${pid#tmux:}"
+                if [[ -n "$session" ]] && command -v tmux >/dev/null 2>&1; then
+                    tmux kill-session -t "$session" >/dev/null 2>&1 || true
+                fi
+                ;;
+            *)
+                if [[ -n "$pid" ]]; then
+                    kill "$pid" >/dev/null 2>&1 || true
+                    sleep 0.1
+                    kill -9 "$pid" >/dev/null 2>&1 || true
+                fi
+                ;;
+        esac
+        rm -f "$pid_file"
+    fi
+}
+
+start_broker() {
+    local env_name="" workdir="" dir="" transport="" pid_file="" log=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --env) env_name="${2:?--env requires a value}"; shift 2 ;;
+            --workdir) workdir="${2:?--workdir requires a value}"; shift 2 ;;
+            --dir) dir="${2:?--dir requires a value}"; shift 2 ;;
+            --transport) transport="${2:?--transport requires a value}"; shift 2 ;;
+            --pid-file) pid_file="${2:?--pid-file requires a value}"; shift 2 ;;
+            --log) log="${2:?--log requires a value}"; shift 2 ;;
+            *) die "unknown start option: $1" ;;
+        esac
+    done
+
+    [[ -n "$env_name" && -n "$workdir" && -n "$dir" && -n "$transport" && -n "$pid_file" && -n "$log" ]] || die "start requires --env, --workdir, --dir, --transport, --pid-file, and --log"
+    workdir=$(realpath "$workdir")
+    command -v docker >/dev/null 2>&1 || die "broker mode requires docker on the host"
+    docker info >/dev/null 2>&1 || die "broker mode cannot reach the host Docker daemon"
+
+    mkdir -p "$dir" "$(dirname "$pid_file")" "$(dirname "$log")"
+    stop_pid_file "$pid_file"
+
+    export SHELLM_BROKER_ENV="$env_name"
+    export SHELLM_BROKER_WORKDIR="$workdir"
+    export SHELLM_BROKER_DIR="$dir"
+    export SHELLM_BROKER_LOG="$log"
+
+    case "$transport" in
+        socket)
+            command -v socat >/dev/null 2>&1 || die "socket transport requires socat"
+            rm -f "$dir/broker.sock"
+            nohup socat "UNIX-LISTEN:$dir/broker.sock,fork,unlink-early" "EXEC:$0 serve-one" >>"$log" 2>&1 &
+            ;;
+        filesystem)
+            if command -v tmux >/dev/null 2>&1 && [[ "${SHELLM_BROKER_USE_TMUX:-1}" != "0" ]]; then
+                local safe_env session tmux_cmd
+                safe_env="${env_name//[^A-Za-z0-9_]/_}"
+                session="shellm-broker-$safe_env"
+                tmux kill-session -t "$session" >/dev/null 2>&1 || true
+                printf -v tmux_cmd 'SHELLM_BROKER_ENV=%q SHELLM_BROKER_WORKDIR=%q SHELLM_BROKER_DIR=%q SHELLM_BROKER_LOG=%q exec %q serve-filesystem >>%q 2>&1' \
+                    "$env_name" "$workdir" "$dir" "$log" "$0" "$log"
+                tmux new-session -d -s "$session" "$tmux_cmd"
+                printf 'tmux:%s\n' "$session" > "$pid_file"
+                log_msg "broker started session=$session transport=$transport env=$env_name workdir=$workdir"
+                return
+            fi
+
+            nohup bash -c '
+                broker="$1"
+                log="$2"
+                child=""
+                stop_child() {
+                    if [ -n "$child" ]; then
+                        kill "$child" >/dev/null 2>&1 || true
+                    fi
+                    exit 0
+                }
+                trap stop_child INT TERM
+                while true; do
+                    "$broker" serve-filesystem &
+                    child=$!
+                    wait "$child"
+                    rc=$?
+                    child=""
+                    if [ "$rc" -eq 0 ]; then
+                        exit 0
+                    fi
+                    printf "%s filesystem broker exited rc=%s; restarting\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rc" >> "$log"
+                    sleep 1
+                done
+            ' shellm-docker-broker-supervisor "$0" "$log" >>"$log" 2>&1 &
+            ;;
+        *) die "unknown broker transport: $transport" ;;
+    esac
+
+    local pid=$!
+    disown "$pid" >/dev/null 2>&1 || true
+    printf '%s\n' "$pid" > "$pid_file"
+    log_msg "broker started pid=$pid transport=$transport env=$env_name workdir=$workdir"
+}
+
+main() {
+    [[ $# -gt 0 ]] || { usage >&2; exit 1; }
+    case "$1" in
+        -h|--help) usage ;;
+        start) shift; start_broker "$@" ;;
+        stop)
+            shift
+            [[ "${1:-}" == "--pid-file" ]] || die "stop requires --pid-file"
+            stop_pid_file "${2:?--pid-file requires a value}"
+            ;;
+        serve-one) serve_one ;;
+        serve-filesystem) serve_filesystem ;;
+        *) die "unknown command: $1" ;;
+    esac
+}
+
+# Guarded so the tests can source this file for its functions.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

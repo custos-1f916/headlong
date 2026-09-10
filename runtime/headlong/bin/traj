@@ -1,0 +1,2206 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# traj — Trajectory operations (single-file and tree).
+# Operates on a .jsonl trajectory file identified by --traj_dir + positional ID
+# or $TRAJ_DIR + $TRAJ_ID env vars.
+#
+# A trajectory's ID is the UUID step_id of its first step. Filenames embed the
+# first 8 hex chars: YYYY-MM-DD-HH-MM-SS_<hex8>_<slug>.jsonl
+
+# ---------------------------------------------------------------------------
+# Defaults & constants
+# ---------------------------------------------------------------------------
+
+STDOUT_INLINE_LIMIT="${SHELLM_STDOUT_INLINE_LIMIT:-4096}"
+
+die() { printf 'traj: error: %s\n' "$*" >&2; exit 1; }
+
+# Colors (disabled if stdout is not a tty, unless forced)
+if [[ -t 1 || "${CLICOLOR_FORCE:-0}" != "0" ]]; then
+    _c_tree=$'\033[36m'; _c_id=$'\033[1;33m'; _c_step=$'\033[32m'; _c_dim=$'\033[2m'; _c_fork=$'\033[35m'; _c_reset=$'\033[0m'
+else
+    _c_tree="" _c_id="" _c_step="" _c_dim="" _c_fork="" _c_reset=""
+fi
+
+usage() {
+    cat <<'EOF'
+Usage: traj <command> [options]
+
+Trajectory is identified by (in priority order):
+  --traj_dir DIR <ID>           Directory + traj ID (UUID or hex prefix).
+  $TRAJ_DIR + $TRAJ_ID          Env vars for directory + ID.
+
+Commands:
+  All commands accept [ID] as an optional positional argument (trajectory ID,
+  UUID, or hex prefix). Falls back to $TRAJ_ID.
+
+  new [--traj_dir DIR] [--slug TEXT] [--field key=val ...]
+                            Create a new trajectory. Outputs two lines:
+                            line 1 = UUID (traj ID), line 2 = relative dir path.
+                            Extra --field values are written into the first step.
+
+  append [ID] [--field key=val ...]
+                            Append a step. Reads JSON from stdin, or builds from
+                            --field flags (must include --field type=X).
+                            Assigns UUID step_id, spills large fields to blobs.
+
+  fork [ID] [--child CHILD_ID] [--slug TEXT]
+                            Create a fork point: append a fork step to the
+                            current trajectory. Auto-creates child trajectory
+                            if --child not provided. Prints child traj ID.
+
+  merge <child_traj_id> [ID] [--content TEXT]
+                            Merge a child back: reads the last step of
+                            <child>, appends a merge step to the current
+                            trajectory. Prints merge step_id.
+
+  show <id> [--full] [--field F]
+                            Show a trajectory or step by ID. Searches all
+                            .jsonl files in traj_dir. If the ID is a
+                            trajectory's first step, shows traj metadata.
+                            Otherwise shows the step JSON.
+
+  tail [ID] [-n N] [-f] [--filter F] [-r] [--raw]
+                            Show recent steps (formatted by default).
+                            --filter field=val  Filter steps by field value.
+                            Multiple --filter flags are AND'd, comma values OR'd.
+                            -r/--recursive includes sub-trajectory steps.
+                            --raw for JSONL output.
+
+  search <pattern> [ID] [--field F] [-i] [-C N] [-E] [-r]
+                            Search step fields. Default field: all.
+                            -r, --recursive  Search sub-trajectories too.
+
+  count [ID]                Print step count.
+
+  last [ID] [--field KEY]   Print the last step as JSON. --field KEY extracts
+                            a single field value.
+
+  cat [ID] [--filter F] [-r] [--raw]
+                            Output all steps as JSONL to stdout.
+                            --filter field=val  Filter steps by field value.
+                            -r/--recursive includes sub-trajectory steps.
+                            --raw for JSONL output (default when piped).
+
+  exists [ID]               Exit 0 if trajectory exists and has steps.
+
+  path [ID]                 Print the resolved trajectory file path.
+
+  list [ID] [--parents N|all] [--children N|all] [--steps] [--json]
+                            List parents, self, and children as ASCII tree.
+                            --steps expands each trajectory to show its steps.
+                            Use --json for machine-readable output.
+
+
+  root [ID]                 Walk up parent links to find root. Print filename.
+
+  check [ID] [-r] [--fix]   Validate JSONL for malformed lines.
+                            -r checks sub-trajectories too.
+                            --fix removes bad lines in place.
+
+
+EOF
+    if [[ -n "${TRAJ_DIR:-}" ]]; then
+        printf 'TRAJ_DIR=%s\n' "$TRAJ_DIR"
+    fi
+    if [[ -n "${TRAJ_ID:-}" ]]; then
+        printf 'TRAJ_ID=%s\n' "$TRAJ_ID"
+    fi
+    printf '\n'
+    exit "${1:-0}"
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Generate a UUID step id.
+gen_step_id() {
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuidgen | tr '[:upper:]' '[:lower:]'
+    elif [[ -f /proc/sys/kernel/random/uuid ]]; then
+        cat /proc/sys/kernel/random/uuid
+    else
+        # Fallback: construct from /dev/urandom
+        local hex
+        hex=$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+        printf '%s-%s-%s-%s-%s\n' \
+            "${hex:0:8}" "${hex:8:4}" "${hex:12:4}" "${hex:16:4}" "${hex:20:12}"
+    fi
+}
+
+# Generate ISO 8601 timestamp with milliseconds, always UTC. Steps used to
+# be stamped in the writer's local zone, so one trajectory mixed offsets
+# depending on which component appended — every latency query then carried
+# a timezone footgun.
+_iso_ts() {
+    perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e '
+        my ($s,$us)=gettimeofday;
+        printf "%s.%03dZ\n", strftime("%Y-%m-%dT%H:%M:%S",gmtime($s)), $us/1000
+    ' 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+# Determine the next blob_id for a step by counting existing blobs.
+next_blob_id() {
+    local blob_dir="$1" step_id="$2"
+    local count=0
+    if [[ -d "$blob_dir" ]]; then
+        count=$(find "$blob_dir" -maxdepth 1 -name "${step_id}-*" \( -name '*.stdout' -o -name '*.stderr' \) 2>/dev/null | wc -l | tr -d ' ')
+    fi
+    printf '%06x' "$count"
+}
+
+# Byte length of a string (LC_ALL=C to count bytes, not chars).
+byte_len() {
+    printf '%s' "$1" | LC_ALL=C wc -c | tr -d ' '
+}
+
+# Resolve a traj_id within a traj_dir to a full file path.
+# Handles: exact path, .jsonl suffix, hex-prefix glob, UUID extraction.
+_resolve_traj_id() {
+    local traj_dir="$1" traj_id="$2"
+
+    # 1. Exact path (e.g., trajectory.jsonl, 30784dbe-root/trajectory.jsonl, or legacy flat file)
+    if [[ -f "$traj_dir/$traj_id" ]]; then
+        printf '%s\n' "$traj_dir/$traj_id"
+        return
+    fi
+
+    # 2. Directory-based: $traj_dir/$traj_id/trajectory.jsonl
+    if [[ -f "$traj_dir/$traj_id/trajectory.jsonl" ]]; then
+        printf '%s\n' "$traj_dir/$traj_id/trajectory.jsonl"
+        return
+    fi
+
+    # 3. UUID handling: extract first segment as hex prefix for glob matching.
+    local hex_prefix="$traj_id"
+    if [[ "$traj_id" == *-*-*-*-* ]]; then
+        hex_prefix="${traj_id%%-*}"
+    fi
+
+    # 4. Directory glob: find directories named <hex_prefix>-*
+    local match
+    match=$(find "$traj_dir" -type d -name "${hex_prefix}-*" 2>/dev/null | head -1)
+    if [[ -n "$match" && -f "$match/trajectory.jsonl" ]]; then
+        printf '%s\n' "$match/trajectory.jsonl"
+        return
+    fi
+
+    return 1
+}
+
+# Resolve trajectory file path from flags or env vars.
+# Flags override env vars; each of dir/id resolved independently.
+# Usage: require_traj_file "$traj_dir_opt" "$traj_id_opt" "$cmd_name"
+require_traj_file() {
+    local traj_dir_opt="$1" traj_id_opt="$2" cmd_name="$3"
+
+    # Merge: flags override env vars independently
+    local dir="${traj_dir_opt:-${TRAJ_DIR:-}}"
+    local id="${traj_id_opt:-${TRAJ_ID:-}}"
+
+    if [[ -n "$dir" && -n "$id" ]]; then
+        _resolve_traj_id "$dir" "$id" \
+            || die "$cmd_name: cannot resolve traj_id '$id' in '$dir'"
+        return
+    fi
+
+    die "$cmd_name: no trajectory specified. Use --traj_dir DIR <ID>, or set TRAJ_DIR + TRAJ_ID env vars."
+}
+
+# Extract the 8-char hex ID from a trajectory filename, or return the basename.
+# Handles both directory-based (trajectory.jsonl inside <hex8>-<slug>/) and legacy flat files.
+_parse_hex_id() {
+    local bn
+    bn=$(basename "$1")
+
+    # If the file is trajectory.jsonl, parse the parent directory name instead
+    if [[ "$bn" == "trajectory.jsonl" ]]; then
+        bn=$(basename "$(dirname "$1")")
+    else
+        bn="${bn%.jsonl}"
+    fi
+
+    # New format: <hex8>-<slug>
+    if [[ "$bn" =~ ^([0-9a-f]{8})- ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    else
+        printf '%s' "$bn"
+    fi
+}
+
+# Get a short summary for a trajectory file.
+_get_summary() {
+    local traj_file="$1"
+    local raw=""
+
+    # Try run-summary step
+    local summary_line
+    summary_line=$(jq -R -c 'fromjson? // empty | select(.type == "run-summary")' "$traj_file" 2>/dev/null | head -1)
+    if [[ -n "$summary_line" ]]; then
+        raw=$(printf '%s' "$summary_line" | jq -r '.tldr // empty')
+    fi
+
+    # Fallback: prompt step
+    if [[ -z "$raw" ]]; then
+        local prompt_line
+        prompt_line=$(jq -R -c 'fromjson? // empty | select(.type == "prompt")' "$traj_file" 2>/dev/null | head -1)
+        if [[ -n "$prompt_line" ]]; then
+            raw=$(printf '%s' "$prompt_line" | jq -r '.content // empty' | head -c 200)
+        fi
+    fi
+
+    # Fallback: shellm-run command
+    if [[ -z "$raw" ]]; then
+        local run_line
+        run_line=$(head -1 "$traj_file")
+        raw=$(printf '%s' "$run_line" | jq -r '.command // empty' 2>/dev/null | head -c 200)
+    fi
+
+    [[ -z "$raw" ]] && raw="(no summary)"
+
+    # Truncate long summaries
+    if [[ ${#raw} -gt 80 ]]; then
+        raw="${raw:0:77}..."
+    fi
+    printf '%s' "$raw"
+}
+
+# Check if a trajectory file is a root (first step is trajectory without parent).
+_is_root_file() {
+    local traj_file="$1"
+    [[ -f "$traj_file" ]] || return 1
+    local first_type first_parent
+    first_type=$(head -1 "$traj_file" | jq -r '.type // empty' 2>/dev/null)
+    if [[ "$first_type" == "trajectory" ]]; then
+        first_parent=$(head -1 "$traj_file" | jq -r '.parent_traj // .parent // empty' 2>/dev/null)
+        [[ -z "$first_parent" ]] && return 0 || return 1
+    fi
+    # Not a trajectory step — treat as root (legacy shellm-run files etc.)
+    return 0
+}
+
+# Resolve the parent traj file directly. Uses parent_ref (fast) or falls back to UUID search.
+# Prints the parent file path, or returns 1 if no parent.
+_resolve_parent_file() {
+    local traj_file="$1" traj_dir="$2"
+    [[ -f "$traj_file" ]] || return 1
+    local first_line
+    first_line=$(head -1 "$traj_file")
+    local parent_id parent_ref
+    parent_id=$(printf '%s' "$first_line" | jq -r '.parent_traj // .parent // empty' 2>/dev/null)
+    [[ -n "$parent_id" ]] || return 1
+
+    # Fast path: parent_traj_ref (or legacy parent_ref)
+    parent_ref=$(printf '%s' "$first_line" | jq -r '.parent_traj_ref // .parent_ref // empty' 2>/dev/null)
+    local my_dir
+    my_dir=$(dirname "$traj_file")
+    if [[ -n "$parent_ref" ]]; then
+        local candidate="$my_dir/$parent_ref"
+        local resolved=""
+        if [[ -f "$candidate" ]]; then
+            # Legacy: parent_ref points to file
+            resolved=$(cd "$my_dir" && realpath "$parent_ref" 2>/dev/null) || resolved="$candidate"
+        elif [[ -f "$candidate/trajectory.jsonl" ]]; then
+            # New: parent_traj_ref points to directory
+            resolved=$(cd "$my_dir" && realpath "$parent_ref/trajectory.jsonl" 2>/dev/null) || resolved="$candidate/trajectory.jsonl"
+        fi
+        if [[ -n "$resolved" ]]; then
+            printf '%s\n' "$resolved"
+            return 0
+        fi
+    fi
+
+    # Slow path: UUID search
+    _resolve_traj_id "$traj_dir" "$parent_id"
+}
+
+# ---------------------------------------------------------------------------
+# new — Create a new trajectory
+# ---------------------------------------------------------------------------
+
+cmd_new() {
+    local traj_dir_opt="" slug="unnamed"
+    local -a fields=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --traj_dir) traj_dir_opt="${2:?--traj_dir requires DIR}"; shift 2 ;;
+            --slug)     slug="${2:?--slug requires TEXT}"; shift 2 ;;
+            --field)    fields+=("${2:?--field requires key=val}"); shift 2 ;;
+            -*)         die "new: unknown option: $1" ;;
+            *)          die "new: unexpected argument: $1" ;;
+        esac
+    done
+
+    local traj_dir="${traj_dir_opt:-${TRAJ_DIR:-}}"
+    [[ -n "$traj_dir" ]] || die "new: --traj_dir or TRAJ_DIR required"
+
+    # Generate UUID for the new trajectory
+    local uuid
+    uuid=$(gen_step_id)
+    local hex8="${uuid%%-*}"
+
+    # Sanitize slug for directory name: collapse to single line, lowercase, safe chars only
+    local safe_slug
+    safe_slug=$(printf '%s' "$slug" | tr '\n\r\t' '---' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//' | head -c 60)
+    [[ -z "$safe_slug" ]] && safe_slug="unnamed"
+
+    # Directory name: <hex8>-<slug>
+    local dir_name="${hex8}-${safe_slug}"
+
+    # Determine base directory: if parent is specified, nest under parent's directory
+    local base_dir="$traj_dir"
+    local parent_id=""
+    local f
+    for f in "${fields[@]+"${fields[@]}"}"; do
+        local key="${f%%=*}" val="${f#*=}"
+        [[ "$key" == "parent_traj" ]] && parent_id="$val"
+    done
+
+    local parent_file=""
+    if [[ -n "$parent_id" ]]; then
+        # Resolve parent trajectory to find its directory
+        parent_file=$(_resolve_traj_id "$traj_dir" "$parent_id" 2>/dev/null) || true
+        if [[ -n "$parent_file" && -f "$parent_file" ]]; then
+            base_dir="$(dirname "$parent_file")"
+        fi
+    fi
+
+    local traj_dir_path="$base_dir/$dir_name"
+    mkdir -p "$traj_dir_path"
+    local traj_file="$traj_dir_path/trajectory.jsonl"
+
+    # Build first step JSON: type=trajectory + any extra --field values
+    local record='{"type":"trajectory"}'
+    for f in "${fields[@]+"${fields[@]}"}"; do
+        local key="${f%%=*}" val="${f#*=}"
+        record=$(printf '%s' "$record" | jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
+    done
+
+    # Add parent_traj_ref: relative path from this trajectory's dir to the parent's dir
+    if [[ -n "$parent_file" ]]; then
+        local parent_traj_ref
+        parent_traj_ref=$(python3 -c "import os.path; print(os.path.relpath('$(dirname "$parent_file")', '$traj_dir_path'))" 2>/dev/null) \
+            || parent_traj_ref=".."
+        record=$(printf '%s' "$record" | jq --arg ref "$parent_traj_ref" '. + {parent_traj_ref: $ref}')
+    fi
+
+    # Add step_id and timestamp
+    local iso_ts
+    iso_ts=$(_iso_ts)
+    record=$(printf '%s' "$record" | jq -c --arg id "$uuid" --arg ts "$iso_ts" '. + {step_id: $id, ts: $ts}')
+
+    printf '%s\n' "$record" > "$traj_file"
+
+    # Output: line 1 = UUID, line 2 = relative path from traj_dir to the directory
+    local rel_path="${traj_dir_path#$traj_dir/}"
+    printf '%s\n%s\n' "$uuid" "$rel_path"
+}
+
+# ---------------------------------------------------------------------------
+# append
+# ---------------------------------------------------------------------------
+
+cmd_append() {
+    local traj_dir_opt="" traj_id_opt=""
+    local -a fields=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --traj_dir)  traj_dir_opt="${2:?--traj_dir requires DIR}"; shift 2 ;;
+            --field)     fields+=("${2:?--field requires key=val}"); shift 2 ;;
+            -*)          die "append: unknown option: $1" ;;
+            *)
+                if [[ -z "$traj_id_opt" ]]; then
+                    traj_id_opt="$1"
+                else
+                    die "append: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    local traj_file
+    traj_file=$(require_traj_file "$traj_dir_opt" "$traj_id_opt" "append")
+
+    # Blob dir is sibling to the trajectory file
+    local blob_dir
+    blob_dir="$(dirname "$traj_file")/blobs"
+
+    # Build record: from --field flags or stdin
+    local record=""
+    if [[ ${#fields[@]} -gt 0 ]]; then
+        # Build JSON from --field flags
+        record='{}'
+        local f
+        for f in "${fields[@]}"; do
+            local key="${f%%=*}" val="${f#*=}"
+            record=$(printf '%s' "$record" | jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
+        done
+    else
+        # Read from stdin
+        record=$(cat)
+        [[ -n "$record" ]] || die "append: empty stdin (use --field to build step without stdin)"
+        printf '%s' "$record" | jq empty 2>/dev/null || die "append: invalid JSON on stdin"
+    fi
+
+    # Validate type field is present.
+    local step_type
+    step_type=$(printf '%s' "$record" | jq -r '.type // empty')
+    [[ -n "$step_type" ]] || die "append: step record must have a 'type' field"
+
+    # Auto-link steps written from inside a shellm run: the run exports
+    # SHELLM_RUN_STEP_ID into executed code's env, so observations (and any
+    # other ad-hoc appends) carry run_id without the writer knowing about
+    # runs. Never overwrites an explicit run_id. shellm-run and trajectory
+    # steps are excluded so a nested run's own header/child trajectory
+    # can't inherit the parent's run.
+    if [[ -n "${SHELLM_RUN_STEP_ID:-}" && "$step_type" != "shellm-run" && "$step_type" != "trajectory" ]]; then
+        record=$(printf '%s' "$record" | jq --arg rid "$SHELLM_RUN_STEP_ID" \
+            'if .run_id then . else . + {run_id: $rid} end')
+    fi
+
+    # Assign step id (preserve existing if caller pre-generated one).
+    local step_id
+    step_id=$(printf '%s' "$record" | jq -r '.step_id // empty')
+    [[ -z "$step_id" ]] && step_id=$(gen_step_id)
+
+    # Add step_id and ts.
+    local iso_ts
+    iso_ts=$(_iso_ts)
+    record=$(printf '%s' "$record" | jq --arg id "$step_id" --arg ts "$iso_ts" '. + {step_id: $id, ts: $ts}')
+
+    # Process stdout: spill if over limit.
+    local stdout_val
+    stdout_val=$(printf '%s' "$record" | jq -r '.stdout // empty')
+    local stdout_bytes
+    stdout_bytes=$(byte_len "$stdout_val")
+
+    if [[ "$stdout_bytes" -gt "$STDOUT_INLINE_LIMIT" ]] && [[ -n "$stdout_val" ]]; then
+        mkdir -p "$blob_dir"
+        local blob_id
+        blob_id=$(next_blob_id "$blob_dir" "$step_id")
+        local blob_file="$blob_dir/${step_id}-${blob_id}.stdout"
+        local blob_ref="blobs/${step_id}-${blob_id}.stdout"
+
+        local tmp_blob
+        tmp_blob=$(mktemp "$blob_dir/.tmp.XXXXXX")
+        printf '%s' "$stdout_val" > "$tmp_blob"
+        sync "$tmp_blob" 2>/dev/null || true
+        mv "$tmp_blob" "$blob_file"
+
+        local inline_val
+        # param-expansion, not printf|head -c: the latter SIGPIPEs under pipefail
+        # when the value exceeds the pipe buffer (~64KB), which made traj append
+        # exit 141 and take the shellm run down with it. See
+        # design/monolith_run_health.md B1.
+        inline_val=${stdout_val:0:$STDOUT_INLINE_LIMIT}
+
+        record=$(printf '%s' "$record" | jq \
+            --arg stdout "$inline_val" \
+            --arg ref "$blob_ref" \
+            --argjson bytes "$stdout_bytes" \
+            '. + {stdout: $stdout, stdout_ref: $ref, stdout_bytes: $bytes, stdout_truncated: true}')
+    fi
+
+    # Process stderr: spill if over limit.
+    local stderr_val
+    stderr_val=$(printf '%s' "$record" | jq -r '.stderr // empty')
+    local stderr_bytes
+    stderr_bytes=$(byte_len "$stderr_val")
+
+    if [[ "$stderr_bytes" -gt "$STDOUT_INLINE_LIMIT" ]] && [[ -n "$stderr_val" ]]; then
+        mkdir -p "$blob_dir"
+        local blob_id
+        blob_id=$(next_blob_id "$blob_dir" "$step_id")
+        local blob_file="$blob_dir/${step_id}-${blob_id}.stderr"
+        local blob_ref="blobs/${step_id}-${blob_id}.stderr"
+
+        local tmp_blob
+        tmp_blob=$(mktemp "$blob_dir/.tmp.XXXXXX")
+        printf '%s' "$stderr_val" > "$tmp_blob"
+        sync "$tmp_blob" 2>/dev/null || true
+        mv "$tmp_blob" "$blob_file"
+
+        local inline_val
+        inline_val=${stderr_val:0:$STDOUT_INLINE_LIMIT}
+
+        record=$(printf '%s' "$record" | jq \
+            --arg stderr "$inline_val" \
+            --arg ref "$blob_ref" \
+            --argjson bytes "$stderr_bytes" \
+            '. + {stderr: $stderr, stderr_ref: $ref, stderr_bytes: $bytes, stderr_truncated: true}')
+    fi
+
+    # Append row to file (compact, one line).
+    mkdir -p "$(dirname "$traj_file")"
+    local compact
+    compact=$(printf '%s' "$record" | jq -c .)
+
+    # Serialize appends across processes: a multi-KB append is several
+    # write() syscalls, and concurrent writers (parallel thinkers/shellm
+    # runs) can interleave mid-line and corrupt the JSONL. mkdir is the
+    # portable atomic lock primitive (macOS has no flock); it also works
+    # across Docker bind mounts since it's the same filesystem path.
+    local lock_dir="${traj_file}.lock"
+    local _lock_tries=0
+    until mkdir "$lock_dir" 2>/dev/null; do
+        _lock_tries=$((_lock_tries + 1))
+        # Every ~0.5s of spinning, steal locks older than 5s — the holder
+        # was killed mid-append (e.g. thinkers stop kills process trees).
+        if [[ $((_lock_tries % 50)) -eq 0 ]]; then
+            local _now _lock_mtime
+            _now=$(date +%s)
+            _lock_mtime=$(stat -f %m "$lock_dir" 2>/dev/null || stat -c %Y "$lock_dir" 2>/dev/null) || _lock_mtime="$_now"
+            if [[ $((_now - _lock_mtime)) -ge 5 ]]; then
+                rmdir "$lock_dir" 2>/dev/null || true
+            fi
+        fi
+        sleep 0.01
+    done
+    printf '%s\n' "$compact" >> "$traj_file"
+    rmdir "$lock_dir" 2>/dev/null || true
+
+    # Print the assigned step_id so the caller knows it.
+    printf '%s\n' "$step_id"
+}
+
+# ---------------------------------------------------------------------------
+# show — unified display for trajectories and steps
+# ---------------------------------------------------------------------------
+
+# Find a step_id across all .jsonl files in a directory.
+# Returns: line 1 = traj_file, line 2 = the JSON row (compact)
+_find_step_in_dir() {
+    local traj_dir="$1" step_id="$2"
+
+    # First, try to resolve as a trajectory ID (fast path via filename glob)
+    local traj_file
+    traj_file=$(_resolve_traj_id "$traj_dir" "$step_id" 2>/dev/null)
+    if [[ -n "$traj_file" && -f "$traj_file" ]]; then
+        local row
+        row=$(head -1 "$traj_file")
+        printf '%s\n%s\n' "$traj_file" "$row"
+        return 0
+    fi
+
+    # Slow path: scan all .jsonl files for the step_id (exact or prefix match)
+    local f
+    while IFS= read -r f; do
+        [[ -f "$f" ]] || continue
+        local row
+        row=$(jq -R -c --arg id "$step_id" 'fromjson? // empty | select(.step_id == $id or (.step_id // "" | startswith($id)))' "$f" 2>/dev/null | head -1)
+        if [[ -n "$row" ]]; then
+            printf '%s\n%s\n' "$f" "$row"
+            return 0
+        fi
+    done < <(find "$traj_dir" -name '*.jsonl' -not -path '*/blobs/*' 2>/dev/null)
+
+    return 1
+}
+
+cmd_show() {
+    local target_id="" full=0 field="" traj_dir_opt="" pretty=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --full)      full=1; shift ;;
+            --pretty)    pretty=1; shift ;;
+            --field)     field="${2:?--field requires a value}"; shift 2 ;;
+            --traj_dir)  traj_dir_opt="${2:?--traj_dir requires DIR}"; shift 2 ;;
+            -*)          die "show: unknown option: $1" ;;
+            *)
+                if [[ -z "$target_id" ]]; then
+                    target_id="$1"
+                else
+                    die "show: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    [[ -n "$target_id" ]] || die "show requires <id> (trajectory or step UUID)"
+
+    local traj_dir="${traj_dir_opt:-${TRAJ_DIR:-}}"
+    [[ -n "$traj_dir" ]] || die "show: --traj_dir or TRAJ_DIR required"
+
+    # Search for the ID across all traj files in traj_dir
+    local result
+    result=$(_find_step_in_dir "$traj_dir" "$target_id") \
+        || die "show: id '$target_id' not found in '$traj_dir'"
+
+    local traj_file row
+    traj_file=$(head -1 <<< "$result")
+    row=$(tail -n +2 <<< "$result")
+
+    [[ -n "$row" ]] || die "show: id '$target_id' not found"
+
+    # Check if this is a trajectory's first step — if so, show traj info
+    local row_type
+    row_type=$(printf '%s' "$row" | jq -r '.type // empty')
+    local row_step_id
+    row_step_id=$(printf '%s' "$row" | jq -r '.step_id // empty')
+    local first_step_id
+    first_step_id=$(head -1 "$traj_file" | jq -r '.step_id // empty' 2>/dev/null)
+
+    if [[ "$row_type" == "trajectory" && "$row_step_id" == "$first_step_id" && -z "$field" && "$full" -eq 0 ]]; then
+        # Show trajectory metadata (like info)
+        printf 'File:   %s\n' "$traj_file"
+        local step_count
+        step_count=$(wc -l < "$traj_file" | tr -d ' ')
+        printf 'Steps:  %d\n' "$step_count"
+
+        local first_ts
+        first_ts=$(printf '%s' "$row" | jq -r '.ts // empty')
+        printf 'ID:     %s\n' "$row_step_id"
+        printf 'Start:  %s\n' "$first_ts"
+
+        local last_line last_ts
+        last_line=$(tail -1 "$traj_file")
+        last_ts=$(printf '%s' "$last_line" | jq -r '.ts // empty' 2>/dev/null)
+        printf 'Last:   %s\n' "$last_ts"
+
+        local parent
+        parent=$(printf '%s' "$row" | jq -r '.parent_traj // .parent // empty')
+        if [[ -z "$parent" ]]; then
+            printf 'Root:   yes\n'
+        else
+            printf 'Parent: %s\n' "$parent"
+        fi
+
+        local summary
+        summary=$(_get_summary "$traj_file")
+        printf 'Summary: %s\n' "$summary"
+        return
+    fi
+
+    local blob_dir
+    blob_dir="$(dirname "$traj_file")/blobs"
+
+    # If --full, replace truncated stdout/stderr with blob contents.
+    if [[ "$full" -eq 1 ]]; then
+        local stdout_ref
+        stdout_ref=$(printf '%s' "$row" | jq -r '.stdout_ref // empty')
+        if [[ -n "$stdout_ref" ]]; then
+            local blob_path
+            blob_path="$(dirname "$traj_file")/$stdout_ref"
+            if [[ -f "$blob_path" ]]; then
+                local full_stdout
+                full_stdout=$(cat "$blob_path")
+                row=$(printf '%s' "$row" | jq --arg v "$full_stdout" '.stdout = $v | del(.stdout_truncated)')
+            fi
+        fi
+        local stderr_ref
+        stderr_ref=$(printf '%s' "$row" | jq -r '.stderr_ref // empty')
+        if [[ -n "$stderr_ref" ]]; then
+            local blob_path
+            blob_path="$(dirname "$traj_file")/$stderr_ref"
+            if [[ -f "$blob_path" ]]; then
+                local full_stderr
+                full_stderr=$(cat "$blob_path")
+                row=$(printf '%s' "$row" | jq --arg v "$full_stderr" '.stderr = $v | del(.stderr_truncated)')
+            fi
+        fi
+    fi
+
+    # If --field, emit just that field's raw bytes.
+    if [[ -n "$field" ]]; then
+        printf '%s' "$row" | jq -r ".${field} // empty"
+        return
+    fi
+
+    # Pretty-print the step.
+    if [[ "$pretty" -eq 1 ]]; then
+        printf '%s' "$row" | jq -r '
+            to_entries | .[] |
+            if (.value | type) == "string" then
+                "\u001b[36m\(.key)\u001b[0m:\n\(.value)\n"
+            else
+                "\u001b[36m\(.key)\u001b[0m: \(.value | tojson)\n"
+            end
+        '
+    else
+        printf '%s' "$row" | jq .
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# tail
+# ---------------------------------------------------------------------------
+
+# Recursively collect all trajectory files reachable via fork steps.
+# Outputs one file path per line (root first, children in fork order).
+_collect_recursive_files() {
+    local traj_file="$1"
+    [[ -f "$traj_file" ]] || return 0
+    printf '%s\n' "$traj_file"
+
+    local parent_dir fork_lines
+    parent_dir=$(dirname "$traj_file")
+    fork_lines=$(jq -R -c 'fromjson? // empty | select(.type == "fork")' "$traj_file" 2>/dev/null) || true
+    [[ -z "$fork_lines" ]] && return 0
+
+    while IFS= read -r fork_line; do
+        local child_ref child_file=""
+        child_ref=$(printf '%s' "$fork_line" | jq -r '.child_ref // empty')
+        if [[ -n "$child_ref" && -f "$parent_dir/$child_ref" ]]; then
+            child_file="$parent_dir/$child_ref"
+        else
+            local child_id
+            child_id=$(printf '%s' "$fork_line" | jq -r '.child // empty')
+            [[ -n "$child_id" ]] || continue
+            child_file=$(_resolve_traj_id "$(dirname "$parent_dir")" "$child_id" 2>/dev/null) || continue
+        fi
+
+        [[ -f "$child_file" ]] && _collect_recursive_files "$child_file"
+    done <<< "$fork_lines"
+}
+
+# Emit every step from the caller's $_all_files, one "epoch<TAB>json" line
+# per step tagged with its file's _traj_hex, filtered by the caller's
+# $_filter_json and sorted by timestamp. Shared by cmd_tail and cmd_cat.
+_sorted_tree_steps() {
+    local f hex
+    while IFS= read -r f; do
+        [[ -f "$f" ]] || continue
+        hex=$(_parse_hex_id "$f")
+        jq -R -r --arg h "$hex" --argjson filters "$_filter_json" '
+            fromjson? // empty |
+            def matches_filters($fs):
+                . as $step |
+                ($fs | length == 0) or all($fs[];
+                    .key as $k | .vals as $vs |
+                    ($step[$k] // null) as $fv |
+                    ($vs | any(. as $v | $v == ($fv | tostring)))
+                );
+            # Sort key, in integer milliseconds. Three things it has to get
+            # right, none of which it did:
+            #   - capture() matches the legacy "<datetime><numeric offset>"
+            #     spelling. This arm is the catch-all for everything else,
+            #     which for a stamp traj writes means UTC ending in "Z" (or
+            #     the RFC-3339 lowercase "z"). Strip that before the "Z"
+            #     added back below; otherwise fromdateiso8601 is handed
+            #     "...:18ZZ", errors on every step _iso_ts ever wrote, and -r
+            #     sorts an empty stream.
+            #   - keep the milliseconds. A trajectory writes many steps per
+            #     second, so a whole-second key ties for most of them and
+            #     sort(1) falls back to comparing the JSON text: an order that
+            #     is neither chronological nor the same on GNU and BSD.
+            #   - a stamp that will not parse must not delete the step. Every
+            #     other date read in the tree already guards this (bin/chat,
+            #     thinkers/_lib/common.sh, bin/thinkers); this one did not.
+            # The milliseconds are folded into an integer rather than left as
+            # a decimal, so the numeric sort below cannot depend on the
+            # locale decimal point.
+            def to_epoch:
+                tostring as $raw |
+                ((($raw | capture("\\.(?<f>[0-9]+)") | .f) // "") + "000")[0:3] as $ms |
+                ($raw | sub("\\.[0-9]+"; "")) |
+                (capture("^(?<dt>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2})(?<sign>[+-])(?<oh>\\d{2}):?(?<om>\\d{2})$") //
+                 {dt: sub("[Zz][[:space:]]*$"; ""), sign: "+", oh: "00", om: "00"}) |
+                ((.oh | tonumber) * 3600 + (.om | tonumber) * 60) as $off |
+                ((.dt + "Z") | try fromdateiso8601 catch 0) as $local_epoch |
+                (if .sign == "-" then ($local_epoch + $off) else ($local_epoch - $off) end) |
+                (. * 1000 + ($ms | tonumber)) |
+                tostring;
+            . + {_traj_hex: $h} | select(matches_filters($filters))
+            | ((.ts // .timestamp // "0") | to_epoch) + "\t" + tojson
+        ' "$f" 2>/dev/null || true
+    done <<< "$_all_files" \
+        | sort -t$'\t' -k1,1n
+}
+
+# Shared by cmd_tail and cmd_cat: build the jq filter array from the
+# caller's filters[], auto-detect format/color, and set the color palette.
+# Assigns the caller's pre-declared locals (_filter_json, format, use_color,
+# c_*) via bash dynamic scoping.
+_setup_stream_format() {
+    _filter_json='[]'
+    local _f
+    for _f in "${filters[@]+"${filters[@]}"}"; do
+        local _fk="${_f%%=*}" _fv="${_f#*=}"
+        _filter_json=$(printf '%s' "$_filter_json" | jq -c --arg k "$_fk" --arg v "$_fv" \
+            '. + [{key: $k, vals: ($v | split(","))}]')
+    done
+
+    # Auto-detect formatting: format on TTY, raw when piped
+    format=1
+    if [[ "$raw" -eq 1 ]]; then
+        format=0
+    elif [[ "$force_format" -eq 1 ]]; then
+        format=1
+    elif [[ ! -t 1 && "${CLICOLOR_FORCE:-0}" == "0" ]]; then
+        format=0
+    fi
+
+    # Auto-detect color
+    if [[ "$use_color" -eq -1 ]]; then
+        if [[ "$format" -eq 1 && ( -t 1 || "${CLICOLOR_FORCE:-0}" != "0" ) ]]; then
+            use_color=1
+        else
+            use_color=0
+        fi
+    fi
+
+    # Color palette
+    c_reset="" c_dim=""
+    c_thought="" c_action="" c_observation="" c_human="" c_agent="" c_tp="" c_shell="" c_meta=""
+    if [[ "$use_color" -eq 1 ]]; then
+        c_reset=$'\033[0m'
+        c_dim=$'\033[2m'
+        c_thought=$'\033[36m'     # cyan
+        c_action=$'\033[33m'      # yellow
+        c_observation=$'\033[32m' # green
+        c_human=$'\033[1;37m'     # bold white
+        c_agent=$'\033[35m'       # magenta
+        c_tp=$'\033[34m'          # blue
+        c_shell=$'\033[2m'        # dim
+        c_meta=$'\033[2m'         # dim
+    fi
+}
+
+# Emit a single JSON line: formatted, or raw with jq-side filtering. Shared
+# by cmd_tail and cmd_cat; reads the caller's locals (format, _filter_json)
+# via dynamic scoping.
+_process_line() {
+    local line="$1"
+    if [[ "$format" -eq 1 ]]; then
+        _format_line "$line"
+    else
+        # Raw mode: apply filters via jq if set
+        if [[ "$_filter_json" != "[]" ]]; then
+            printf '%s' "$line" | jq -c --argjson filters "$_filter_json" '
+                def matches_filters($fs):
+                    . as $step |
+                    ($fs | length == 0) or all($fs[];
+                        .key as $k | .vals as $vs |
+                        ($step[$k] // null) as $fv |
+                        ($vs | any(. as $v | $v == ($fv | tostring)))
+                    );
+                select(matches_filters($filters))
+            ' 2>/dev/null || true
+        else
+            printf '%s\n' "$line"
+        fi
+    fi
+}
+
+# Format a single JSON line. Shared by cmd_tail and cmd_cat; reads the
+# caller's locals (color palette, all_fields, _filter_json) via bash
+# dynamic scoping.
+_format_line() {
+    local line="$1"
+    [[ -z "$line" ]] && return 0
+
+    if [[ "$all_fields" -eq 1 ]]; then
+        # -a mode: show timestamp step_id colored [field=val ...] <content>
+        local _all_out
+        _all_out=$(printf '%s' "$line" | jq -r --argjson filters "$_filter_json" '
+            def matches_filters($fs):
+                . as $step |
+                ($fs | length == 0) or all($fs[];
+                    .key as $k | .vals as $vs |
+                    ($step[$k] // null) as $fv |
+                    ($vs | any(. as $v | $v == ($fv | tostring)))
+                );
+            select(matches_filters($filters)) |
+            ((.ts // .timestamp // "0") | tostring) + "\t" +
+            (.step_id // "") + "\t" +
+            (.type // "") + "\t" +
+            ((.content // "") | tostring | gsub("\n"; "\\n") | gsub("\t"; "\\t")) + "\t" +
+            ([to_entries[] | select(.key != "ts" and .key != "timestamp" and .key != "_traj_hex" and .key != "content" and .key != "step_id") |
+                .key + "=" + (.value | tostring | gsub("\n"; "\\n") | gsub("\t"; "\\t"))] | join(" "))
+        ' 2>/dev/null) || return 0
+        [[ -z "$_all_out" ]] && return 0
+
+        local _ts _step_id _type _content _meta
+        _ts=$(printf '%s' "$_all_out" | cut -f1)
+        _step_id=$(printf '%s' "$_all_out" | cut -f2)
+        _type=$(printf '%s' "$_all_out" | cut -f3)
+        _content=$(printf '%s' "$_all_out" | cut -f4)
+        _meta=$(printf '%s' "$_all_out" | cut -f5-)
+
+        # Extract date + time from timestamp
+        local time_display="----/--/-- --:--:--"
+        if [[ "$_ts" =~ ^[0-9]{9,10}$ ]]; then
+            time_display=$(date -r "$_ts" +"%Y/%m/%d %H:%M:%S" 2>/dev/null) || time_display="----/--/-- --:--:--"
+        elif [[ "$_ts" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
+            time_display="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]} ${BASH_REMATCH[4]}"
+        elif [[ "$_ts" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2}) ]]; then
+            time_display="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]} --:--:--"
+        fi
+
+        # Color by type (same scheme as non -a)
+        local color=""
+        case "$_type" in
+            thought|reasoning)  color="$c_thought" ;;
+            action)             color="$c_action" ;;
+            observation)        color="$c_observation" ;;
+            human-msg|message|feedback) color="$c_human" ;;
+            agent-run|agent-msg|final) color="$c_agent" ;;
+            fork|merge|trajectory) color="$c_agent" ;;
+            tp:*|tp-thought)    color="$c_tp" ;;
+            shell-output)       color="$c_shell" ;;
+            shellm-run|run-summary|prompt) color="$c_meta" ;;
+        esac
+
+        # Print: dim(timestamp step_id) color([meta]) content
+        if [[ -n "$_meta" ]]; then
+            printf '%s%s %s%s %s[%s]%s %s\n' \
+                "$c_dim" "$time_display" "$_step_id" "$c_reset" \
+                "$color" "$_meta" "$c_reset" \
+                "$_content"
+        else
+            printf '%s%s %s%s %s\n' \
+                "$c_dim" "$time_display" "$_step_id" "$c_reset" \
+                "$_content"
+        fi
+        return 0
+    fi
+
+    local entry_type content source ts step_id traj_hex
+    { read -r entry_type
+      IFS= read -r content
+      read -r source
+      read -r ts
+      read -r step_id
+      read -r traj_hex
+    } < <(
+        printf '%s' "$line" | jq -r --argjson filters "$_filter_json" '
+            def matches_filters($fs):
+                . as $step |
+                ($fs | length == 0) or all($fs[];
+                    .key as $k | .vals as $vs |
+                    ($step[$k] // null) as $fv |
+                    ($vs | any(. as $v | $v == ($fv | tostring)))
+                );
+            def preview:
+                if   .type == "reasoning"    then
+                    ((.content // .thought // "")[0:100]) +
+                    (if .cmd then " | " + (.cmd | gsub("\n"; " ") | gsub("\\s+"; " "))[0:120] else "" end)
+                elif .type == "shell-output"  then (.stdout // "")
+                elif .type == "shellm-run"    then (.command // "")
+                elif .type == "run-summary"   then (.tldr // "")
+                elif .type == "final"         then ((.content // .thought) // "")
+                elif .type == "fork"          then ("-> " + (.child // ""))
+                elif .type == "trajectory"    then (if (.parent_traj // .parent) then ("<- parent: " + (.parent_traj // .parent)) else ("root" + (if .identity_dir then " (" + .identity_dir + ")" else "" end)) end)
+                elif .type == "merge"         then ("<- " + (.content // .from_traj // ""))
+                else (.content // "")
+                end;
+            select(matches_filters($filters)) |
+            (.type // "unknown"),
+            (preview | if . == "" then "-" else (split("\n") | if length > 1 then .[0] + "..." else .[0] end) end | gsub("\t"; " ")),
+            (.source // "-"),
+            ((.ts // .timestamp // "0") | tostring),
+            (.step_id // "-"),
+            (._traj_hex // "-")
+        ' 2>/dev/null
+    )
+    [[ -n "$entry_type" ]] || return 0
+
+    # Normalize placeholders back to empty
+    [[ "$content" == "-" ]] && content=""
+    [[ "$source" == "-" ]] && source=""
+    [[ "$step_id" == "-" ]] && step_id=""
+    [[ "$traj_hex" == "-" ]] && traj_hex=""
+
+    # Extract date + time from timestamp
+    local time_display="----/--/-- --:--:--"
+    if [[ "$ts" =~ ^[0-9]{9,10}$ ]]; then
+        time_display=$(date -r "$ts" +"%Y/%m/%d %H:%M:%S" 2>/dev/null) || time_display="----/--/-- --:--:--"
+    elif [[ "$ts" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
+        time_display="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]} ${BASH_REMATCH[4]}"
+    elif [[ "$ts" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2}) ]]; then
+        time_display="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]} --:--:--"
+    fi
+
+    # Color by type
+    local color=""
+    case "$entry_type" in
+        thought|reasoning)  color="$c_thought" ;;
+        action)             color="$c_action" ;;
+        observation)        color="$c_observation" ;;
+        human-msg|message|feedback) color="$c_human" ;;
+        agent-run|agent-msg|final) color="$c_agent" ;;
+        fork|merge|trajectory) color="$c_agent" ;;
+        tp:*|tp-thought)    color="$c_tp" ;;
+        shell-output)       color="$c_shell" ;;
+        shellm-run|run-summary|prompt) color="$c_meta" ;;
+    esac
+
+    local type_tag="$entry_type"
+    [[ -n "$source" ]] && type_tag="$entry_type, $source"
+
+    local short_id="${step_id:0:8}"
+    local traj_tag=""
+    [[ -n "$traj_hex" ]] && traj_tag="${c_dim}${traj_hex}/${c_reset}"
+
+    printf '%s%s%s %s%s%s%s %s[%s]%s %s\n' \
+        "$c_dim" "$time_display" "$c_reset" \
+        "$traj_tag" \
+        "$c_dim" "$short_id" "$c_reset" \
+        "$color" "$type_tag" "$c_reset" \
+        "$content"
+}
+
+cmd_tail() {
+    local n=10 follow=0 raw=0 force_format=0 use_color=-1 traj_dir_opt="" traj_id_opt="" recursive=0 all_fields=0
+    local -a filters=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n)          n="${2:?-n requires a number}"; shift 2 ;;
+            -f)          follow=1; shift ;;
+            --traj_dir)  traj_dir_opt="${2:?--traj_dir requires DIR}"; shift 2 ;;
+            --raw)       raw=1; shift ;;
+            --format)    force_format=1; shift ;;
+            --no-color)  use_color=0; shift ;;
+            --filter)    filters+=("${2:?--filter requires field=value}"); shift 2 ;;
+            -a|--all)    all_fields=1; shift ;;
+            -r|--recursive) recursive=1; shift ;;
+            -h|--help)
+                cat <<'TAILHELP'
+traj tail — Stream trajectory steps
+
+Usage:
+  traj tail [ID] [-n N] [-f]        Show recent steps
+  traj tail [ID] --filter field=val  Filter steps
+  traj tail [ID] -r                  Include sub-trajectory steps
+
+Options:
+  [ID]               Trajectory ID (positional)
+  -n N               Last N steps (default: 10)
+  -f                 Follow new steps as they arrive
+  -a, --all          Show all fields per step (not just type + content)
+  -r, --recursive    Include steps from all sub-trajectories, interleaved
+  --traj_dir DIR     Trajectory directory
+  --filter field=val Filter steps (e.g. --filter type=thought,merge).
+                     Multiple --filter flags are AND'd.
+                     Comma-separated values within a filter are OR'd.
+  --raw              Raw JSONL (default when piped)
+  --format           Force formatted output (even when piped)
+  --no-color         Disable ANSI colors
+  -h, --help         Show this help
+
+Environment:
+  TRAJ_DIR + TRAJ_ID   Default trajectory
+TAILHELP
+                return 0
+                ;;
+            -*)  die "tail: unknown option: $1" ;;
+            *)
+                if [[ "$1" =~ ^[0-9]+$ ]]; then
+                    n="$1"
+                elif [[ -z "$traj_id_opt" ]]; then
+                    traj_id_opt="$1"
+                else
+                    die "tail: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    local traj_file
+    traj_file=$(require_traj_file "$traj_dir_opt" "$traj_id_opt" "tail")
+
+    # recursive + follow is handled below
+
+    # Filter array, format/color detection, palette (shared helper)
+    local _filter_json format
+    local c_reset c_dim c_thought c_action c_observation c_human c_agent c_tp c_shell c_meta
+    _setup_stream_format
+
+    # Exit cleanly on SIGINT/SIGPIPE
+    trap 'exit 0' INT PIPE
+
+    if [[ "$recursive" -eq 1 ]]; then
+        [[ -f "$traj_file" ]] || die "tail: trajectory file not found: $traj_file"
+        # Collect all trajectory files in the tree
+        local _all_files
+        _all_files=$(_collect_recursive_files "$traj_file") || true
+        [[ -z "$_all_files" ]] && return 0
+
+        local f hex  # also used by the follow block below
+        _sorted_tree_steps \
+            | tail -n "$n" \
+            | cut -f2- \
+            | while IFS= read -r line; do
+                _process_line "$line"
+            done
+
+        # Follow all files in the tree
+        if [[ "$follow" -eq 1 ]]; then
+            local -a _tail_pids=()
+            while IFS= read -r f; do
+                [[ -f "$f" ]] || continue
+                hex=$(_parse_hex_id "$f")
+                tail -n 0 -F "$f" 2>/dev/null | while IFS= read -r line; do
+                    local _tagged
+                    _tagged=$(printf '%s' "$line" | jq -c --arg h "$hex" '. + {_traj_hex: $h}' 2>/dev/null) || continue
+                    _process_line "$_tagged"
+                done &
+                _tail_pids+=($!)
+            done <<< "$_all_files"
+            # Wait for any signal; clean up on exit
+            # shellcheck disable=SC2154  # p is the trap body's own loop variable
+            trap 'for p in "${_tail_pids[@]}"; do kill "$p" 2>/dev/null; done; exit 0' INT PIPE TERM
+            wait
+        fi
+    elif [[ "$follow" -eq 1 ]]; then
+        # Replay then follow (single file)
+        if [[ -f "$traj_file" ]] && [[ "$n" -gt 0 ]]; then
+            tail -n "$n" "$traj_file" | while IFS= read -r line; do
+                _process_line "$line"
+            done
+        fi
+        # Wait for file to exist
+        while [[ ! -f "$traj_file" ]]; do
+            sleep 0.5
+        done
+        tail -n 0 -F "$traj_file" 2>/dev/null | while IFS= read -r line; do
+            _process_line "$line"
+        done
+    else
+        [[ -f "$traj_file" ]] || die "tail: trajectory file not found: $traj_file"
+        tail -n "$n" "$traj_file" | while IFS= read -r line; do
+            _process_line "$line"
+        done
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# search
+# ---------------------------------------------------------------------------
+
+cmd_search() {
+    local pattern="" field="all" case_flag="" context_lines=0 use_regex=0 traj_dir_opt="" traj_id_opt="" recursive=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --field)     field="${2:?--field requires a value}"; shift 2 ;;
+            --traj_dir)  traj_dir_opt="${2:?--traj_dir requires DIR}"; shift 2 ;;
+            -i)          case_flag="-i"; shift ;;
+            -C)          context_lines="${2:?-C requires a number}"; shift 2 ;;
+            -E)          use_regex=1; shift ;;
+            -r|--recursive) recursive=1; shift ;;
+            -*)          die "search: unknown option: $1" ;;
+            *)
+                if [[ -z "$pattern" ]]; then
+                    pattern="$1"
+                elif [[ -z "$traj_id_opt" ]]; then
+                    traj_id_opt="$1"
+                else
+                    die "search: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    [[ -n "$pattern" ]] || die "search requires <pattern>"
+
+    local traj_file
+    traj_file=$(require_traj_file "$traj_dir_opt" "$traj_id_opt" "search")
+    [[ -f "$traj_file" ]] || die "search: trajectory file not found: $traj_file"
+
+    # Search all non-metadata fields by default, or specific field.
+    local fields_to_search
+    case "$field" in
+        all) fields_to_search="content thought cmd stdout stderr" ;;
+        *)   fields_to_search="$field" ;;
+    esac
+
+    local grep_mode="-F"  # literal by default
+    [[ "$use_regex" -eq 1 ]] && grep_mode="-E"
+
+    local -a grep_args=("$grep_mode")
+    [[ -n "$case_flag" ]] && grep_args+=("$case_flag")
+    [[ "$context_lines" -gt 0 ]] && grep_args+=(-C "$context_lines")
+    grep_args+=(-n)  # line numbers
+
+    # Collect files to search
+    local _search_files
+    if [[ "$recursive" -eq 1 ]]; then
+        _search_files=$(_collect_recursive_files "$traj_file")
+    else
+        _search_files="$traj_file"
+    fi
+
+    while IFS= read -r _sf; do
+        [[ -f "$_sf" ]] || continue
+        local _traj_hex
+        _traj_hex=$(_parse_hex_id "$_sf")
+        local blob_base
+        blob_base="$(dirname "$_sf")"
+
+        # Iterate over each row in the trajectory.
+        while IFS= read -r row; do
+            local step_id
+            step_id=$(printf '%s' "$row" | jq -r '.step_id // empty')
+            [[ -n "$step_id" ]] || continue
+
+            for f in $fields_to_search; do
+                local content=""
+
+                # For stdout/stderr, check if there's a blob and use that for full search.
+                local ref_key="${f}_ref"
+                local ref_val
+                ref_val=$(printf '%s' "$row" | jq -r ".${ref_key} // empty" 2>/dev/null)
+
+                if [[ -n "$ref_val" ]] && [[ -f "$blob_base/$ref_val" ]]; then
+                    content=$(cat "$blob_base/$ref_val")
+                else
+                    content=$(printf '%s' "$row" | jq -r ".${f} // empty")
+                fi
+
+                [[ -n "$content" ]] || continue
+
+                # Search the content.
+                local matches
+                matches=$(printf '%s\n' "$content" | grep "${grep_args[@]}" -- "$pattern" 2>/dev/null || true)
+                [[ -n "$matches" ]] || continue
+
+                # Format output: <traj_hex>:<step>:<field>:<match> or <step>:<field>:<match>
+                while IFS= read -r match_line; do
+                    if [[ "$recursive" -eq 1 ]]; then
+                        printf '%s:%s:%s:%s\n' "$_traj_hex" "$step_id" "$f" "$match_line"
+                    else
+                        printf '%s:%s:%s\n' "$step_id" "$f" "$match_line"
+                    fi
+                done <<< "$matches"
+            done
+        done < "$_sf"
+    done <<< "$_search_files"
+}
+
+# ---------------------------------------------------------------------------
+# fork
+# ---------------------------------------------------------------------------
+
+cmd_fork() {
+    local child_id="" traj_dir_opt="" traj_id_opt="" slug="" fork_step_id=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --traj_dir)  traj_dir_opt="${2:?--traj_dir requires DIR}"; shift 2 ;;
+            --child)     child_id="${2:?--child requires CHILD_ID}"; shift 2 ;;
+            --slug)      slug="${2:?--slug requires TEXT}"; shift 2 ;;
+            --step-id)   fork_step_id="${2:?--step-id requires UUID}"; shift 2 ;;
+            -*)          die "fork: unknown option: $1" ;;
+            *)
+                if [[ -z "$traj_id_opt" ]]; then
+                    traj_id_opt="$1"
+                else
+                    die "fork: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Pre-generate fork step_id (used for cross-referencing in child's parent_step field)
+    [[ -z "$fork_step_id" ]] && fork_step_id=$(gen_step_id)
+
+    # Resolve parent traj file to compute relative path to child
+    local parent_file
+    parent_file=$(require_traj_file "$traj_dir_opt" "$traj_id_opt" "fork")
+    local parent_dir
+    parent_dir=$(dirname "$parent_file")
+
+    # Auto-create child trajectory if no --child provided
+    if [[ -z "$child_id" ]]; then
+        local -a new_args=(--traj_dir "$parent_dir")
+        [[ -n "$slug" ]] && new_args+=(--slug "$slug")
+        local parent_traj_id
+        parent_traj_id=$(head -1 "$parent_file" | jq -r '.step_id')
+        new_args+=(--field "parent_traj=$parent_traj_id")
+        new_args+=(--field "parent_step=$fork_step_id")
+        local new_output
+        new_output=$(cmd_new "${new_args[@]}")
+        child_id=$(head -1 <<< "$new_output")
+    fi
+
+    # Resolve child traj file for the relative ref
+    local search_dir="${TRAJ_DIR:-$parent_dir}"
+    local child_ref=""
+    local child_file
+    child_file=$(_resolve_traj_id "$search_dir" "$child_id" 2>/dev/null) || true
+    if [[ -z "$child_file" ]]; then
+        child_file=$(_resolve_traj_id "$parent_dir" "$child_id" 2>/dev/null) || true
+    fi
+    if [[ -n "$child_file" && -f "$child_file" ]]; then
+        child_ref=$(python3 -c "import os.path; print(os.path.relpath('$child_file', '$parent_dir'))" 2>/dev/null) || true
+    fi
+
+    # Build fork JSON with pre-generated step_id and child ref
+    local fork_json
+    fork_json=$(jq -nc --arg child "$child_id" --arg ref "$child_ref" --arg sid "$fork_step_id" \
+        '{type:"fork", child:$child, step_id:$sid} + (if $ref != "" then {child_ref:$ref} else {} end)')
+
+    # Append fork step to parent
+    local -a append_args=()
+    [[ -n "$traj_dir_opt" ]] && append_args+=(--traj_dir "$traj_dir_opt")
+    [[ -n "$traj_id_opt" ]] && append_args+=("$traj_id_opt")
+    printf '%s' "$fork_json" | cmd_append "${append_args[@]+"${append_args[@]}"}" >/dev/null
+
+    # Output only the child traj ID
+    printf '%s\n' "$child_id"
+}
+
+# ---------------------------------------------------------------------------
+# merge
+# ---------------------------------------------------------------------------
+
+cmd_merge() {
+    local from_traj="" traj_dir_opt="" traj_id_opt=""
+    local -a fields=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --field)     fields+=("${2:?--field requires key=val}"); shift 2 ;;
+            --traj_dir)  traj_dir_opt="${2:?--traj_dir requires DIR}"; shift 2 ;;
+            -*)          die "merge: unknown option: $1" ;;
+            *)
+                if [[ -z "$from_traj" ]]; then
+                    from_traj="$1"
+                elif [[ -z "$traj_id_opt" ]]; then
+                    traj_id_opt="$1"
+                else
+                    die "merge: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    [[ -n "$from_traj" ]] || die "merge requires <child_traj_id>"
+
+    local traj_file
+    traj_file=$(require_traj_file "$traj_dir_opt" "$traj_id_opt" "merge")
+
+    local traj_dir
+    traj_dir=$(dirname "$traj_file")
+
+    # Resolve child file from UUID — search from traj_dir's parent too
+    # (children may be in sibling dirs or subdirs)
+    local search_dir="${TRAJ_DIR:-$traj_dir}"
+    local child_file
+    child_file=$(_resolve_traj_id "$search_dir" "$from_traj") \
+        || die "merge: cannot resolve child traj '$from_traj'"
+    [[ -f "$child_file" ]] || die "merge: child file not found for traj '$from_traj'"
+
+    local last_step_id
+    last_step_id=$(tail -1 "$child_file" | jq -r '.step_id // empty')
+    [[ -n "$last_step_id" ]] || die "merge: child '$from_traj' has no steps"
+
+    # Compute relative path from parent dir to child file
+    local from_traj_ref=""
+    from_traj_ref=$(python3 -c "import os.path; print(os.path.relpath('$child_file', '$traj_dir'))" 2>/dev/null) || true
+
+    # Build merge step JSON
+    local merge_json
+    merge_json=$(jq -nc \
+        --arg from_traj "$from_traj" \
+        --arg from_step "$last_step_id" \
+        --arg ref "$from_traj_ref" \
+        '{type: "merge", from_traj: $from_traj, from_step: $from_step} + (if $ref != "" then {from_traj_ref: $ref} else {} end)')
+
+    # Apply extra --field values
+    local f
+    for f in "${fields[@]+"${fields[@]}"}"; do
+        local key="${f%%=*}" val="${f#*=}"
+        merge_json=$(printf '%s' "$merge_json" | jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
+    done
+
+    # Append merge step to parent
+    local -a append_args=()
+    [[ -n "$traj_dir_opt" ]] && append_args+=(--traj_dir "$traj_dir_opt")
+    [[ -n "$traj_id_opt" ]] && append_args+=("$traj_id_opt")
+    printf '%s' "$merge_json" | cmd_append "${append_args[@]+"${append_args[@]}"}"
+}
+
+# ---------------------------------------------------------------------------
+# count — Print step count for a trajectory
+# ---------------------------------------------------------------------------
+
+cmd_count() {
+    local traj_dir_opt="" traj_id_opt=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --traj_dir)  traj_dir_opt="${2:?--traj_dir requires DIR}"; shift 2 ;;
+            -*)          die "count: unknown option: $1" ;;
+            *)
+                if [[ -z "$traj_id_opt" ]]; then
+                    traj_id_opt="$1"
+                else
+                    die "count: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    local traj_file
+    traj_file=$(require_traj_file "$traj_dir_opt" "$traj_id_opt" "count")
+
+    if [[ ! -f "$traj_file" ]]; then
+        printf '0\n'
+        return 0
+    fi
+
+    wc -l < "$traj_file" | tr -d ' '
+}
+
+# ---------------------------------------------------------------------------
+# last — Print the last step as JSON
+# ---------------------------------------------------------------------------
+
+cmd_last() {
+    local traj_dir_opt="" traj_id_opt="" field=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --traj_dir)  traj_dir_opt="${2:?--traj_dir requires DIR}"; shift 2 ;;
+            --field)     field="${2:?--field requires KEY}"; shift 2 ;;
+            -*)          die "last: unknown option: $1" ;;
+            *)
+                if [[ -z "$traj_id_opt" ]]; then
+                    traj_id_opt="$1"
+                else
+                    die "last: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    local traj_file
+    traj_file=$(require_traj_file "$traj_dir_opt" "$traj_id_opt" "last")
+
+    [[ -f "$traj_file" ]] || die "last: trajectory file not found: $traj_file"
+
+    local last_line
+    last_line=$(tail -1 "$traj_file")
+    [[ -n "$last_line" ]] || { printf '\n'; return 0; }
+
+    if [[ -n "$field" ]]; then
+        printf '%s' "$last_line" | jq -r ".${field} // empty"
+    else
+        printf '%s\n' "$last_line"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# cat — Output all steps (formatted or JSONL)
+# ---------------------------------------------------------------------------
+
+cmd_cat() {
+    local traj_dir_opt="" traj_id_opt="" raw=0 force_format=0 use_color=-1 recursive=0 all_fields=0
+    local -a filters=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --traj_dir)  traj_dir_opt="${2:?--traj_dir requires DIR}"; shift 2 ;;
+            --raw)       raw=1; shift ;;
+            --format)    force_format=1; shift ;;
+            --no-color)  use_color=0; shift ;;
+            --filter)    filters+=("${2:?--filter requires field=value}"); shift 2 ;;
+            -a|--all)    all_fields=1; shift ;;
+            -r|--recursive) recursive=1; shift ;;
+            -h|--help)
+                cat <<'CATHELP'
+traj cat — Output all trajectory steps
+
+Usage:
+  traj cat [ID]                    Output all steps
+  traj cat [ID] --filter field=val Filter steps
+  traj cat [ID] -r                 Include sub-trajectory steps
+
+Options:
+  [ID]               Trajectory ID (positional)
+  -a, --all          Show all fields per step (not just type + content)
+  -r, --recursive    Include steps from all sub-trajectories
+  --traj_dir DIR     Trajectory directory
+  --filter field=val Filter steps (e.g. --filter type=thought,merge).
+                     Multiple --filter flags are AND'd.
+                     Comma-separated values within a filter are OR'd.
+  --raw              Raw JSONL (default when piped)
+  --format           Force formatted output (even when piped)
+  --no-color         Disable ANSI colors
+  -h, --help         Show this help
+
+Environment:
+  TRAJ_DIR + TRAJ_ID   Default trajectory
+CATHELP
+                return 0
+                ;;
+            -*)  die "cat: unknown option: $1" ;;
+            *)
+                if [[ -z "$traj_id_opt" ]]; then
+                    traj_id_opt="$1"
+                else
+                    die "cat: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    local traj_file
+    traj_file=$(require_traj_file "$traj_dir_opt" "$traj_id_opt" "cat")
+
+    [[ -f "$traj_file" ]] || return 0
+
+    # Filter array, format/color detection, palette (shared helper)
+    local _filter_json format
+    local c_reset c_dim c_thought c_action c_observation c_human c_agent c_tp c_shell c_meta
+    _setup_stream_format
+
+
+    trap 'exit 0' INT PIPE
+
+    if [[ "$recursive" -eq 1 ]]; then
+        # Collect all trajectory files in the tree
+        local _all_files
+        _all_files=$(_collect_recursive_files "$traj_file") || true
+        [[ -z "$_all_files" ]] && return 0
+
+        _sorted_tree_steps \
+            | cut -f2- \
+            | if [[ "$format" -eq 1 ]]; then
+                while IFS= read -r line; do
+                    _format_line "$line"
+                done
+              else
+                # Raw mode: lines were already filtered by the per-file jq
+                # above — emit as-is instead of re-filtering per line.
+                cat
+              fi
+    elif [[ "$format" -eq 0 ]]; then
+        # Raw mode: one pass over the whole file. The per-line _process_line
+        # spawns a jq per step when filters are set, which on a large
+        # trajectory (tens of thousands of steps) turns every filtered
+        # cat into minutes of process spawning.
+        if [[ "$_filter_json" == "[]" ]]; then
+            cat "$traj_file"
+        else
+            jq -Rc --argjson filters "$_filter_json" '
+                fromjson? // empty |
+                def matches_filters($fs):
+                    . as $step |
+                    ($fs | length == 0) or all($fs[];
+                        .key as $k | .vals as $vs |
+                        ($step[$k] // null) as $fv |
+                        ($vs | any(. as $v | $v == ($fv | tostring)))
+                    );
+                select(matches_filters($filters))
+            ' "$traj_file" 2>/dev/null || true
+        fi
+    else
+        while IFS= read -r line; do
+            _process_line "$line"
+        done < "$traj_file"
+    fi
+}
+
+
+# ---------------------------------------------------------------------------
+# path — Print the resolved trajectory file path
+# ---------------------------------------------------------------------------
+
+cmd_path() {
+    local traj_dir_opt="" traj_id_opt=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --traj_dir)  traj_dir_opt="${2:?--traj_dir requires DIR}"; shift 2 ;;
+            -h|--help)
+                cat <<'PATHHELP'
+traj path — Print the resolved trajectory file path
+
+Usage:
+  traj path [ID]
+
+Options:
+  [ID]               Trajectory ID (positional)
+  --traj_dir DIR     Trajectory directory
+
+Environment:
+  TRAJ_DIR + TRAJ_ID   Default trajectory
+PATHHELP
+                return 0
+                ;;
+            -*)  die "path: unknown option: $1" ;;
+            *)
+                if [[ -z "$traj_id_opt" ]]; then
+                    traj_id_opt="$1"
+                else
+                    die "path: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    require_traj_file "$traj_dir_opt" "$traj_id_opt" "path"
+}
+
+
+# ---------------------------------------------------------------------------
+# exists — Exit 0 if trajectory exists with steps, 1 otherwise
+# ---------------------------------------------------------------------------
+
+cmd_exists() {
+    local traj_dir_opt="" traj_id_opt=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --traj_dir)  traj_dir_opt="${2:?--traj_dir requires DIR}"; shift 2 ;;
+            -*)          die "exists: unknown option: $1" ;;
+            *)
+                if [[ -z "$traj_id_opt" ]]; then
+                    traj_id_opt="$1"
+                else
+                    die "exists: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    local traj_file
+    # Don't die on missing args for exists — just return 1
+    local dir="${traj_dir_opt:-${TRAJ_DIR:-}}"
+    local id="${traj_id_opt:-${TRAJ_ID:-}}"
+    if [[ -n "$dir" && -n "$id" ]]; then
+        traj_file=$(_resolve_traj_id "$dir" "$id" 2>/dev/null) || return 1
+    else
+        return 1
+    fi
+
+    [[ -f "$traj_file" ]] || return 1
+
+    # Check it has at least one line
+    local count
+    count=$(wc -l < "$traj_file" | tr -d ' ')
+    [[ "$count" -gt 0 ]] && return 0 || return 1
+}
+
+# cmd_info removed — use cmd_show with a trajectory ID instead
+
+# ---------------------------------------------------------------------------
+# root — walk up parent chain to find root
+# ---------------------------------------------------------------------------
+
+cmd_root() {
+    local traj_dir_opt="" traj_id_opt=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --traj_dir)  traj_dir_opt="${2:?--traj_dir requires DIR}"; shift 2 ;;
+            -*)          die "root: unknown option: $1" ;;
+            *)
+                if [[ -z "$traj_id_opt" ]]; then
+                    traj_id_opt="$1"
+                else
+                    die "root: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    local traj_file
+    traj_file=$(require_traj_file "$traj_dir_opt" "$traj_id_opt" "root")
+
+    local traj_dir="${traj_dir_opt:-${TRAJ_DIR:-$(dirname "$traj_file")}}"
+
+    local current="$traj_file"
+    local max_depth=50
+    local depth=0
+    while [[ "$depth" -lt "$max_depth" ]]; do
+        local parent_file
+        parent_file=$(_resolve_parent_file "$current" "$traj_dir") || break
+        [[ -f "$parent_file" ]] || break
+
+        current="$parent_file"
+        depth=$((depth + 1))
+    done
+
+    # For directory-based trajectories (trajectory.jsonl), print the directory name
+    local display
+    display=$(basename "$current")
+    if [[ "$display" == "trajectory.jsonl" ]]; then
+        display=$(basename "$(dirname "$current")")
+    fi
+    printf '%s\n' "$display"
+}
+
+# ---------------------------------------------------------------------------
+# list — unified listing with ASCII tree
+# ---------------------------------------------------------------------------
+
+# Collect the full tree into parallel arrays for rendering.
+# Arrays: _list_files[], _list_depths[], _list_is_self[]
+_list_collect_children() {
+    local traj_file="$1" traj_dir="$2" max_depth="$3" cur_depth="$4"
+    [[ -f "$traj_file" ]] || return
+    [[ "$cur_depth" -ge "$max_depth" ]] && return
+
+    local fork_lines
+    fork_lines=$(jq -R -c 'fromjson? // empty | select(.type == "fork")' "$traj_file" 2>/dev/null || true)
+    [[ -z "$fork_lines" ]] && return
+
+    local parent_dir
+    parent_dir=$(dirname "$traj_file")
+
+    while IFS= read -r fork_line; do
+        local child_id child_ref_path child_file=""
+        child_id=$(printf '%s' "$fork_line" | jq -r '.child // empty')
+        [[ -n "$child_id" ]] || continue
+
+        # Fast path: use child_ref relative path if present
+        child_ref_path=$(printf '%s' "$fork_line" | jq -r '.child_ref // empty')
+        if [[ -n "$child_ref_path" && -f "$parent_dir/$child_ref_path" ]]; then
+            child_file="$parent_dir/$child_ref_path"
+        else
+            # Slow path: resolve UUID
+            child_file=$(_resolve_traj_id "$traj_dir" "$child_id" 2>/dev/null) || continue
+        fi
+
+        if [[ -f "$child_file" ]]; then
+            _list_files+=("$child_file")
+            _list_depths+=($((cur_depth + 1)))
+            _list_is_self+=(0)
+            _list_collect_children "$child_file" "$traj_dir" "$max_depth" $((cur_depth + 1))
+        fi
+    done <<< "$fork_lines"
+}
+
+# Render steps of a trajectory, inlining child trajectories under fork steps.
+# Usage: _render_steps_inline <file> <step_prefix> <traj_dir> <max_depth> <cur_depth>
+_render_steps_inline() {
+    local file="$1" step_prefix="$2" traj_dir="$3" max_depth="$4" cur_depth="$5"
+    [[ -f "$file" ]] || return
+
+    # Batch-process all steps with a single jq call.
+    # Use \u001f (unit separator) as delimiter since tabs can appear in content.
+    local step_total _all_steps _US=$'\x1f'
+    step_total=$(wc -l < "$file" | tr -d ' ')
+    _all_steps=$(jq -R -r '
+        fromjson? // empty |
+        (.step_id // "")[0:8] + "\u001f" +
+        (.type // "?") + "\u001f" +
+        (if .type == "fork" then (.child // "")
+         elif .type == "merge" then (.from_traj // .from_branch // "")
+         else ""
+         end) + "\u001f" +
+        ((if .type == "reasoning" then (.thought // "")[0:60]
+          elif .type == "shell-output" then (.stdout // "")[0:60]
+          elif .type == "shellm-run" then (.command // "")[0:60]
+          elif .type == "run-summary" then (.tldr // "")[0:60]
+          elif .type == "fork" then ("-> " + ((.child // "")[0:50]))
+          elif .type == "merge" then ("<- " + ((.content // .from_traj // .from_branch // "")[0:50]))
+          else (.content // "")[0:60]
+          end) | gsub("[\\n\\r\\t]"; " "))
+    ' "$file" 2>/dev/null) || true
+
+    local step_idx=0
+    while IFS="$_US" read -r sid stype sref spreview; do
+        step_idx=$((step_idx + 1))
+        [[ "$step_idx" -eq 1 ]] && continue
+        [[ -n "$sid" ]] || continue
+
+        local step_connector
+        if [[ "$step_idx" -eq "$step_total" ]]; then
+            step_connector="${_c_tree}└── ${_c_reset}"
+        else
+            step_connector="${_c_tree}├── ${_c_reset}"
+        fi
+
+        printf '%s%s%s%s%s %s[%s]%s %s\n' \
+            "$step_prefix" "$step_connector" \
+            "$_c_step" "$sid" "$_c_reset" \
+            "$_c_dim" "$stype" "$_c_reset" \
+            "$spreview"
+
+        # Inline child trajectory under fork steps
+        if [[ "$stype" == "fork" && -n "$sref" && "$cur_depth" -lt "$max_depth" ]]; then
+            local child_file
+            child_file=$(_resolve_traj_id "$traj_dir" "$sref" 2>/dev/null) || true
+            if [[ -n "$child_file" && -f "$child_file" ]]; then
+                # Continuation bar: │ if more steps follow, space if this was last
+                local cont
+                if [[ "$step_idx" -eq "$step_total" ]]; then
+                    cont="    "
+                else
+                    cont="${_c_tree}│${_c_reset}   "
+                fi
+
+                local child_hex child_count child_summary
+                child_hex=$(_parse_hex_id "$child_file")
+                child_count=$(wc -l < "$child_file" | tr -d ' ')
+                child_summary=$(_get_summary "$child_file")
+
+                # Print child trajectory header indented under the fork
+                printf '%s%s%s└── %s%s%s%s: %s %s(%d steps)%s\n' \
+                    "$step_prefix" "$cont" "$_c_tree" "$_c_reset" \
+                    "$_c_id" "$child_hex" "$_c_reset" \
+                    "$child_summary" "$_c_dim" "$child_count" "$_c_reset"
+
+                # Recurse: render child's steps with deeper indentation
+                _render_steps_inline "$child_file" "${step_prefix}${cont}    " \
+                    "$traj_dir" "$max_depth" $((cur_depth + 1))
+            fi
+        fi
+    done <<< "$_all_steps"
+}
+
+# Print one trajectory as JSON object.
+_print_traj_json() {
+    local file="$1" is_self="$2" depth="$3"
+    local hex_id
+    hex_id=$(_parse_hex_id "$file")
+    local step_count
+    step_count=$(wc -l < "$file" | tr -d ' ')
+    local summary
+    summary=$(_get_summary "$file")
+    local first_step_id
+    first_step_id=$(head -1 "$file" | jq -r '.step_id // empty' 2>/dev/null)
+    jq -nc \
+        --arg id "$first_step_id" \
+        --arg hex "$hex_id" \
+        --arg file "$file" \
+        --arg summary "$summary" \
+        --argjson steps "$step_count" \
+        --argjson depth "$depth" \
+        --argjson is_self "$is_self" \
+        '{id:$id, hex:$hex, file:$file, summary:$summary, steps:$steps, depth:$depth, is_self:($is_self == 1)}'
+}
+
+cmd_list() {
+    local traj_dir_opt="" traj_id_opt=""
+    local parents_depth="" children_depth="all" format="plain" show_steps=0
+    local children_explicit=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --traj_dir)   traj_dir_opt="${2:?--traj_dir requires DIR}"; shift 2 ;;
+            --parents)    parents_depth="${2:?--parents requires N or 'all'}"; shift 2 ;;
+            --children)   children_depth="${2:?--children requires N or 'all'}"; children_explicit=1; shift 2 ;;
+            --steps)      show_steps=1; shift ;;
+            --json)       format="json"; shift ;;
+            -*)           die "list: unknown option: $1" ;;
+            *)
+                if [[ -z "$traj_id_opt" ]]; then
+                    traj_id_opt="$1"
+                else
+                    die "list: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Default parents: 0 when a traj_id is specified, "all" otherwise
+    if [[ -z "$parents_depth" ]]; then
+        if [[ -n "$traj_id_opt" ]]; then
+            parents_depth=0
+        else
+            parents_depth="all"
+        fi
+    fi
+
+    # When --steps is used, default to --children 1 (direct only) to avoid
+    # massive output; the user can override with --children all.
+    local children_was_default=0
+    if [[ "$show_steps" -eq 1 && "$children_explicit" -eq 0 ]]; then
+        children_depth=1
+        children_was_default=1
+    fi
+
+    local traj_file
+    traj_file=$(require_traj_file "$traj_dir_opt" "$traj_id_opt" "list")
+
+    local traj_dir="${traj_dir_opt:-${TRAJ_DIR:-$(dirname "$traj_file")}}"
+
+    # Convert "all" to a large number for loop limits
+    local max_parents=999 max_children=999
+    [[ "$parents_depth" != "all" ]] && max_parents="$parents_depth"
+    [[ "$children_depth" != "all" ]] && max_children="$children_depth"
+
+    # --- Collect all entries into arrays ---
+    local -a _list_files=() _list_depths=() _list_is_self=()
+
+    # Parents (walk up, then reverse for top-down)
+    local -a parent_files=()
+    if [[ "$max_parents" -gt 0 ]]; then
+        local current="$traj_file"
+        local depth=0
+        while [[ "$depth" -lt "$max_parents" && "$depth" -lt 50 ]]; do
+            local parent_file
+            parent_file=$(_resolve_parent_file "$current" "$traj_dir") || break
+            [[ -f "$parent_file" ]] || break
+            parent_files+=("$parent_file")
+            current="$parent_file"
+            depth=$((depth + 1))
+        done
+    fi
+
+    # Add parents top-down (depth 0 = root ancestor, increasing toward self)
+    local i parent_count=${#parent_files[@]}
+    for (( i=parent_count-1; i>=0; i-- )); do
+        _list_files+=("${parent_files[$i]}")
+        _list_depths+=($((parent_count - 1 - i)))
+        _list_is_self+=(0)
+    done
+
+    # Self
+    local self_depth="$parent_count"
+    _list_files+=("$traj_file")
+    _list_depths+=("$self_depth")
+    _list_is_self+=(1)
+
+    # Children (recursive) — only collected for non-steps mode;
+    # in --steps mode, children are rendered inline under fork steps.
+    if [[ "$max_children" -gt 0 && "$show_steps" -eq 0 ]]; then
+        _list_collect_children "$traj_file" "$traj_dir" "$max_children" "$self_depth"
+    fi
+
+    # --- Render ---
+    local count=${#_list_files[@]}
+
+    if [[ "$format" == "json" ]]; then
+        for (( i=0; i<count; i++ )); do
+            _print_traj_json "${_list_files[$i]}" "${_list_is_self[$i]}" "${_list_depths[$i]}"
+        done
+        return
+    fi
+
+    # Plain format with ASCII tree connectors.
+    # Determine is_last for each entry (last sibling at its depth).
+    local -a is_last=()
+    for (( i=0; i<count; i++ )); do
+        local d=${_list_depths[$i]}
+        # Look ahead: is there another entry at the same depth before a shallower one?
+        local last=1
+        local j
+        for (( j=i+1; j<count; j++ )); do
+            if [[ ${_list_depths[$j]} -le $d ]]; then
+                # Next sibling or ancestor found
+                [[ ${_list_depths[$j]} -eq $d ]] && last=0
+                break
+            fi
+        done
+        is_last+=("$last")
+    done
+
+    # Render each entry with tree prefix.
+    local -a has_more=()
+    for (( i=0; i<count; i++ )); do
+        local d=${_list_depths[$i]}
+        local file="${_list_files[$i]}"
+
+        # Build tree prefix
+        local prefix=""
+        if [[ $d -gt 0 ]]; then
+            local lvl
+            for (( lvl=0; lvl<d-1; lvl++ )); do
+                if [[ "${has_more[$lvl]:-0}" -eq 1 ]]; then
+                    prefix+="${_c_tree}│${_c_reset}   "
+                else
+                    prefix+="    "
+                fi
+            done
+            if [[ ${is_last[$i]} -eq 1 ]]; then
+                prefix+="${_c_tree}└── ${_c_reset}"
+            else
+                prefix+="${_c_tree}├── ${_c_reset}"
+            fi
+        fi
+
+        # Track which levels still have siblings below
+        if [[ $d -gt 0 ]]; then
+            if [[ ${is_last[$i]} -eq 1 ]]; then
+                has_more[$((d-1))]=0
+            else
+                has_more[$((d-1))]=1
+            fi
+        fi
+
+        # Format the entry line
+        local hex_id step_count summary
+        hex_id=$(_parse_hex_id "$file")
+        step_count=$(wc -l < "$file" | tr -d ' ')
+        summary=$(_get_summary "$file")
+
+        local marker=""
+        local pad=""
+        if [[ ${_list_is_self[$i]} -eq 1 ]]; then
+            marker="${_c_fork}>>> ${_c_reset}"
+        else
+            pad="    "
+        fi
+
+        printf '%s%s%s%s%s%s: %s %s(%d steps)%s\n' \
+            "$marker" "$pad" "$prefix" "$_c_id" "$hex_id" "$_c_reset" \
+            "$summary" "$_c_dim" "$step_count" "$_c_reset"
+
+        # Render steps within this trajectory if --steps is set
+        if [[ "$show_steps" -eq 1 && -f "$file" ]]; then
+            # Build step prefix: continuation lines for all levels up to and including d
+            local step_base="    "
+            if [[ $d -gt 0 ]]; then
+                local lvl
+                for (( lvl=0; lvl<d-1; lvl++ )); do
+                    if [[ "${has_more[$lvl]:-0}" -eq 1 ]]; then
+                        step_base+="${_c_tree}│${_c_reset}   "
+                    else
+                        step_base+="    "
+                    fi
+                done
+                # Continuation from this traj's level
+                if [[ ${is_last[$i]} -eq 1 ]]; then
+                    step_base+="    "
+                else
+                    step_base+="${_c_tree}│${_c_reset}   "
+                fi
+            fi
+
+            _render_steps_inline "$file" "$step_base" "$traj_dir" "$max_children" 0
+        fi
+    done
+
+    # Print a note if children depth was auto-limited
+    if [[ "$children_was_default" -eq 1 ]]; then
+        if [[ "$show_steps" -eq 1 ]]; then
+            # In --steps mode, children are rendered inline; check if any forks exist
+            # by looking for fork steps in the self trajectory
+            local has_forks
+            has_forks=$(jq -R -r 'fromjson? // empty | select(.type=="fork") | .child' "$traj_file" 2>/dev/null | head -1)
+            if [[ -n "$has_forks" ]]; then
+                printf '%s(showing direct children only; use --children all to expand full tree)%s\n' \
+                    "$_c_dim" "$_c_reset"
+            fi
+        else
+            local child_count=$(( count - self_depth - 1 ))
+            if [[ "$child_count" -gt 0 ]]; then
+                printf '%s(showing direct children only; use --children all to expand full tree)%s\n' \
+                    "$_c_dim" "$_c_reset"
+            fi
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# check — validate trajectory JSONL for malformed lines
+# ---------------------------------------------------------------------------
+
+cmd_check() {
+    local traj_dir_opt="" traj_id_opt="" recursive=0 fix=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --traj_dir)  traj_dir_opt="${2:?--traj_dir requires DIR}"; shift 2 ;;
+            -r|--recursive) recursive=1; shift ;;
+            --fix)       fix=1; shift ;;
+            -h|--help)
+                cat <<'CHECKHELP'
+traj check — Validate trajectory JSONL for malformed lines
+
+Usage:
+  traj check [ID]         Check a single trajectory file
+  traj check [ID] -r      Check all files in the trajectory tree
+  traj check [ID] --fix   Remove malformed lines (writes file in place)
+
+Options:
+  [ID]               Trajectory ID (positional)
+  -r, --recursive    Check all sub-trajectory files too
+  --fix              Remove malformed lines from the file(s)
+  --traj_dir DIR     Trajectory directory
+  -h, --help         Show this help
+
+Environment:
+  TRAJ_DIR + TRAJ_ID   Default trajectory
+CHECKHELP
+                return 0
+                ;;
+            -*)  die "check: unknown option: $1" ;;
+            *)
+                if [[ -z "$traj_id_opt" ]]; then
+                    traj_id_opt="$1"
+                else
+                    die "check: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    local traj_file
+    traj_file=$(require_traj_file "$traj_dir_opt" "$traj_id_opt" "check")
+
+    local -a files=("$traj_file")
+    if [[ "$recursive" -eq 1 ]]; then
+        local _all _f
+        _all=$(_collect_recursive_files "$traj_file") || true
+        if [[ -n "$_all" ]]; then
+            files=()
+            while IFS= read -r _f; do files+=("$_f"); done <<< "$_all"
+        fi
+    fi
+
+    local total_bad=0 total_files=0 total_fixed=0
+    local f
+    for f in "${files[@]}"; do
+        [[ -f "$f" ]] || continue
+        total_files=$((total_files + 1))
+        local line_num=0 bad=0 bad_lines=""
+        while IFS= read -r line; do
+            line_num=$((line_num + 1))
+            if ! printf '%s' "$line" | jq empty 2>/dev/null; then
+                bad=$((bad + 1))
+                bad_lines="${bad_lines:+$bad_lines }$line_num"
+                local preview="${line:0:80}"
+                printf '%s:%d: %s\n' "$f" "$line_num" "$preview"
+            fi
+        done < "$f"
+
+        if [[ "$bad" -gt 0 ]]; then
+            total_bad=$((total_bad + bad))
+            if [[ "$fix" -eq 1 ]]; then
+                local tmp="${f}.check_tmp"
+                jq -R -c 'fromjson? // empty' "$f" > "$tmp" 2>/dev/null
+                mv "$tmp" "$f"
+                total_fixed=$((total_fixed + bad))
+                printf '  fixed: removed %d malformed line(s)\n' "$bad"
+            fi
+        fi
+    done
+
+    if [[ "$total_bad" -eq 0 ]]; then
+        printf 'OK: %d file(s) checked, no malformed lines\n' "$total_files"
+    else
+        printf '%d malformed line(s) in %d file(s)\n' "$total_bad" "$total_files"
+        if [[ "$fix" -eq 1 ]]; then
+            printf 'Fixed: removed %d line(s)\n' "$total_fixed"
+        else
+            printf 'Run with --fix to remove them\n'
+        fi
+        [[ "$fix" -eq 1 ]] || return 1
+    fi
+}
+
+# Dispatch
+# ---------------------------------------------------------------------------
+
+[[ $# -gt 0 ]] || usage 1
+cmd="$1"; shift
+case "$cmd" in
+    new)      cmd_new "$@" ;;
+    append)   cmd_append "$@" ;;
+    fork)     cmd_fork "$@" ;;
+    merge)    cmd_merge "$@" ;;
+    show)     cmd_show "$@" ;;
+    tail)     cmd_tail "$@" ;;
+    search)   cmd_search "$@" ;;
+    count)    cmd_count "$@" ;;
+    last)     cmd_last "$@" ;;
+    cat)      cmd_cat "$@" ;;
+    exists)   cmd_exists "$@" ;;
+    path)     cmd_path "$@" ;;
+    list)     cmd_list "$@" ;;
+    root)     cmd_root "$@" ;;
+    check)    cmd_check "$@" ;;
+    help|-h|--help) usage 0 ;;
+    *) die "unknown command: $cmd" ;;
+esac

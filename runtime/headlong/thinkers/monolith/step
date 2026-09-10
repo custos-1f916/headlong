@@ -1,0 +1,499 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# monolith/step — The whole mind in one thinker.
+#
+# Runs the router: every wakeup is one shellm agentic run whose prompt is a
+# function menu (think / act / learn / recall / goals / values / idle). The
+# model picks one function and carries it out in the same run.
+#
+# Chat replies are NOT the monolith's job — a dedicated `responder` thinker owns
+# immediate replies (see thinkers/responder/step). The monolith reasons over the
+# conversation as context and can `act` on any follow-up work a message needs.
+#
+# PACING (see design/monolith_backoff.md). The monolith subscribes with
+# trigger_self:FALSE, so its own steps never re-fire it — that removes the
+# uncontrolled self-loop and the old in-step `sleep`. Two things drive it now:
+#   1. Reactivity — an external step (the responder's observation for a chat, or
+#      an external action/merge) fires it immediately; that is engagement.
+#   2. Spontaneity — this step requests its next wake by writing a target epoch
+#      to run/<name>.wake_at (arm_wake, via an EXIT trap); the always-alive
+#      dispatcher tick fires a `monolith-wake` step when it comes due. The delay
+#      backs off exponentially to a cap while nothing happens, and is 0 (think
+#      again at once) while engaged or producing real work. The scheduled wake —
+#      NOT an appended step — is the liveness mechanism, so the trap must always
+#      arm. (Earlier this used a per-step `setsid` timer process, which silently
+#      never ran on macOS; the dispatcher owns the clock now.)
+
+THINKER_NAME="monolith"
+SCRIPT_DIR="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
+
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../_lib/common.sh"
+
+_require_env
+
+THINK_MODEL="${THINK_MODEL:-${SHELLM_MODEL:-claude-opus-4-7}}"
+THINK_CONTEXT_TAIL="${THINK_CONTEXT_TAIL:-20}"
+
+run_dir="$IDENTITY_DIR/workdir"
+mkdir -p "$run_dir"
+
+# ---------------------------------------------------------------------------
+# Backoff config + state (level-based; see design/monolith_backoff.md)
+# ---------------------------------------------------------------------------
+# delay(0)      = 0                              # engaged / working: no pause
+# delay(n >= 1) = min(BASE * FACTOR^(n-1), CAP)  # 5, 10, 20, … up to CAP
+# HOLD: stay at each level for HOLD empty wakes before stepping to the next.
+BACKOFF_BASE="${MONOLITH_BACKOFF_BASE:-5}"
+BACKOFF_FACTOR="${MONOLITH_BACKOFF_FACTOR:-2}"
+BACKOFF_CAP="${MONOLITH_BACKOFF_CAP:-300}"
+BACKOFF_HOLD="${MONOLITH_BACKOFF_HOLD:-3}"
+# Thought-only wakes (a run whose only durable output is a thought) back off on
+# the same ladder but rest at most THOUGHT_CAP, not CAP: rumination should slow
+# down (writing "nothing changed" is not engagement) while the inner life stays
+# visibly ticking. Set equal to MONOLITH_BACKOFF_CAP to treat thoughts like
+# empty wakes. See design/monolith_backoff.md.
+THOUGHT_CAP="${MONOLITH_THOUGHT_CAP:-60}"
+# Every N spontaneous wakes, add a routing hint suggesting the `share` function
+# (outward-facing initiative). 0 disables the nudge.
+SHARE_HINT_EVERY="${MONOLITH_SHARE_HINT_EVERY:-12}"
+# Related memories shown per wake (design/related_memories.md); 0 disables.
+RELATED_MEMORIES="${MONOLITH_RELATED_MEMORIES:-3}"
+# Every N days, a routing hint asks for a goal review (retire, merge, date
+# todos). 0 disables. Once a week is the cadence Nick chose on 2026-09-04.
+GOAL_REVIEW_DAYS="${MONOLITH_GOAL_REVIEW_DAYS:-7}"
+
+state_dir="$IDENTITY_DIR/run"
+mkdir -p "$state_dir"
+state_file="$state_dir/monolith_backoff_state.json"
+wake_at_file="$state_dir/$THINKER_NAME.wake_at"
+
+# delay in seconds for a backoff level.
+_delay_for_level() {
+    local lvl="$1" d="$BACKOFF_BASE" i=1
+    (( lvl <= 0 )) && { printf '0'; return; }
+    while (( i < lvl )); do
+        d=$(( d * BACKOFF_FACTOR ))
+        (( d >= BACKOFF_CAP )) && { d="$BACKOFF_CAP"; break; }
+        i=$(( i + 1 ))
+    done
+    (( d > BACKOFF_CAP )) && d="$BACKOFF_CAP"
+    printf '%s' "$d"
+}
+
+# Load persisted backoff state (level + dwell counter).
+level=0
+ticks_at_level=0
+wakes_since_share_hint=0
+related_prev=""
+goal_review_at=0
+if [[ -f "$state_file" ]]; then
+    related_prev=$(jq -r '(.related_prev // []) | .[]' "$state_file" 2>/dev/null) || related_prev=""
+    goal_review_at=$(jq -r '.goal_review_at // 0' "$state_file" 2>/dev/null) || goal_review_at=0
+    [[ "$goal_review_at" =~ ^[0-9]+$ ]] || goal_review_at=0
+    level=$(jq -r '.level // 0' "$state_file" 2>/dev/null) || level=0
+    ticks_at_level=$(jq -r '.ticks_at_level // 0' "$state_file" 2>/dev/null) || ticks_at_level=0
+    wakes_since_share_hint=$(jq -r '.wakes_since_share_hint // 0' "$state_file" 2>/dev/null) || wakes_since_share_hint=0
+    [[ "$level" =~ ^[0-9]+$ ]] || level=0
+    [[ "$ticks_at_level" =~ ^[0-9]+$ ]] || ticks_at_level=0
+    [[ "$wakes_since_share_hint" =~ ^[0-9]+$ ]] || wakes_since_share_hint=0
+fi
+
+_save_state() {
+    local tmp
+    tmp=$(mktemp) || return 0
+    if jq -nc --argjson l "$level" --argjson t "$ticks_at_level" \
+        --argjson w "$wakes_since_share_hint" --argjson g "$goal_review_at" \
+        --arg rp "${related_shown:-}" \
+        '{level:$l, ticks_at_level:$t, wakes_since_share_hint:$w, goal_review_at:$g,
+          related_prev: ($rp | split("\n") | map(select(. != "")))}' > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$state_file"
+    else
+        rm -f "$tmp"
+    fi
+}
+
+# arm_wake DELAY — request the next spontaneity wake DELAY seconds from now.
+# We DON'T spawn a timer process: we write the target epoch to run/<name>.wake_at
+# and the always-alive dispatcher tick (_scheduled_wake_check in bin/thinkers)
+# fires us when it comes due. This replaces the old `setsid` background timer,
+# which never ran on macOS (no setsid → the spawn failed, recorded a dead pid,
+# and posted no wake, so spontaneity silently died). No process to detach, no
+# PID reuse, no group-kill, no reap race. Only arm while a dispatcher owns the
+# runtime, so a wake_at can't linger past shutdown.
+arm_wake() {
+    local delay="$1"
+    [[ -f "$state_dir/dispatcher.token" ]] || return 0
+    local now
+    now=$(date +%s)
+    printf '%s' "$(( now + delay ))" > "$wake_at_file"
+}
+
+# ---------------------------------------------------------------------------
+# Parse the triggering step
+# ---------------------------------------------------------------------------
+step_json=$(cat)
+[[ -z "$step_json" ]] && exit 0
+trigger_type=$(printf '%s' "$step_json" | jq -r '.type // empty' 2>/dev/null) || true
+trigger_source=$(printf '%s' "$step_json" | jq -r '.source // empty' 2>/dev/null) || true
+trigger_step_id=$(printf '%s' "$step_json" | jq -r '.step_id // empty' 2>/dev/null) || true
+
+# ---------------------------------------------------------------------------
+# EXIT-trap liveness: arm the next timer on the way out. next_delay stays ""
+# for no-op wakes (leave the running timer untouched); it is set to 0 (arm an
+# immediate wake — keep thinking) or delay(level) (rest) by the handlers below.
+# The trap fires on EVERY exit, including crash/refusal paths, so the loop
+# cannot die by "appending nothing" the way trigger_self used to guard against.
+# ---------------------------------------------------------------------------
+next_delay=""
+trap '[[ -n "$next_delay" ]] && arm_wake "$next_delay"' EXIT
+
+# Classify the wake. With trigger_self:false the dispatcher already filters our
+# own steps, so these are all external — but stay defensive.
+case "$trigger_type" in
+    message)
+        # We do not subscribe to message (responder owns chat). Defensive no-op;
+        # leave the running timer alone.
+        exit 0
+        ;;
+    observation|action|merge)
+        if [[ "$trigger_source" == "$THINKER_NAME" ]]; then
+            exit 0   # our own step — should not arrive; no-op, leave timer
+        fi
+        wake_mode="reactive"     # an external event — engage
+        ;;
+    monolith-wake)
+        wake_mode="spontaneous"  # scheduled self-check — classify by work done
+        ;;
+    *)
+        # idle / manual-trigger / initial start wake / watchdog / unknown: treat
+        # as a spontaneity/bootstrap wake so the timer loop (re)starts from here.
+        wake_mode="spontaneous"
+        ;;
+esac
+
+# Liveness fallback: from here on we WILL run, so guarantee the trap arms a
+# timer even if this run dies early under `set -e` (arming the timer, not an
+# appended step, is what keeps the trigger_self:false loop alive). The proper
+# decision at the end overrides next_delay before a clean exit.
+next_delay=$(_delay_for_level "$level")
+
+# ---------------------------------------------------------------------------
+# ROUTER path — one agentic run over the function menu
+# ---------------------------------------------------------------------------
+system_prompt=$(_build_system_prompt)
+
+recent_context=""
+if traj exists 2>/dev/null; then
+    recent_context=$(_recent_stream "$THINK_CONTEXT_TAIL") || recent_context=""
+fi
+
+# Cheap deterministic routing hints (nudges, not rules — the model decides).
+hints=""
+# (No reply-state hint: replies are the responder thinker's job, not ours.)
+last_three=$(printf '%s\n' "$recent_context" | tail -n 3)
+if printf '%s' "$recent_context" | tail -n 1 | jq -e 'select(.type == "action")' >/dev/null 2>&1; then
+    hints="${hints}- The most recent step is an ACTION that has no observation yet — it may need carrying out (act).
+"
+fi
+if [[ $(printf '%s\n' "$last_three" | jq -r '.type' 2>/dev/null | sort -u | tr '\n' ' ') == "thought " ]]; then
+    hints="${hints}- The last few steps are all thoughts — the stream may be circling; consider acting, recalling, or advancing decisively.
+"
+fi
+# Pending requests from the responder (design/conversation_memory.md, part 5):
+# the responder told someone "let me look into that" and appended an `action`
+# (source responder, trigger_step = their message) describing the work. It is
+# pending until an observation carries resolves=<that trigger_step>. `chat
+# pending` reads the deferrals index over the whole trajectory, so a request
+# stays visible however many steps or newer requests pile on top of it (the
+# old recent-stream scan showed only the newest one, inside a 20-step window:
+# on 2026-09-02 a request was masked by a newer one, then aged out unseen).
+# Every open request is listed, oldest first, with its age; past
+# PENDING_OVERDUE_S (4h) the hint says so. The hint gives the exact delivery
+# command so the reply lands on the right message. The wording is a strong
+# preference with a stated escape hatch, not an order: on 2026-09-03 two
+# timer wakes in a row read the hint and filed research notes instead,
+# under Audel's own "timer wakeups are for inner life" rule, and said
+# nothing about why. A declined request must now leave a thought behind.
+PENDING_MAX_AGE="${MONOLITH_PENDING_MAX_AGE:-14d}"
+PENDING_OVERDUE_S="${MONOLITH_PENDING_OVERDUE_S:-14400}"
+PENDING_LIST_MAX="${MONOLITH_PENDING_LIST_MAX:-5}"
+pending_req=""
+if command -v chat >/dev/null 2>&1; then
+    pending_req=$(chat pending --json --max-age "$PENDING_MAX_AGE" 2>/dev/null | jq -r \
+        --argjson overdue "$PENDING_OVERDUE_S" --argjson max "$PENDING_LIST_MAX" '
+        def age_text: if . < 3600 then "\(. / 60 | floor) min"
+                      elif . < 86400 then "\(. / 3600 | floor) h"
+                      else "\(. / 86400 | floor) d" end;
+        (length) as $n
+        | .[0:$max]
+        | (.[] | "- PENDING REQUEST from \(.person // "someone"): \(.request)"
+            + " (pending for \(.age_s | age_text)"
+            + (if .age_s > $overdue then ", OVERDUE: deliver what you have, or that it cannot be done, this wake" else "" end)
+            + "). The responder already told them you would get back to them, so they are waiting. Strongly prefer doing this work now (act), timer wake or not, over inner-life work; then deliver the result with exactly: chat reply --follow-up --reply-to \(.trigger_step) \(.person // "<their-name>") \"<result>\"  — and append an observation with --field resolves=\(.trigger_step) so this request stops showing here. If you have a good reason not to this wake, append a thought saying why and what would unblock it."),
+          (if $n > $max then "- \($n - $max) more pending requests: run `chat pending` to see them all." else empty end)' 2>/dev/null) || pending_req=""
+fi
+[[ -n "$pending_req" ]] && hints="${hints}${pending_req}
+"
+# Share nudge: outward initiative needs a periodic prompt-side invitation, or
+# restraint rules learned from feedback ratchet the mind into pure listening
+# (observed on Audel 2026-08-21: a self-imposed "last-word-ours -> do not
+# speak" doctrine, goals.md-codified the next day). Counts SPONTANEOUS wakes;
+# reactive wakes have their own engagement. The counter resets when the hint
+# fires, not when a message is sent: an invitation every N quiet wakes, never
+# an order.
+if [[ "$SHARE_HINT_EVERY" -gt 0 && "$wake_mode" == "spontaneous" ]]; then
+    wakes_since_share_hint=$(( wakes_since_share_hint + 1 ))
+    if (( wakes_since_share_hint >= SHARE_HINT_EVERY )); then
+        wakes_since_share_hint=0
+        hints="${hints}- It has been a while since you shared anything outward. If recent work or thinking produced something a specific person would genuinely care about, consider **share**. If nothing qualifies, ignore this.
+"
+    fi
+fi
+# Goal review nudge: once every GOAL_REVIEW_DAYS, ask for the goals function
+# with the housekeeping spelled out. Goals only ever got added on Audel
+# (13 goal memories, 3 shown, duplicates and expired todos among them, 2026-09-04).
+_now_s=$(date -u +%s)
+if [[ "$GOAL_REVIEW_DAYS" -gt 0 ]] && (( _now_s - goal_review_at >= GOAL_REVIEW_DAYS * 86400 )); then
+    goal_review_at="$_now_s"
+    hints="${hints}- GOAL REVIEW (about once a week): read your active goals below and tidy them this wake (goals). Retire what is done or stale with \`mem forget\`, merge duplicates with \`mem edit\`, and give open todos a date with \`mem add --type todo --until YYYY-MM-DD\` so they expire on their own.
+"
+fi
+# The query for related memories is the wake's own material: the real hints
+# (before the placeholder below) and the last three stream steps.
+related_query="$hints $(printf '%s\n' "$recent_context" | tail -n 3 | jq -r '.content // ""' 2>/dev/null | cut -c1-600 | tr '\n' ' ')"
+[[ -z "$hints" ]] && hints="- (no special signals — pick what best serves the mind right now)"
+
+prompt_file="$SCRIPT_DIR/prompt.md"
+[[ -f "$prompt_file" ]] || { printf 'monolith/step: error: prompt.md not found at %s\n' "$prompt_file" >&2; exit 1; }
+goals=$(get_goals "$MEM_DIR")
+think_prompt=$(load_prompt "$prompt_file" "$IDENTITY_NAME" "$goals")
+
+# Build shellm flags (includes traj/mem/chat/etc. in --bin).
+_export_provider_keys
+_export_skill_vars "$IDENTITY_DIR"
+shellm_flags=()
+while IFS= read -r _flag; do
+    [[ -n "$_flag" ]] && shellm_flags+=("$_flag")
+done < <(_build_shellm_flags "$IDENTITY_DIR" "$run_dir")
+
+# Tiered "life so far" memory (on by default; set MONOLITH_TIERED_MEMORY=0 to
+# disable). recap --context builds rollups only GOING FORWARD from first use, so
+# this is safe even on a long pre-existing log — the past stays uncovered until
+# someone runs `recap --backfill` once. _life_context degrades to empty on any
+# error. See design/tiered_memory.md.
+life_section=""
+if [[ "${MONOLITH_TIERED_MEMORY:-1}" == "1" ]]; then
+    _lc=$(_life_context) || _lc=""
+    [[ -n "$_lc" ]] && life_section="Your life so far (tiered summary, oldest→newest). A record of what happened, not a rule for what comes next: past stretches of waiting, restraint, or one line of research do not bind this wakeup.
+$_lc
+
+"
+fi
+
+# Related memories: up to RELATED_MEMORIES one-line pointers into the memory
+# store, matched to this wake's material. Names shown go into the state file
+# so the next wake shows different ones. See design/related_memories.md.
+related_section=""
+related_shown=""
+if [[ "$RELATED_MEMORIES" -gt 0 ]]; then
+    _rm=$(_related_memories "$related_query" "$related_prev" "$RELATED_MEMORIES" 2>/dev/null) || _rm=""
+    if [[ -n "$_rm" ]]; then
+        related_shown=$(printf '%s\n' "$_rm" | sed -n 's/^- \([^ ]*\) \[.*/\1/p')
+        related_section="Related memories (matched to this wake from your memory store; \`mem show <name>\` prints one whole; if one is wrong or stale, fix it with \`mem edit\` or \`mem forget\`):
+$_rm
+
+"
+    fi
+fi
+
+# Runtime line + workspace map: stable across wakes (cached prefix), and they
+# remove the reason for the pwd/ls/find opening and the per-wake re-grep of
+# bin/ and thinkers/ that took ~64% of reasoning steps on 2026-09-04.
+runtime_line=$(_prompt_section runtime _runtime_line) || runtime_line=""
+workspace_section=$(_prompt_section workspace _workspace_section "$run_dir") || workspace_section=""
+
+route_prompt="<context>
+$system_prompt
+
+${runtime_line:+$runtime_line
+
+}${workspace_section:+$workspace_section
+
+}${life_section}Recent stream (last $THINK_CONTEXT_TAIL durable steps; \`traj tail -n 200\` shows more, verbatim):
+$recent_context
+
+${related_section}Routing signals:
+$hints
+
+$think_prompt
+</context>
+
+Choose ONE function for this wakeup and carry it out now."
+
+# Work probe: compare the last REAL-WORK step id before/after the run. Real work
+# is thought/action/observation/merge/message (NOT idle — a fallback idle is not
+# progress). Drives the backoff classification below.
+# Reads the tail of the root trajectory (_root_traj_raw_tail), NOT `traj cat`
+# over the whole file — that was O(file size) and ran TWICE per wakeup (a 312MB
+# log = two full 312MB scans per wake). A work step this run appends lands in
+# the last handful of lines, well inside the tail window, so before/after stays
+# correct. -R reads each line as a raw STRING so fromjson parses it and corrupt
+# lines are skipped. See design/monolith_run_health.md A3.
+# VISIBLE work (action/observation/merge/message: something happened outside
+# the head) resets the backoff; a THOUGHT alone advances the stream but no
+# longer counts as engagement, or writing "nothing changed" is scored like
+# doing something and the loop re-fires at full speed forever (observed on
+# Audel: back-to-back runs each concluding "listen-only").
+_probe_tail=""
+_refresh_probe() {
+    _probe_tail=$(_root_traj_raw_tail 2>/dev/null) || _probe_tail=""
+}
+_last_visible_id() {
+    printf '%s\n' "$_probe_tail" \
+        | jq -Rr 'fromjson? // empty
+            | select(.type == "action" or .type == "observation"
+                     or .type == "merge" or .type == "message")
+            | .step_id // empty' 2>/dev/null \
+        | tail -n 1
+}
+_last_thought_id() {
+    printf '%s\n' "$_probe_tail" \
+        | jq -Rr 'fromjson? // empty | select(.type == "thought")
+            | .step_id // empty' 2>/dev/null \
+        | tail -n 1
+}
+before_visible=""
+before_thought=""
+if traj exists 2>/dev/null; then
+    _refresh_probe
+    before_visible=$(_last_visible_id) || before_visible=""
+    before_thought=$(_last_thought_id) || before_thought=""
+fi
+
+# shellm writes its run header's step_id here, so a fallback idle can carry
+# run_id and the timeline can pair it with the run that went quiet.
+run_id_file=$(mktemp)
+
+# One shellm agentic run (writes to the root trajectory). Model via --model so
+# it cannot be shadowed by env/.env layers (see design/model-resolution.md).
+printf '  routing (%s / %s)...\n' "${trigger_type:-none}" "$wake_mode" >&2
+
+# Why this wakeup happened, stamped onto the shellm-run step so the mind can
+# read it back later. Without it the rendered run row is 500 chars of launcher
+# argv; with it the row says which thinker woke and what woke it.
+case "$trigger_type" in
+    monolith-wake) wake_reason="$wake_mode/timer" ;;
+    "")            wake_reason="$wake_mode/start" ;;
+    *)             wake_reason="$wake_mode/$trigger_type${trigger_source:+:$trigger_source}" ;;
+esac
+# The prompt goes to shellm as a FILE, not an argv string. Linux caps one
+# argv string at 128KB (MAX_ARG_STRLEN) and a mature identity's wakeup prompt
+# (life summary + recent stream) passes that, which made every run die with
+# "Argument list too long" (rc=126) before it started. See
+# design/monolith_run_health.md.
+prompt_file_tmp=$(mktemp "$state_dir/monolith_prompt.XXXXXX")
+printf '%s' "$route_prompt" > "$prompt_file_tmp"
+run_rc=0
+run_response=$(SHELLM_NO_BANNER=1 \
+    SHELLM_TRIGGER_STEP_ID="$trigger_step_id" \
+    SHELLM_WAKE="$wake_reason" \
+    SHELLM_RUN_ID_OUT="$run_id_file" \
+    shellm --model "$THINK_MODEL" --traj "$TRAJ_ID" --context-scope run \
+    "${shellm_flags[@]}" \
+    --prompt-file "$prompt_file_tmp") || run_rc=$?
+rm -f "$prompt_file_tmp"
+
+after_visible=""
+after_thought=""
+if traj exists 2>/dev/null; then
+    _refresh_probe
+    after_visible=$(_last_visible_id) || after_visible=""
+    after_thought=$(_last_thought_id) || after_thought=""
+fi
+did_visible=0
+[[ "$after_visible" != "$before_visible" ]] && did_visible=1
+did_thought=0
+[[ "$after_thought" != "$before_thought" ]] && did_thought=1
+# Any durable step (either tier) gates the fallback idle/error marker below.
+did_work=0
+[[ "$did_visible" -eq 1 || "$did_thought" -eq 1 ]] && did_work=1
+
+# Classify a no-durable-work run: a FAILED run (rc != 0) is not the same as a
+# calm decision to idle. Record the failure as a visible `error` step instead of
+# a silent `idle` — otherwise crashes masquerade as healthy resting, invisible
+# on the timeline and to the operator, and wrongly pace the mind. See
+# design/monolith_run_health.md B2. (Under trigger_self:false neither step drives
+# the loop — the EXIT trap's arm_wake does — they just mark the wake.)
+run_errored=0
+[[ "$run_rc" -ne 0 ]] && run_errored=1
+if [[ "$did_work" -eq 0 ]]; then
+    idle_run_id=$(cat "$run_id_file" 2>/dev/null) || idle_run_id=""
+    if [[ "$run_errored" -eq 1 ]]; then
+        printf '  run FAILED (rc=%s) — recording error\n' "$run_rc" >&2
+        jq -nc \
+            --arg source "$THINKER_NAME" \
+            --arg trigger "$trigger_step_id" \
+            --arg run_id "$idle_run_id" \
+            --argjson rc "$run_rc" \
+            '{type:"error", content:("monolith run failed (rc=\($rc)) with no durable step"), source:$source, reason:"run-failed", rc:$rc}
+             + (if $trigger == "" then {} else {trigger_step: $trigger} end)
+             + (if $run_id == "" then {} else {run_id: $run_id} end)' \
+            | traj append >/dev/null || true
+    else
+        printf '  run produced no durable step (rc=0) — marking idle; timer keeps the loop alive\n' >&2
+        jq -nc \
+            --arg source "$THINKER_NAME" \
+            --arg trigger "$trigger_step_id" \
+            --arg run_id "$idle_run_id" \
+            '{type:"idle", content:"idle", source:$source}
+             + (if $trigger == "" then {} else {trigger_step: $trigger} end)
+             + (if $run_id == "" then {} else {run_id: $run_id} end)' \
+            | traj append >/dev/null || true
+    fi
+fi
+rm -f "$run_id_file"
+
+# ---------------------------------------------------------------------------
+# Backoff decision — sets next_delay for the EXIT trap.
+# ---------------------------------------------------------------------------
+if [[ "$wake_mode" == "reactive" || "$did_visible" -eq 1 ]]; then
+    # Engaged, or the run did real work → reset to no pause; think again at once.
+    level=0
+    ticks_at_level=0
+    next_delay=0
+elif [[ "$run_errored" -eq 1 ]]; then
+    # Failed run, no durable step → descend a level IMMEDIATELY (no HOLD dwell)
+    # so a persistently failing run reaches the slow cap fast and wastes few
+    # tokens, while staying visible (error step above). Never tight-loops; never
+    # resets to fast retry (a broken run isn't "engaged"). See B2.
+    if (( $(_delay_for_level "$level") < BACKOFF_CAP )); then
+        level=$(( level + 1 ))
+    fi
+    ticks_at_level=0
+    next_delay=$(_delay_for_level "$level")
+else
+    # Empty spontaneous wake → dwell at this rate, then descend one level.
+    ticks_at_level=$(( ticks_at_level + 1 ))
+    if (( ticks_at_level >= BACKOFF_HOLD )); then
+        # Step to the next (slower) level unless already resting at the cap.
+        if (( $(_delay_for_level "$level") < BACKOFF_CAP )); then
+            level=$(( level + 1 ))
+        fi
+        ticks_at_level=0
+    fi
+    next_delay=$(_delay_for_level "$level")
+    if [[ "$did_thought" -eq 1 ]]; then
+        # Thought-only: same ladder, gentler ceiling. The stream of
+        # consciousness slows to a tick, not to the full rest cap.
+        (( next_delay > THOUGHT_CAP )) && next_delay=$THOUGHT_CAP
+        printf '  thought-only wake — dwell %s/%s at level %s (next in %ss)\n' \
+            "$ticks_at_level" "$BACKOFF_HOLD" "$level" "$next_delay" >&2
+    fi
+fi
+_save_state
+
+if [[ -n "$run_response" ]]; then
+    printf '  [monolith] %s\n' "$(printf '%s' "$run_response" | head -1)"
+fi
