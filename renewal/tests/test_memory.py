@@ -588,6 +588,20 @@ class ResponderTests(MemoryFixture):
         self.assertIn("You have no note yet about hal", seen["system"])
         self.assertIn("fine to ask them something back", seen["system"])
 
+    def test_oversized_person_candidate_preserves_note_and_reply(self):
+        people=cm.People(self.store)
+        people.save("hal", "Hal", {"notes":"Complete prior note.", "aliases":[]}, "hal")
+        before=people.find("hal")[0][0].read_bytes()
+        notes="A complete candidate sentence with ordinary words. " * 50
+        self.plan={"reply":"Hello.","decision":"reply","goal":None,"memories":[],"person":{"notes":notes}}
+        with mock.patch.object(cm,"run",side_effect=self.model):cm.response(self.store,self.request)
+        self.assertEqual(people.find("hal")[0][0].read_bytes(),before)
+        self.assertEqual(self.outgoing()[0]["content"],"Hello.")
+        proposals=list((self.store.directory.parent/"dream/person-proposals").glob("*.json"))
+        self.assertEqual(len(proposals),1)
+        self.assertEqual(json.loads(proposals[0].read_text())["notes"],notes)
+        self.assertTrue(any(x.get("person_update_warning")=="oversized_note_kept_previous" for x in self.steps()))
+
     def test_person_display_is_fixed_after_creation(self):
         self.plan = {"reply": "Hi.", "decision": "reply", "goal": None, "memories": [],
                      "person": {"display": "Hal", "aliases": [], "notes": "Hal is my operator."}}
@@ -620,7 +634,10 @@ class ResponderTests(MemoryFixture):
         raw_newline = cm.encode(base).replace("follow up.", "follow\nup.")  # a literal newline inside the string
         self.assertIn("follow\nup.", cm.validate_plan(raw_newline)["reply"])
         oversized = {**base, "person": {"notes": "x" * 5000}}
-        self.assertLessEqual(len(cm.validate_plan(cm.encode(oversized))["person"]["notes"]), cm.PERSON_NOTE_MAX)
+        metadata = {}
+        self.assertIsNone(cm.validate_plan(cm.encode(oversized), metadata=metadata)["person"])
+        self.assertEqual(metadata["person_candidate"], cm.redact_secrets("x" * 5000))
+        self.assertEqual(metadata["person_update_warning"], "oversized_note_kept_previous")
         self.assertEqual(cm.validate_plan("Your move.")["reply"], "Your move.")
         prose = "Not thin, I have been turning it over. **Who I am.** Keep the keeper line; that is the whole thing."
         plan = cm.validate_plan(prose)

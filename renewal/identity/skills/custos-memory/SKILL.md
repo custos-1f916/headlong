@@ -71,3 +71,10 @@ query or use `mem show` for the actual identified file.
 (`-E`), context (`-C`) and recursive (`-r`) searches include referenced stdout/stderr
 blobs. Malformed JSON records produce a warning naming their lines; preserve
 those records for repair and do not pretend the damaged rows were searched.
+
+Scheduled memory maintenance uses `skills show custos-dream`: one bounded review
+inside the monolith in the early morning, with version checks, preimage backups,
+evidence and a private report. Use its revise/archive commands during a dream.
+Untouched ambient non-task records settle after six hours without a reply; accepted
+tasks and attempted replies do not expire this way. Oversized person updates keep
+the previous complete note and preserve an unverified candidate for later review.

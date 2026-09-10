@@ -351,13 +351,14 @@ index e6a5b00..a4d426e 100755
          if [[ "$http_code" =~ ^(000|408|429|5[0-9][0-9])$ && "$_attempt" -lt "$_max_attempts" ]]; then
              echo "llm: transient API failure (attempt $_attempt/$_max_attempts): HTTP $http_code — retrying" >&2
 diff --git a/bin/mem b/bin/mem
-index 98df4f9..7a48e00 100755
 --- a/bin/mem
 +++ b/bin/mem
-@@ -55,6 +55,16 @@ slugify() {
+@@ -53,6 +53,16 @@
+         | tr -cs 'a-z0-9' '-' \
+         | sed 's/^-//; s/-$//' \
          | cut -c1-80
- }
- 
++}
++
 +# Truncate characters, never UTF-8 bytes. Drain the input so a long body cannot
 +# SIGPIPE its writer after we have read the first line.
 +memory_summary() {
@@ -366,12 +367,10 @@ index 98df4f9..7a48e00 100755
 +while sys.stdin.buffer.read(65536):
 +    pass
 +sys.stdout.buffer.write(first.rstrip(b"\r\n").decode("utf-8")[:80].encode("utf-8"))'
-+}
-+
+ }
+ 
  # Extract a field from YAML frontmatter.
- # Usage: frontmatter_field <file> <field>
- frontmatter_field() {
-@@ -129,7 +139,7 @@ action_add() {
+@@ -129,7 +139,7 @@
      hex=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
      slug=$(slugify "$text")
      filename="${timestamp}_${hex}_${slug}"
@@ -380,7 +379,7 @@ index 98df4f9..7a48e00 100755
      created=$(date +"%Y-%m-%d %H:%M:%S")
  
      cat > "$MEM_DIR/${filename}.md" << EOF
-@@ -198,7 +208,7 @@ action_prefilter() {
+@@ -198,7 +208,7 @@
      mem_prefilter "$query" "$top"
  }
  
@@ -389,7 +388,7 @@ index 98df4f9..7a48e00 100755
      local query="$1"
  
      local count
-@@ -215,14 +225,35 @@ action_search() {
+@@ -215,14 +225,35 @@
      candidates=$(mem_prefilter "$query" "$top")
      [[ -n "$candidates" ]] || candidates=$(ls -1 "$MEM_DIR"/*.md | tail -n "$top")
  
@@ -433,7 +432,7 @@ index 98df4f9..7a48e00 100755
  
      # Stage 2: the model ranks the candidates. Utility call: use the cheap
      # model class when one is configured. A reasoning model spends output
-@@ -234,15 +265,33 @@ $(cat "$f")
+@@ -234,15 +265,33 @@
      # before its first visible token (glm 5.3 flash: 31s on the box,
      # 2026-09-03). MEM_SEARCH_HEARTBEAT_S=0 disables it.
      local hb="${MEM_SEARCH_HEARTBEAT_S:-10}" _hb_pid=""
@@ -473,7 +472,7 @@ index 98df4f9..7a48e00 100755
  
  action_list() {
      local limit=0 short=0 filter_type="" filter_before="" filter_after=""
-@@ -343,6 +392,30 @@ action_forget() {
+@@ -343,6 +392,30 @@
      echo "Forgotten: $(basename "$file" .md)" >&2
  }
  
@@ -504,7 +503,7 @@ index 98df4f9..7a48e00 100755
  action_edit() {
      local name="$1"; shift
      local file
-@@ -370,8 +443,9 @@ action_edit() {
+@@ -370,8 +443,9 @@
      # edit: a todo shortlist that is appended to during the day must still
      # expire that night.
      local summary type created id until
@@ -515,7 +514,7 @@ index 98df4f9..7a48e00 100755
      created=$(frontmatter_field "$file" "created")
      id=$(frontmatter_field "$file" "id")
      until=$(frontmatter_field "$file" "until")
-@@ -454,6 +528,7 @@ Usage:
+@@ -454,6 +528,7 @@
    mem types                      List memory types with counts
    mem show <id>                  Show a memory's full contents
    mem forget <id>                Delete a memory by hex ID
@@ -523,7 +522,7 @@ index 98df4f9..7a48e00 100755
    mem edit <id> [--slug SLUG] <text>  Update body (or pipe via stdin)
  
  List options:
-@@ -474,6 +549,7 @@ Options:
+@@ -474,6 +549,7 @@
  Environment:
    MEM_DIR   Override memory directory (default: ./.memories)
    MEM_SEARCH_TOP         Candidates the keyword prefilter sends the model (40)
@@ -531,7 +530,26 @@ index 98df4f9..7a48e00 100755
    MEM_SEARCH_MAX_TOKENS  Output cap for the search call (16000; a reasoning
                           model thinks against it, so keep it roomy)
    MEM_SEARCH_HEARTBEAT_S Seconds between "waiting" lines on stderr while the
-@@ -530,6 +606,19 @@ main() {
+@@ -516,6 +592,18 @@
+     local cmd="${1:-}"
+     [[ -n "$cmd" ]] && shift
+ 
++    # Serialize native mutations with Custos's CAS reviewer and responder.
++    # Staged writes lock their staging directory, so Store.commit does not
++    # recursively acquire the canonical store lock.
++    case "$cmd" in
++        add|edit|done|forget)
++            mkdir -p "$MEM_DIR"
++            local memory_lock_fd
++            exec {memory_lock_fd}>"$MEM_DIR/.custos-lock-824d80d71985f082a26997a8db88b5d1dd45b777d73585d03d236303e21bde97"
++            flock -x "$memory_lock_fd"
++            ;;
++    esac
++
+     case "$cmd" in
+         add)
+             # Parse --type flag
+@@ -530,6 +618,19 @@
                          [[ "$MEM_UNTIL" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die "--until takes a date, YYYY-MM-DD"
                          shift 2
                          ;;
@@ -551,7 +569,7 @@ index 98df4f9..7a48e00 100755
                      *)
                          break
                          ;;
-@@ -558,6 +647,11 @@ main() {
+@@ -558,6 +659,11 @@
              [[ $# -lt 1 ]] && die "Usage: mem forget <id>"
              action_forget "$1"
              ;;
@@ -2491,10 +2509,9 @@ index ab96818..b3b2f87 100755
          path=$(command -v "$cmd" 2>/dev/null) || continue
          printf '%s\n' "--bin" "$path"
 diff --git a/thinkers/monolith/prompt.md b/thinkers/monolith/prompt.md
-index 5bcd50d..118ba07 100644
 --- a/thinkers/monolith/prompt.md
 +++ b/thinkers/monolith/prompt.md
-@@ -8,18 +8,20 @@ This prompt is your wakeup context: the life summary, the recent stream, and the
+@@ -8,18 +8,21 @@
  
  Read the recent stream and the routing signals above, then choose EXACTLY ONE of these and carry it out. Do not do two. Do not narrate the menu.
  
@@ -2508,6 +2525,7 @@ index 5bcd50d..118ba07 100644
  - **share** — Something you found, built, or concluded would genuinely matter to a specific person. Send it with `chat send --to '<their-name>' "..."` (one message, the substance in the message itself), then append an `observation` recording what you sent and to whom. New information only: never a status ping, never a re-answer, never a second follow-up on the same finding.
  - **think** — Advance the stream of consciousness by one step. Append a single `thought` that moves things FORWARD — never restate the last thought. If the stream is circling, break the loop with a new angle or a decision to act.
  - **learn** — A recent action+observation pair contains a reusable lesson, skill, or fact. Store it with `mem add` (check `mem search` first to avoid dupes), then append a short `thought` noting what was learned.
++- **dream** — When the scheduled memory-dream routing signal is present, review memory using `skills show custos-dream` and `custos-dream begin`. Prefer this bounded review over discretionary explore/make; urgent directed work can take priority. Keep the existing inference slot and ordinary admission controls. Record evidence-backed keep/uncertain/revised/archived decisions and finish a private report. This is memory maintenance, not an instruction to send messages or invent work.
  - **recall** — A stored memory is associatively relevant but not yet in play. `mem search` for it and surface 1–3 as `thought` steps ("I'm reminded of: …").
 -- **goals** — A new intention is forming, the stream has drifted from active goals, or a GOAL REVIEW signal is up. `mem edit` the existing goal when one already covers it and `mem forget` what is done; `mem add --type goal|todo` only for something new, with `--until YYYY-MM-DD` on a todo so it expires. Then append a `thought` that names the intention or gently redirects.
 +- **goals** — A new intention is forming, priorities changed, or a GOAL REVIEW is due. For directed requests use `custos-memory update` and evidence-bearing `custos-memory complete`, preserving the original and its reply correlation. For self-chosen ordinary goals use native `mem edit`, `mem add --type goal|objective|todo`, and retire finished ones with `mem done ID "what happened"` (writing DONE in the body while the type stays `goal` keeps it active). Never overwrite a Custos request record with plain `mem edit` or delete its receipt with `mem forget`. A todo's `--until` only expires its context visibility; schedule a real observation when a timed action is required.
@@ -2520,7 +2538,7 @@ index 5bcd50d..118ba07 100644
  
  ## How to write steps
  
-@@ -34,7 +36,7 @@ traj append --field type=observation --field content="Saved a memory that Andy p
+@@ -34,7 +37,7 @@
  
  # idle: record the idle step AND end the run in the same block
  traj append --field type=idle --field content=idle --field source=monolith
@@ -2529,7 +2547,7 @@ index 5bcd50d..118ba07 100644
  ```
  
  For `act`, run the actual commands first, then append the observation: one sentence, the fact, as in the example. Do not write the handoff twice.
-@@ -43,8 +45,10 @@ End the run from INSIDE your bash block by setting `FINAL="..."` — that string
+@@ -43,8 +46,10 @@
  
  ## Rules
  
@@ -2542,10 +2560,9 @@ index 5bcd50d..118ba07 100644
  - The Runtime and Workspace lines above are authoritative. Do not open a wake by re-orienting (`pwd`, `ls`, `find`) or by re-verifying your own runtime (grepping or checksumming `bin/` and `thinkers/`): a fact you verified about the runtime holds until the Runtime line changes, and the workspace map tells you where things are. Spend the steps on the work itself.
  
 diff --git a/thinkers/monolith/step b/thinkers/monolith/step
-index bfe362b..90e3d6d 100755
 --- a/thinkers/monolith/step
 +++ b/thinkers/monolith/step
-@@ -4,7 +4,7 @@ set -euo pipefail
+@@ -4,7 +4,7 @@
  # monolith/step — The whole mind in one thinker.
  #
  # Runs the router: every wakeup is one shellm agentic run whose prompt is a
@@ -2554,7 +2571,7 @@ index bfe362b..90e3d6d 100755
  # model picks one function and carries it out in the same run.
  #
  # Chat replies are NOT the monolith's job — a dedicated `responder` thinker owns
-@@ -34,7 +34,16 @@ source "$SCRIPT_DIR/../_lib/common.sh"
+@@ -34,7 +34,16 @@
  _require_env
  
  THINK_MODEL="${THINK_MODEL:-${SHELLM_MODEL:-claude-opus-4-7}}"
@@ -2572,7 +2589,7 @@ index bfe362b..90e3d6d 100755
  
  run_dir="$IDENTITY_DIR/workdir"
  mkdir -p "$run_dir"
-@@ -88,7 +97,13 @@ ticks_at_level=0
+@@ -88,7 +97,13 @@
  wakes_since_share_hint=0
  related_prev=""
  goal_review_at=0
@@ -2586,7 +2603,7 @@ index bfe362b..90e3d6d 100755
      related_prev=$(jq -r '(.related_prev // []) | .[]' "$state_file" 2>/dev/null) || related_prev=""
      goal_review_at=$(jq -r '.goal_review_at // 0' "$state_file" 2>/dev/null) || goal_review_at=0
      [[ "$goal_review_at" =~ ^[0-9]+$ ]] || goal_review_at=0
-@@ -104,9 +119,11 @@ _save_state() {
+@@ -104,9 +119,11 @@
      local tmp
      tmp=$(mktemp) || return 0
      if jq -nc --argjson l "$level" --argjson t "$ticks_at_level" \
@@ -2600,7 +2617,7 @@ index bfe362b..90e3d6d 100755
            related_prev: ($rp | split("\n") | map(select(. != "")))}' > "$tmp" 2>/dev/null; then
          mv "$tmp" "$state_file"
      else
-@@ -201,41 +218,60 @@ if [[ $(printf '%s\n' "$last_three" | jq -r '.type' 2>/dev/null | sort -u | tr '
+@@ -201,41 +218,60 @@
      hints="${hints}- The last few steps are all thoughts — the stream may be circling; consider acting, recalling, or advancing decisively.
  "
  fi
@@ -2694,7 +2711,7 @@ index bfe362b..90e3d6d 100755
  # Share nudge: outward initiative needs a periodic prompt-side invitation, or
  # restraint rules learned from feedback ratchet the mind into pure listening
  # (observed on Audel 2026-08-21: a self-imposed "last-word-ours -> do not
-@@ -243,6 +279,16 @@ fi
+@@ -243,6 +279,16 @@
  # reactive wakes have their own engagement. The counter resets when the hint
  # fires, not when a message is sent: an invitation every N quiet wakes, never
  # an order.
@@ -2711,7 +2728,7 @@ index bfe362b..90e3d6d 100755
  if [[ "$SHARE_HINT_EVERY" -gt 0 && "$wake_mode" == "spontaneous" ]]; then
      wakes_since_share_hint=$(( wakes_since_share_hint + 1 ))
      if (( wakes_since_share_hint >= SHARE_HINT_EVERY )); then
-@@ -257,7 +303,7 @@ fi
+@@ -257,7 +303,7 @@
  _now_s=$(date -u +%s)
  if [[ "$GOAL_REVIEW_DAYS" -gt 0 ]] && (( _now_s - goal_review_at >= GOAL_REVIEW_DAYS * 86400 )); then
      goal_review_at="$_now_s"
@@ -2720,7 +2737,28 @@ index bfe362b..90e3d6d 100755
  "
  fi
  # The query for related memories is the wake's own material: the real hints
-@@ -453,6 +499,16 @@ if [[ "$did_work" -eq 0 ]]; then
+@@ -314,6 +360,12 @@
+ runtime_line=$(_prompt_section runtime _runtime_line) || runtime_line=""
+ workspace_section=$(_prompt_section workspace _workspace_section "$run_dir") || workspace_section=""
+ 
++# A clock signal inside this existing mind; never a second inference worker.
++dream_section=""
++if command -v custos-dream >/dev/null 2>&1; then
++    dream_section=$(custos-dream due) || dream_section="Memory dream schedule check failed; inspect the helper before editing memories."
++fi
++
+ route_prompt="<context>
+ $system_prompt
+ 
+@@ -326,6 +378,7 @@
+ 
+ ${related_section}Routing signals:
+ $hints
++$dream_section
+ 
+ $think_prompt
+ </context>
+@@ -453,6 +506,16 @@
              | traj append >/dev/null || true
      fi
  fi
@@ -4086,3 +4124,76 @@ index 0000000..16281c4
 +++ b/thinkers/social/subscriptions.jsonl
 @@ -0,0 +1 @@
 +{"types":["observation","social-wake"],"trigger_self":false}
+diff --git a/tests/test_monolith_dream.sh b/tests/test_monolith_dream.sh
+new file mode 100755
+--- /dev/null
++++ b/tests/test_monolith_dream.sh
+@@ -0,0 +1,68 @@
++#!/usr/bin/env bash
++# tests/test_monolith_wake_sections.sh — the monolith's related-memories
++# section and goal-review hint (design/related_memories.md). Drives
++# thinkers/monolith/step against a throwaway identity with a stubbed shellm
++# that captures the --prompt-file. Pins: the section appears with a memory
++# matched to the stream, the names shown land in the state file and are not
++# shown again next wake, MONOLITH_RELATED_MEMORIES=0 removes the section, the
++# goal-review hint fires on the first wake and not on the next, and the
++# active-goals section lists a todo with its type.
++set -uo pipefail
++unset IDENTITY_DIR IDENTITY_NAME MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID 2>/dev/null
++HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(dirname "$HERE")"; STEP="$REPO/thinkers/monolith/step"
++pass=0; fail=0
++ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
++bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
++WORK=$(mktemp -d); trap 'cd /; rm -rf "$WORK"' EXIT
++ID="$WORK/ident"; TRAJ_ID="cafe0000-0000-0000-0000-0000000000bb"
++mkdir -p "$ID/memories" "$ID/trajectories/$TRAJ_ID" "$ID/run" "$WORK/stub" "$WORK/home"
++printf 'name=testid\ncreated=test\nroot_trajectory=%s\n' "$TRAJ_ID" > "$ID/info.txt"
++TRAJ="$ID/trajectories/$TRAJ_ID/trajectory.jsonl"; : > "$TRAJ"
++printf 'test-token\n' > "$ID/run/dispatcher.token"
++cat > "$WORK/stub/shellm" <<'STUB'
++#!/usr/bin/env bash
++prev=""
++for a in "$@"; do [[ "$prev" == "--prompt-file" ]] && cp "$a" "$STUB_CAPTURE"; prev="$a"; done
++printf '{"step_id":"obs-%s","type":"observation","content":"did a thing","source":"monolith","ts":"%s"}\n' "$RANDOM" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$STUB_TRAJ"
++exit 0
++STUB
++chmod +x "$WORK/stub/shellm"
++export STUB_CAPTURE="$WORK/prompt" STUB_TRAJ="$TRAJ" SHELLM_MODEL=test-model
++STATE="$ID/run/monolith_backoff_state.json"
++mk() { printf -- '---\nid: x\nsummary: s\ntype: %s\ncreated: %s\n---\n\n%s\n' "$2" "$3" "$4" > "$ID/memories/$1.md"; }
++mk 2026-08-20-00-00-00_a1_gh   fact "2026-08-20 00:00:00" "GitHub write on this box: gh is logged in as headlong42, pull-only on laude-institute"
++mk 2026-08-21-00-00-00_b2_disp fact "2026-08-21 00:00:00" "The dispatcher token file arms the wake and lives under run/"
++mk 2026-08-22-00-00-00_c3_todo todo "2026-08-22 00:00:00" "Ping Braden about the temporal test"
++printf '{"step_id":"t1","type":"thought","content":"I should check the github pull-only login headlong42 before the PR work","source":"monolith","ts":"2026-09-04T00:00:00Z"}\n' >> "$TRAJ"
++mkdir -p "$ID/workdir/notes"; printf 'a\n' > "$ID/workdir/notes/a.md"; printf 'b\n' > "$ID/workdir/notes/b.md"
++
++run_step() {  # $1 = trigger json, then env overrides
++    local trig="$1"; shift
++    printf '%s' "$trig" | env PATH="$WORK/stub:$REPO/bin:$PATH" \
++        IDENTITY_DIR="$ID" IDENTITY_NAME=testid MEM_DIR="$ID/memories" \
++        TRAJ_DIR="$ID/trajectories" TRAJ_ID="$TRAJ_ID" HOME="$WORK/home" \
++        MONOLITH_TIERED_MEMORY=0 MONOLITH_SHARE_HINT_EVERY=0 "$@" "$STEP" >> "$WORK/step.log" 2>&1
++}
++WAKE='{"type":"monolith-wake","content":"wake","source":"monolith-timer"}'
++
++cat > "$WORK/stub/custos-dream" <<'STUB'
++#!/usr/bin/env python3
++import sys,os,datetime as dt
++sys.path.insert(0,os.environ['CUSTOS_RENEWAL_DIR'])
++from custos_dream import Dream
++print(Dream(clock=lambda:dt.datetime.fromisoformat(os.environ['DREAM_TEST_NOW'])).due())
++STUB
++chmod +x "$WORK/stub/custos-dream"
++export DREAM_TEST_NOW=2026-09-10T09:30:00+00:00
++run_step "$WAKE" MONOLITH_RELATED_MEMORIES=0
++p=$(cat "$STUB_CAPTURE")
++grep -q "^Hal's scheduled memory dream is due" <<<"$p" && ok "real due helper reaches captured model prompt" || bad "dream routing missing"
++grep -q 'skills show custos-dream' <<<"$p" && ok "skill is reachable from menu" || bad "skill routing missing"
++[[ -f "$ID/dream/2026-09-10/inventory.json" ]] && ok "live hook created inventory in temporary identity" || bad "inventory missing"
++export DREAM_TEST_NOW=2026-09-10T12:00:00+00:00
++run_step "$WAKE" MONOLITH_RELATED_MEMORIES=0
++p=$(cat "$STUB_CAPTURE")
++grep -q "^Hal's scheduled memory dream is due" <<<"$p" && bad "late catch-up incorrectly scheduled" || ok "no late catch-up"
++[[ -f "$ID/dream/2026-09-10/report.md" ]] && ok "missed window leaves private expired report" || bad "report missing"
++printf '\n%d passed, %d failed\n' "$pass" "$fail"
++[[ "$fail" -eq 0 ]]

@@ -233,12 +233,40 @@ class Store:
             raise MemoryError("duplicate request records require operator reconciliation")
         return matches[0] if matches else None
 
+    def settle_ambient(self, older_than_hours=6, limit=50):
+        """Close untouched ambient conversation, never a task or attempted reply."""
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=older_than_hours)
+        candidates = [i[3]["id"] for i in self.files() if i[4] and i[4]["status"] == "active"]
+        settled = 0
+        for key in candidates:
+            if settled >= limit: break
+            try: item = self.find(key)
+            except MemoryError: continue
+            request_id = item[4]["origin"]["request_id"]
+            # Same lock order as responder/complete. Recheck after taking both.
+            with self.lock("reply:" + request_id):
+                with self.lock():
+                    item = self.find(key); record = item[4]
+                    if (record["status"] != "active" or not record["origin"].get("ambient") or
+                        is_task(record) or record.get("response") or record.get("responder_attempt")):
+                        continue
+                    try: received = dt.datetime.fromisoformat(record["received_at"].replace("Z", "+00:00"))
+                    except (ValueError, KeyError): continue
+                    if received.tzinfo is None or received >= cutoff: continue
+                    resolution = {"disposition": "completed", "evidence":
+                        "Untouched ambient conversation aged beyond six-hour review window; no task accepted, no reply sent."}
+                    record["status"] = "completed"; record["resolution"] = resolution
+                    record["events"].append({"at": now(), "resolution": resolution})
+                    self.save(item, record); settled += 1
+        return settled
+
     def archive_conversations(self, older_than_days=2):
         """Move settled, non-task conversation records out of memories/.
 
         Returns the number moved. Active records, deferred tasks (goals), and
         anything newer than the window stay. The archive keeps the files whole,
         so a replayed request id is still recognised (see capture)."""
+        self.settle_ambient()
         cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=older_than_days)).isoformat()
         adir = self.archive_dir()
         moved = 0
@@ -1056,12 +1084,15 @@ def validate_plan(raw, allow_reaction=True, metadata=None, require_envelope=Fals
         if ok:
             notes = person["notes"]
             if len(notes) > PERSON_NOTE_MAX:
-                notes = notes[:PERSON_NOTE_MAX].rsplit(" ", 1)[0]
+                metadata["person_candidate"] = redact_secrets(notes)
+                metadata["person_update_warning"] = "oversized_note_kept_previous"
+                ok = False
             aliases = [a for a in (person.get("aliases") or []) if isinstance(a, str) and a.strip()][:12] if isinstance(person.get("aliases"), list) else []
             display = person.get("display") if isinstance(person.get("display"), str) and 0 < len(person["display"]) <= 64 else None
             plan["person"] = {"notes": notes, "aliases": [a[:48] for a in aliases]}
             if display:
                 plan["person"]["display"] = display
+            if not ok: plan["person"] = None
         else:
             plan["person"] = None
     if not isinstance(plan["reply"], str):
@@ -1314,6 +1345,9 @@ def compose_plan(raw, argv, incoming, attempt, started):
         if had_commitment and plan["decision"] != "defer":
             raise InvalidInput("repair lost an existing commitment")
         metadata["repaired"] = True
+    if metadata.get("person_candidate"):
+        attempt["person_candidate"] = metadata["person_candidate"]
+        attempt["person_update_warning"] = metadata["person_update_warning"]
     attempt["format"] = metadata.get("format", "envelope")
     attempt["repaired"] = metadata.get("repaired", False)
     return plan
@@ -1440,6 +1474,18 @@ def response(store, payload):
             else:
                 raw=run(argv+['-M',encode(messages),'-s',system],timeout=RESPONSE_TIMEOUT)
             plan = compose_plan(raw, argv, incoming, attempt, started)
+            if attempt.get("person_candidate"):
+                # Preserve complete candidate as private, explicitly unverified
+                # material. Never replace a valid person note with its prefix.
+                from custos_dream import write_json
+                proposal_dir = store.directory.parent / "dream" / "person-proposals"
+                proposal_id = hashlib.sha256((goal_id + attempt["person_candidate"]).encode()).hexdigest()[:24]
+                try:
+                    write_json(proposal_dir / (proposal_id + ".json"), {
+                        "goal_id": goal_id, "trigger": trigger, "person_key": who_key,
+                        "at": now(), "status": "unverified-candidate", "notes": attempt.pop("person_candidate")})
+                except OSError:
+                    attempt["person_update_warning"] = "oversized_note_candidate_save_failed_previous_kept"
             if incoming.get("ambient") and plan["goal"] is not None and plan["decision"] != "defer":
                 raise InvalidInput("ambient task requires explicit defer decision")
             attempt["stage"] = "prepare"
@@ -1449,7 +1495,8 @@ def response(store, payload):
                 if record["status"] != "active":
                     raise MemoryError("goal retired during composition; reconcile before reply")
                 record["response"] = {"state": "prepared", "plan": plan, "at": now(),
-                                      "format": attempt.get("format", "envelope"), "repaired": attempt.get("repaired", False)}
+                                      "format": attempt.get("format", "envelope"), "repaired": attempt.get("repaired", False),
+                                      "person_update_warning": attempt.get("person_update_warning")}
                 store.save(item, record)
         else:
             plan = saved["plan"]
@@ -1533,6 +1580,7 @@ def response(store, payload):
                              "failure_stage": "person-note", "error_code": failure_code(error),
                              "content": "Person note update failed after native enqueue: " + failure_code(error)})
         metrics = dict(payload["metrics"]) if isinstance(payload["metrics"], dict) else {}
+        metrics["person_update_warning"] = attempt.get("person_update_warning", (saved or {}).get("person_update_warning"))
         metrics["response_format"] = attempt.get("format", (saved or {}).get("format", "envelope"))
         metrics["format_repaired"] = attempt.get("repaired", (saved or {}).get("repaired", False))
         metrics["compose_ms"] = int(metrics.get("compose_ms", 0)) + int((time.monotonic() - started) * 1000)

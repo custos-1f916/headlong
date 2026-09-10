@@ -702,3 +702,50 @@ commitment preservation, private diagnostics, attempted ambient replay, stale
 suppression, recovery attempt limits, and failures after memory promotion/native
 reply append. Installed shell tests check that one precise failure observation
 survives the wrapper with no protocol-text delivery.
+
+### Early-morning memory dream (2026-09-10)
+
+Hal requested an evidence-based recurring memory review after the September 9 audit.
+The monolith calls `custos-dream due` when constructing each wake's routing context.
+`renewal/dream.json` schedules one session per **America/Denver local day, 03:30–05:00**;
+the session starts when the existing mind chooses `dream`, with a 20-minute budget,
+40 selected records and 20 edits maximum. The full store is inventoried and the
+substantive review rotates by last reviewed content/version. Urgent directed work
+may preempt it. Missed windows do not catch up later, and operator pause/admission
+continue to apply. This adds no standalone inference worker or night reservation.
+
+`renewal/identity/skills/custos-dream/SKILL.md` is the procedure. Install its directory
+into the active identity's skills and link `renewal/bin/custos-dream` into the normal
+helper PATH. The installed runtime patch adds the routing signal, menu function,
+and native `mem` mutation lock shared with the responder/reviewer. `flock` (util-linux)
+is required on the Custos Linux runtime. The Python helper is standard-library-only,
+including `zoneinfo`; it neither calls a model nor contacts a network service.
+
+Changes require inspected SHA-256 versions, evidence, atomic replacement, private
+preimage backups and readback. Request JSON and person routing are protected;
+scheduled review cannot change values or archive requests, people, goals or values.
+Direct file writes bypass cooperative locking and must not be used during reviews.
+`custos-dream show ID` retrieves both active and archived memories. Prepared journals
+are reconciled after interruptions and consume the edit budget; incomplete reviews
+produce partial/expired reports, not a claim of full semantic coverage.
+
+Private state and reports live in `$IDENTITY_DIR/dream/YYYY-MM-DD/`; `reviewed.json`
+is review bookkeeping, not a second task store. Every edit retains a `.before.md`
+and JSON journal with target, hashes, evidence and operation. To undo an edit, first
+verify the current target still matches its recorded `after_sha256`, then restore
+the preimage atomically under the store lock. If it changed, merge deliberately.
+Archives retain whole files and IDs. No public or Signal notification is scheduled.
+Set `enabled` to false in `dream.json` to disable future due signals/edits.
+
+The recurring observer's existing conversation archive pass now settles untouched
+ambient non-task receipts after six hours; it never expires accepted tasks, direct
+asks or attempted responses. Oversized responder person notes no longer truncate the
+existing note: the complete redacted candidate is held privately in
+`dream/person-proposals/` for evidenced review, with a diagnostic on the response.
+
+The design follows Headlong's continuous-mind/inspectable-tools approach and its
+recall-integration lesson: a useful maintenance tool must actually enter the live
+thought stream. See <https://www.laude.org/updates/headlong-a-microharness-for-persistent-agents>.
+Validation covers native monolith prompt routing with the real helper and a temporary
+identity, scheduling/DST/missed windows, interrupted writes, version conflicts,
+protected metadata, ambient lifecycle, and complete person-note preservation.
