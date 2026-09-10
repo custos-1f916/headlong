@@ -105,7 +105,10 @@ windows restore per-message delivery.
 
 Replies are threaded onto the message they answer as a Signal quote (author,
 timestamp and a bridge-cleaned preview) in the group always, and in a DM when
-the answered message is no longer that person's latest. The host selects the
+the answered message is no longer that person's latest. A batched reply threads
+only when the batch holds exactly one message it can be answering; several
+questions to Custos, or a chime-in on a run of ambient chatter, go out
+unthreaded rather than quoted onto an arbitrary line. The host selects the
 quoted original from the spool; the model never supplies a target. On delivery
 into Custos the bridge sends the author a read receipt for each message, and
 while a reply to a directed message is expected it keeps a typing indicator

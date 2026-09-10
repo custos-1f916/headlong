@@ -259,9 +259,19 @@ def quote_text(body):
 
 def threaded(item, db):
     """Quote the message being answered in a group (many voices, and a reply can land
-    minutes later) or in a DM when it is no longer that person's latest message."""
+    minutes later) or in a DM when it is no longer that person's latest message.
+
+    A batched reply threads only when the batch holds exactly one message it can be
+    answering: several questions to Custos, or a general chime-in on a run of ambient
+    chatter, go out unthreaded rather than quoted onto an arbitrary line (Hal, 2026-09-10)."""
     if item.get('reaction'):
         return False
+    folded = db.execute("SELECT payload FROM inbox WHERE phase='batched' AND json_extract(receipt,'$.carrier')=?",
+                        (item['request_id'],)).fetchall()
+    if folded:
+        directed = [bool(item.get('directed', True))] + [bool(json.loads(r[0]).get('directed', True)) for r in folded]
+        if sum(directed) != 1:
+            return False
     if item['group']:
         return True
     newer = db.execute("SELECT 1 FROM inbox WHERE json_extract(payload,'$.conversation')=? "

@@ -544,6 +544,49 @@ class SignalSpoolTests(unittest.TestCase):
         self.assertEqual([self.phase(i['request_id']) for i in items], ['batched', 'queued', 'batched'])
         self.assertEqual([p for m, p in calls if m == 'sendTyping'], [{'groupId': 'agreed-group'}])
         self.assertEqual(len([m for m, p in calls if m == 'sendReceipt']), 3)
+        # Exactly one message in the batch was for Custos: the reply threads onto it.
+        self.reply(bridge, items[1], calls, transport)
+        self.assertEqual([p for m, p in calls if m == 'send'][0].get('quoteTimestamp'), 2000)
+
+    def reply(self, bridge, carrier, calls, transport):
+        self.spool.batch(carrier['route'], {'trajectory': 'g', 'offset': 7, 'events': [
+            {'step_id': 'r-' + carrier['request_id'][-6:], 'request_id': carrier['request_id'], 'content': 'One answer'}]})
+        calls.clear(); bridge.last_send.clear()
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+
+    def test_batch_reply_is_unthreaded_when_no_single_message_is_being_answered(self):
+        calls, sends = [], []; bridge, transport = self.waiting_bridge(calls, sends)
+        group = {'groupId': 'agreed-group'}
+        # Two questions to Custos in one batch: which one would the quote point at? Neither.
+        items = [cs.classify(envelope(FRIEND, message=text, timestamp=stamp, groupInfo=group), POLICY) for text, stamp in
+                 (('Custos, first question?', 1000), ('Custos, second question?', 2000))]
+        for item in items:
+            self.spool.receive(item); self.age(item['request_id'], 130)
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        self.assertEqual(self.phase(items[1]['request_id']), 'queued')
+        self.reply(bridge, items[1], calls, transport)
+        send = [p for m, p in calls if m == 'send'][0]
+        self.assertNotIn('quoteTimestamp', send); self.assertEqual(send['groupId'], 'agreed-group')
+        # A chime-in on a run of ambient chatter is not an answer to its last line either.
+        chatter = [cs.classify(envelope(FRIEND, message=text, timestamp=stamp, groupInfo=group), POLICY) for text, stamp in
+                   (('did you see the game', 5000), ('what a finish', 6000))]
+        for item in chatter:
+            self.spool.receive(item); self.age(item['request_id'], 130)
+        sends.clear()
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        self.assertIn('--ambient', sends[0][0])
+        self.reply(bridge, chatter[1], calls, transport)
+        self.assertNotIn('quoteTimestamp', [p for m, p in calls if m == 'send'][0])
+        # A single ambient message answered on its own still threads (nothing arbitrary about it).
+        lone = cs.classify(envelope(FRIEND, message='anyone around', timestamp=9000, groupInfo=group), POLICY)
+        self.spool.receive(lone); self.age(lone['request_id'], 130); sends.clear()
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
+            bridge.tick()
+        self.reply(bridge, lone, calls, transport)
+        self.assertEqual([p for m, p in calls if m == 'send'][0].get('quoteTimestamp'), 9000)
 
     def test_batch_goes_after_max_wait_even_while_the_room_keeps_talking(self):
         calls, sends = [], []; bridge, transport = self.waiting_bridge(calls, sends)
