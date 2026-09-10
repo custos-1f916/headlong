@@ -175,6 +175,19 @@ def start(rid):
  call(['systemctl','start','custos-relay-bridge.service',TIMER])
  return {'ok':True}
 
+def dashboard_health():
+ with urllib.request.urlopen('http://127.0.0.1:8080/',timeout=10) as r:
+  if r.status!=200:raise RuntimeError('dashboard page not healthy')
+ with urllib.request.urlopen('http://127.0.0.1:8080/api/identities',timeout=10) as r:
+  rows=json.load(r)
+ if not isinstance(rows,list):raise RuntimeError('dashboard identity response is not a list')
+ matches=[x for x in rows if isinstance(x,dict) and x.get('id')=='.identities~custos' and x.get('root_trajectory')=='7ed4c8d8-4fc3-43b7-a812-3c29d92fbb1d']
+ if len(matches)!=1 or not matches[0].get('dispatcher',{}).get('running'):
+  raise RuntimeError('dashboard cannot discover the running Custos identity')
+ with urllib.request.urlopen('http://127.0.0.1:8080/api/identities/.identities~custos/status',timeout=10) as r:
+  if r.status!=200 or not isinstance(json.load(r),dict):raise RuntimeError('dashboard identity status not healthy')
+ return {'identity':'.identities~custos','dispatcher':True,'status_api':True}
+
 def health(a,rid):
  if installed()!=a:raise RuntimeError('release pointer changed during probation')
  c=checkpoint_dir(rid);trajectory=identity()/'trajectories/7ed4c8d8-root/trajectory.jsonl'
@@ -201,11 +214,10 @@ def health(a,rid):
   if progress:break
   time.sleep(2)
  if not progress:raise TimeoutError('no successful model/tool progress during probation')
- with urllib.request.urlopen('http://127.0.0.1:8080/',timeout=10) as r:
-  if r.status!=200:raise RuntimeError('dashboard not healthy')
+ dashboard=dashboard_health()
  for name in ['custos-relay-bridge.service',TIMER]:
   if call(['systemctl','is-active',name],check=False).returncode:raise RuntimeError(name+' not active')
- return {'ok':True,'wake_progress':progress,'dashboard':True}
+ return {'ok':True,'wake_progress':progress,'dashboard':dashboard}
 
 def restore(a,rid):
  atomic_json(MAINT,{'request_id':rid,'recovery':True})

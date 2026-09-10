@@ -32,3 +32,11 @@ Prepare changed dependencies in the seal, preserve .bin symlinks for build tools
 update the input hashes and bundle identity, and qualify the resulting artifact.
 Keep the old bundle until its rollback releases are retired. Never run package
 install hooks in the activated live identity.
+
+Dashboard discovery uses `/var/lib/custos-harness/dashboard` as a persistent view.
+Its `.identities` is a real directory containing `custos` as a symlink to the
+persistent identity. This preserves `.identities~custos` URLs: upstream discovery
+accepts an identity symlink but deliberately does not recurse through a symlinked
+parent. The existing `.web-push` state was copied from the original application
+backup into this view before restarting the dashboard. Health must check the
+identity/status APIs as well as the HTML page; HTTP 200 alone missed this defect.

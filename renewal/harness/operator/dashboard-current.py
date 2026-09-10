@@ -3,7 +3,7 @@ from pathlib import Path
 import uvicorn
 from headlong_web.server import create_app
 from headlong_web.push import PushWatcher
-root=Path('/root/.headlong/app')
+root=Path('/var/lib/custos-harness/dashboard')
 static=Path('/opt/custos/current/runtime/headlong/web/viewer/build/client')
 if not (static/'index.html').is_file():raise RuntimeError('qualified dashboard assets are missing')
 PushWatcher(root).start()
