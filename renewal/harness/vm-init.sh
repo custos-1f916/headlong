@@ -3,6 +3,8 @@
 set -eu
 mountpoint -q /proc || mount -t proc proc /proc
 mountpoint -q /sys || mount -t sysfs sysfs /sys
+mkdir -p /dev/shm
+mount -t tmpfs -o size=64m,nosuid,nodev tmpfs /dev/shm
 mount -t tmpfs -o size=64m,nosuid,nodev tmpfs /run
 mount -t tmpfs -o size=256m,nosuid,nodev tmpfs /tmp
 mount -t tmpfs -o size=1100m,nosuid,nodev tmpfs /work

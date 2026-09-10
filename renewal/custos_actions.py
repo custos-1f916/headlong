@@ -203,7 +203,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.client_address[0] != '192.168.86.52':
                 code=403; raise ValueError('client not allowed')
-            if self.path != '/v1/actions':
+            if self.path not in {'/v1/actions','/v1/harness'}:
                 code=404; raise ValueError('unknown path')
             lengths=self.headers.get_all('Content-Length', [])
             if (self.headers.get('Transfer-Encoding') or len(lengths)!=1 or
@@ -212,7 +212,17 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError('bounded JSON body required')
             raw=self.rfile.read(int(lengths[0]))
             if len(raw)!=int(lengths[0]): raise ValueError('incomplete body')
-            result=self.server.channel.handle(json.loads(raw))
+            if self.path=='/v1/harness':
+                import socket
+                with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as upstream:
+                    upstream.settimeout(12);upstream.connect('/run/custos-harness.sock')
+                    upstream.sendall(raw+b'\n')
+                    with upstream.makefile('rb') as response:
+                        line=response.readline(1024*1024+1)
+                    if len(line)>1024*1024 or not line.endswith(b'\n'):raise ValueError('invalid supervisor response')
+                    result=json.loads(line)
+            else:
+                result=self.server.channel.handle(json.loads(raw))
         except (ValueError, UnicodeError, RecursionError) as error:
             code=400 if code==200 else code; result={'ok':False,'error':str(error)[:200]}
         except Exception:

@@ -25,9 +25,8 @@ def build(repo,commit):
   for name,expected in depmeta['inputs'].items():
    if digest(source/name)!=expected:raise ValueError('dependency input changed: '+name+'; prepare and qualify a new pinned dependency bundle first')
   shutil.copytree(deps/'renewal-node',source/'renewal/node_modules')
-  shutil.copytree(deps/'web',source/'runtime/headlong/web/.runtime')
   # Build viewer from this commit, using pinned offline dependencies inside the seal.
-  shutil.copytree(deps/'viewer-node',source/'runtime/headlong/web/viewer/node_modules')
+  shutil.copytree(deps/'viewer-node',source/'runtime/headlong/web/viewer/node_modules',symlinks=True)
   from harness.seal import run
   result=run(source,['bun','run','build'],seconds=240,subdir='runtime/headlong/web/viewer',keep=False)
   if result['exit_code']!=0:raise RuntimeError('sealed viewer build failed: '+result['job'])
@@ -40,6 +39,7 @@ def build(repo,commit):
     p=source/e.name.removeprefix('work/');p.parent.mkdir(parents=True,exist_ok=True)
     with t.extractfile(e) as f,p.open('wb') as o:shutil.copyfileobj(f,o)
     p.chmod(0o644)
+  shutil.copytree(deps/'web',source/'runtime/headlong/web/.runtime')
   # Host-controller sources ship for review but never replace host code.
   files={};total=0
   for p in sorted(source.rglob('*')):

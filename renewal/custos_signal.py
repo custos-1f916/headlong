@@ -315,10 +315,10 @@ class RPC:
         return response.get('result')
 
 
-def transport(args, content=''):
+def _transport(args, content=''):
     command = ['/usr/sbin/pct', 'exec', '122', '--', '/bin/bash', '-c',
                'source /root/.headlong/app/.identities/custos/activate >/dev/null 2>&1; '
-               'exec /usr/bin/python3 /opt/custos/current/renewal/custos_transport.py "$@"',
+               'exec /usr/bin/python3 /usr/local/libexec/custos-transport-current.py "$@"',
                'custos-signal', *args]
     result = subprocess.run(command, input=content, text=True, capture_output=True,
                             timeout=120 if '--media' in args else 40)
@@ -327,7 +327,16 @@ def transport(args, content=''):
     return json.loads(result.stdout)
 
 
+def transport(args, content=''):
+    import fcntl
+    with open('/run/custos-harness-intake.lock','a') as gate:
+        fcntl.flock(gate,fcntl.LOCK_SH)
+        if Path('/var/lib/custos-harness/maintenance').exists():
+            raise RuntimeError('harness maintenance; native intake retained for retry')
+        return _transport(args, content)
+
 def paused():
+    if Path('/var/lib/custos-harness/maintenance').exists(): return True
     result = subprocess.run(['/usr/sbin/pct', 'exec', '122', '--', '/usr/bin/test', '!', '-e',
                              '/var/lib/custos/operator-paused'], capture_output=True, timeout=5)
     return result.returncode != 0

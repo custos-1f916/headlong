@@ -1,5 +1,5 @@
 """LXC122-only supervisor. Invoked by systemd on blink1, outside Custos."""
-import hashlib,json,os,pathlib,shutil,socketserver,subprocess,sys,threading,time,tarfile
+import fcntl,hashlib,json,os,pathlib,shutil,socketserver,subprocess,sys,threading,time,tarfile
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]))
 from harness.controller import Controller
 from harness.common import digest,validate_archive,atomic_json,MAX_ARCHIVE
@@ -55,21 +55,32 @@ class Adapter:
   if evidence.get('artifact')!=a:raise ValueError('qualification mismatch')
   self.install();self.supply(a);self.supply(current['artifact'])
   return self.act('preflight',artifact=a,expected_current=current['artifact'])
- def drain(self,r):return self.act('drain',request_id=r['request_id'])
- def abort_drain(self,r):return self.act('abort-drain',request_id=r['request_id'])
+ def drain(self,r):
+  atomic_json(STATE/'maintenance',{'request_id':r['request_id']})
+  # Wait for existing host-to-guest native writes. The flag prevents new ones.
+  with open('/run/custos-harness-intake.lock','a') as lock:
+   deadline=time.monotonic()+150
+   while True:
+    try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB);break
+    except BlockingIOError:
+     if time.monotonic()>deadline:raise TimeoutError('host intake did not drain')
+     time.sleep(1)
+  return self.act('drain',request_id=r['request_id'])
+ def abort_drain(self,r):
+  result=self.act('abort-drain',request_id=r['request_id']);(STATE/'maintenance').unlink(missing_ok=True);return result
  def stop(self,r):return self.act('stop',request_id=r['request_id'])
  def switch(self,a,r):
   if self.paused():raise RuntimeError('operator pause before switch')
   return self.act('switch',artifact=a,request_id=r['request_id'])
  def verify(self,a,r):
   if self.paused():raise RuntimeError('operator pause before startup')
-  return self.act('verify',artifact=a,request_id=r['request_id'])
+  result=self.act('verify',artifact=a,request_id=r['request_id']);(STATE/'maintenance').unlink(missing_ok=True);return result
  def restore(self,a,r):
   self.install();self.supply(a)
   # The guest's mirrored pause normally arrives through admission; explicitly
   # retain it if the host pause is already active. Never remove either pause.
   if P('/etc/custos-gateway/paused').exists():command(['pct','exec','122','--','touch','/var/lib/custos/operator-paused'])
-  return self.act('restore',artifact=a,request_id=r['request_id'])
+  result=self.act('restore',artifact=a,request_id=r['request_id']);(STATE/'maintenance').unlink(missing_ok=True);return result
 class Server(socketserver.ThreadingMixIn,socketserver.UnixStreamServer):daemon_threads=True
 class Handler(socketserver.StreamRequestHandler):
  def handle(self):

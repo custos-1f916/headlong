@@ -1,5 +1,5 @@
 """Bounded experiment runner; clean environment plus a disposable KVM machine."""
-import argparse,base64,contextlib,hashlib,http.client,http.server,ipaddress,json,os,pathlib,re,selectors,shutil,signal,socket,socketserver,subprocess,sys,tempfile,threading,time,uuid
+import fcntl,argparse,base64,contextlib,hashlib,http.client,http.server,ipaddress,json,os,pathlib,re,selectors,shutil,signal,socket,socketserver,subprocess,sys,tempfile,threading,time,uuid
 P=pathlib.Path
 STATE=P('/var/lib/custos-harness/jobs')
 FETCH_HOSTS={'github.com','codeload.github.com','objects.githubusercontent.com','raw.githubusercontent.com','registry.npmjs.org','pypi.org','files.pythonhosted.org'}
@@ -14,7 +14,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         parts=self.path.rsplit(':',1)
         if len(parts)!=2 or parts[0] not in FETCH_HOSTS or parts[1]!='443':self.send_error(403);return
         try:
-            addresses=socket.getaddrinfo(parts[0],443,type=socket.SOCK_STREAM)
+            addresses=socket.getaddrinfo(parts[0],443,family=socket.AF_INET,type=socket.SOCK_STREAM)
             if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):raise ValueError('nonpublic address')
             with socket.create_connection(addresses[0][4][:2],timeout=20) as remote:
                 self.send_response(200);self.end_headers()
@@ -28,7 +28,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             size+=len(b)
                             if size>256*1024*1024:return
                             k.data.sendall(b)
-        except (OSError,ValueError):return
+        except (OSError,ValueError) as e:
+            print('hermetic fetch proxy: '+str(e),file=sys.stderr,flush=True);return
     def do_POST(self):
         if self.server.profile!='model' or self.path!='/v1/chat/completions':self.send_error(403);return
         try:
@@ -69,7 +70,7 @@ def snapshot(source,dest,profile='offline'):
             shutil.copy2(p,q)
     return {'files':count,'bytes':total}
 
-def run(source,argv,profile='offline',seconds=900,keep=True,subdir='',test_env=None,job_root=STATE):
+def _run(source,argv,profile='offline',seconds=900,keep=True,subdir='',test_env=None,job_root=STATE):
     if profile not in {'offline','fetch','model'} or not 1<=seconds<=1800:raise ValueError('invalid profile or time bound')
     if not argv or not all(isinstance(x,str) and '\x00' not in x for x in argv):raise ValueError('command required')
     if subdir and (P(subdir).is_absolute() or '..' in P(subdir).parts):raise ValueError('invalid relative cwd')
@@ -95,7 +96,7 @@ def run(source,argv,profile='offline',seconds=900,keep=True,subdir='',test_env=N
     shutil.copy2(P(__file__).with_name('sandbox_entry.py'),volume/'entry.py')
     disk=job/'input.ext4';size=max(64*1024*1024,info['bytes']+info['files']*8192+32*1024*1024)
     with disk.open('wb') as f:f.truncate(size)
-    subprocess.run(['mkfs.ext4','-q','-F','-N',str(max(1024,info['files']+1000)),'-d',str(volume),str(disk)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=120)
+    subprocess.run(['mkfs.ext4','-q','-F','-N',str(max(1024,info['files']*2+4096)),'-d',str(volume),str(disk)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=120)
     args=['qemu-system-x86_64','-machine','q35,accel=kvm','-cpu','host','-smp','1','-m','1536',
           '-nodefaults','-no-reboot','-display','none','-monitor','none','-serial','stdio',
           '-kernel',str(toolchain/'vmlinuz'),'-initrd',str(toolchain/'initrd'),
@@ -155,6 +156,13 @@ def run(source,argv,profile='offline',seconds=900,keep=True,subdir='',test_env=N
     disk.unlink(missing_ok=True)
     if not keep:shutil.rmtree(volume)
     return result
+
+def run(*args,**kwargs):
+    STATE.mkdir(parents=True,exist_ok=True,mode=0o700)
+    with (STATE/'runner.lock').open('a') as lock:
+        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:raise RuntimeError('another sealed job is running; retry after it finishes')
+        return _run(*args,**kwargs)
 
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--cwd',default=os.getcwd());p.add_argument('--profile',choices=['offline','fetch','model'],default='offline');p.add_argument('--timeout',type=int,default=900);p.add_argument('--keep',action='store_true');p.add_argument('command',nargs=argparse.REMAINDER);a=p.parse_args()

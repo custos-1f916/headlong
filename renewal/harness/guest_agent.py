@@ -58,6 +58,11 @@ def stage(a,repair=False):
 
 def qualification(a):
  r=release(a);m=stage(a)
+ expected=P(__file__).resolve().parents[1]/'toolchain-manifest.json'
+ if expected.exists():
+  meta=json.loads(expected.read_text())
+  for name in ['root.ext4','vmlinuz','initrd']:
+   if digest(S/'toolchain'/name)!=meta[name]:raise ValueError('test toolchain differs from host qualification baseline')
  # The trusted contract suite is not supplied by the candidate.
  canary=r/'.controller'
  if canary.exists():shutil.rmtree(canary)

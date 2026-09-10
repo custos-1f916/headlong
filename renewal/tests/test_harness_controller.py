@@ -52,6 +52,15 @@ class TestController(unittest.TestCase):
     self.c.handle({'action':'deploy','request_id':phase,'artifact':B,'expected_current':A})
     r=self.c.read(self.c.state/'requests'/(phase+'.json'));self.c.save(r,phase,previous={'artifact':A,'commit':C});self.f.selected=B
     Controller(self.tmp.name,self.f).recover();self.assertEqual(self.f.selected,A);self.assertEqual(self.c.read(self.c.state/'requests'/(phase+'.json'))['phase'],'rolled-back')
+ def test_drain_timeout_does_not_kill_active_work(self):
+  self.ready();self.f.fail='drain';self.assertEqual(self.deploy()['phase'],'failed');self.assertIn('abort-drain',self.f.calls);self.assertNotIn('stop',self.f.calls);self.assertNotIn('restore',self.f.calls)
+ def test_interrupted_drain_resumes_old_release(self):
+  self.request('deploy','d',expected_current=A);r=self.c.read(self.c.state/'requests/d.json');self.c.save(r,'draining',previous={'artifact':A,'commit':C})
+  Controller(self.tmp.name,self.f).process_one();self.assertIn('abort-drain',self.f.calls);self.assertNotIn('restore',self.f.calls)
+ def test_failed_restore_remains_recoverable(self):
+  self.request('deploy','d',expected_current=A);r=self.c.read(self.c.state/'requests/d.json');self.c.save(r,'switching',previous={'artifact':A,'commit':C});self.f.fail='restore'
+  with self.assertRaises(RuntimeError):self.c.process_one()
+  self.assertEqual(self.c.read(self.c.state/'requests/d.json')['phase'],'rolling-back');self.f.fail=None;self.c.process_one();self.assertEqual(self.c.read(self.c.state/'requests/d.json')['phase'],'rolled-back')
  def test_conflict_overlay(self):
   self.assertEqual(overlay_action('a','local','a'),'keep');self.assertEqual(overlay_action('a','a','b'),'replace')
   with self.assertRaises(ValueError):overlay_action('a','local','b')
