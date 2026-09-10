@@ -52,10 +52,21 @@ class ClientTests(unittest.TestCase):
   self.srv.response=(200,b'not-json')
   code,stdout,stderr=self.call(['current'])
   self.assertEqual(code,3);self.assertIn('non-JSON',stderr);self.assertNotIn('Traceback',stderr)
- def test_urlopen_raises_surfaces_as_three(self):
-  """The core behavioral regression: a raw URLError becomes exit 3, not a traceback."""
-  def boom(*a,**k):raise urllib.error.URLError('no route to host')
-  with mock.patch.object(client.urllib.request,'urlopen',side_effect=boom):
+ def test_non_object_json_body_exit_three_no_traceback(self):
+  for body in (b'[]', b'null'):
+   self.srv.response=(200,body)
    code,stdout,stderr=self.call(['current'])
-  self.assertEqual(code,3);self.assertIn('unreachable',stderr);self.assertNotIn('Traceback',stderr)
+   self.assertEqual(code,3);self.assertIn('non-object',stderr);self.assertNotIn('Traceback',stderr);self.assertEqual(stdout,'')
+ def test_urlopen_raises_surfaces_as_three(self):
+  """Core transport regression, old-compatible: patched sys.argv + mocked urlopen, main() called with no argv. On the original client this errors with the raw URLError escaping main(); on the new client it is a clean exit 3."""
+  def boom(*a,**k):raise urllib.error.URLError('no route to host')
+  out=io.StringIO();err=io.StringIO()
+  with mock.patch.object(client.urllib.request,'urlopen',side_effect=boom),\
+       mock.patch.object(sys,'argv',['custos-harness','current']),\
+       contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+   code=client.main()
+  self.assertEqual(code,3)
+  self.assertIn('unreachable',err.getvalue())
+  self.assertNotIn('Traceback',err.getvalue())
+  self.assertEqual(out.getvalue(),'')
 if __name__=='__main__':unittest.main()

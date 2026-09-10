@@ -5,7 +5,7 @@ Exit codes:
   1  supervisor answered ok:False (a logical failure, e.g. a bad request)
   2  usage error (argparse)
   3  transport or build error (supervisor unreachable, timeout, HTTP error,
-     non-JSON body, or the local build step failed)
+     non-JSON body, non-object JSON body, or the local build step failed)
 """
 import argparse,json,os,socket,sys,urllib.error,urllib.request
 
@@ -31,9 +31,11 @@ def request(payload,url=None,timeout=None):
   raise HarnessTransportError('supervisor unreachable: %s'%e.reason)
  except (socket.timeout,TimeoutError):
   raise HarnessTransportError('timed out after %ss'%timeout)
- try:return json.loads(body)
+ try:out=json.loads(body)
  except json.JSONDecodeError as e:
   raise HarnessTransportError('non-JSON response body: %s'%e)
+ if not isinstance(out,dict):raise HarnessTransportError('non-object JSON response body: got %s'%type(out).__name__)
+ return out
 
 def main(argv=None):
  p=argparse.ArgumentParser(description=__doc__);s=p.add_subparsers(dest='command',required=True)
