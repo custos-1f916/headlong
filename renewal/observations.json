@@ -86,7 +86,7 @@
       "at": "17:00",
       "tz": "America/Denver",
       "grace_seconds": 14400,
-      "content": "Meal-planning week starts (first text). Follow skill custos-mealplan: `mealplan brief`, propose dinners for the coming Saturday pickup within the family's constraints, one message to the Collette Haus group (or one each to Hal and Dani) — candidates as `Title — <link>` lines, then the questions from `mealplan prefs` — then `mealplan plan proposed`. Track it on one goal for the week (reuse it if it exists)."
+      "content": "Meal-planning week starts (first text). Follow skill custos-mealplan: `mealplan brief`, build a full draft plan for the coming Saturday pickup — one dinner per cook night from Saturday through Friday within the family's constraints, saved with `mealplan plan set` — then ONE message to the Collette Haus group (or one each to Hal and Dani): every day on its own line as `Day: Title — <link>` (leftover/out nights marked), two or three alternates with links, the staples line, then the questions from `mealplan prefs`. Then `mealplan plan proposed`. Track it on one goal for the week (reuse it if it exists)."
     },
     {
       "name": "mealplan-thursday",
@@ -94,7 +94,7 @@
       "at": "17:00",
       "tz": "America/Denver",
       "grace_seconds": 14400,
-      "content": "Check-in day. Follow skill custos-mealplan: `mealplan plan show`. Skipped week → nothing. No first message yet → propose now exactly as on Wednesday (candidates with links, the questions, then `mealplan plan proposed`). Proposed but nobody engaged → one short reminder in the Collette Haus group with the draft as day-by-day links. Engaged → nothing unless one decision is still open."
+      "content": "Check-in day. Follow skill custos-mealplan: `mealplan plan show`. Skipped week → nothing. No first message yet → build and send the full day-by-day draft plan exactly as on Wednesday (every day as `Day: Title — <link>`, alternates, staples line, the questions, then `mealplan plan proposed`). Proposed but nobody engaged → one short reminder in the Collette Haus group with the draft as day-by-day links. Engaged → nothing unless one decision is still open."
     },
     {
       "name": "mealplan-friday",

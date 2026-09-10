@@ -16,16 +16,25 @@ The planning week is the week of the **next Saturday pickup** (`mealplan plan sh
 the brief's `planning` line shows its status, whether the first message went out, whether anyone
 has replied, and how many dinners are drafted). Three scheduled wakes, all 17:00 Mountain:
 
-- **Wednesday 17:00 — the first text** (`schedule: mealplan-wednesday`; the Whole Foods sale week
-  starts Wednesday, so the flyer is fresh and still valid at Saturday's pickup). Read `mealplan
+- **Wednesday 17:00 — the first text is a full draft plan** (`schedule: mealplan-wednesday`; the
+  Whole Foods sale week starts Wednesday, so the flyer is fresh and still valid at Saturday's pickup).
+  Hal, 2026-09-10: a proposal of recipes for each day "is a helpful starting place". Read `mealplan
   brief` — it carries the family's **constraints** (dinners per week, weeknight minutes, servings,
   leftovers, no-repeat window, sale picks, budget cap), their **rules** (e.g. pregnancy-safe food),
-  the **questions** they want asked, candidates from the cookbooks scored by sale matches/ratings/
-  recency, each with its recipe **link**, and the sales as a hint. Pick candidates that satisfy the
-  constraints and what you know about Hal and Dani (person notes), then send ONE message to the
-  `Collette Haus` group (Hal, Dani and you; label from `signal-contacts`), else one each to Hal and
-  Dani: the candidates, one per line as **`Title — <link>`**, the staples line, then the questions from
-  `mealplan prefs`, nothing else. Then `mealplan plan proposed`.
+  the **questions** they want asked, the **staples**, candidates from the cookbooks scored by sale
+  matches/ratings/recency, each with its recipe **link**, and the sales as a hint. Build the draft
+  first: one dinner for each cook night from the pickup Saturday through Friday, honouring the
+  constraints and what you know about Hal and Dani (person notes), and write it down with
+  `mealplan plan set --dinner DATE=SLUG …` (as many `--dinner` as cook nights). Then send ONE message
+  to the `Collette Haus` group (Hal, Dani and you; label from `signal-contacts`), else one each to
+  Hal and Dani, in this order and nothing else:
+  1. the plan, **every day Saturday → Friday on its own line**: `Sat 9/13: Title — <link>`; a
+     leftover night or a night they said they're out reads `Tue 9/16: leftovers` / `out`;
+  2. two or three alternates as `Title — <link>` in case a day misses;
+  3. the staples line (`Staples: milk; extras: —`);
+  4. the questions from `mealplan prefs`.
+  Then `mealplan plan proposed`. They edit from there; a draft they can react to beats a menu they
+  have to assemble.
 - **Replies.** Back and forth about meals and staples is normal and welcome — answer in the
   group, adjust the draft (`mealplan plan set --dinner DATE=SLUG …`, one dinner per day of the
   week they cook, dates from the pickup Saturday onward), record tastes in person notes, standing
@@ -35,8 +44,8 @@ has replied, and how many dinners are drafted). Three scheduled wakes, all 17:00
   acknowledgement, and nothing more that week — no reminder, no cart. `mealplan plan resume` if
   they change their mind.
 - **Thursday 17:00** (`schedule: mealplan-thursday`): `mealplan plan show`. If the week is
-  skipped: nothing. If no first message went out yet (no `proposed`): propose now exactly as on
-  Wednesday. If it went out but nobody replied (no `engaged`): one short reminder in the group
+  skipped: nothing. If no first message went out yet (no `proposed`): build and send the full draft plan
+  exactly as on Wednesday. If it went out but nobody replied (no `engaged`): one short reminder in the group
   with the draft as day-by-day links. If they have engaged: nothing, unless a decision is still
   open (then ask that one question).
 - **Friday 17:00 — cart setup** (`schedule: mealplan-friday`). Skipped week: nothing. No reply all
