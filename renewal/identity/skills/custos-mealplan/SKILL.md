@@ -10,40 +10,56 @@ Hal set this up on 2026-09-09 as a standing job. The kitchen service on LXC 128
 grocery cart driver; `mealplan` is its CLI (`mealplan --help` for every shape). You
 never hold Amazon credentials; the cart driver does, on the kitchen box.
 
-## The week
+## The week (Hal, 2026-09-10: "We can always decline, that's a valid way to stop the week's meal plan")
 
-- **Monday wake** (`schedule: mealplan-monday`): read `mealplan brief` — it carries the
-  family's **constraints** (dinners per week, weeknight minutes, servings, leftovers, no-repeat
-  window, sale picks, budget cap), their **rules** (e.g. pregnancy-safe food), the **questions**
-  they want asked, candidates from the cookbooks scored by sale matches/ratings/recency, and the
-  sales as a hint (the sale week changes Wednesday). Pick candidates that satisfy the constraints
-  and what you know about Hal and Dani (person notes), then send ONE message to the `Collette Haus` group
-  (Hal, Dani and you; label from `signal-contacts`), else one each to Hal and Dani: the candidates in a few words
-  each, then the questions from `mealplan prefs`, nothing else. Record answers: tastes into person
-  notes, standing rules and constraint changes into `mealplan learn rules …` /
-  `mealplan constraint KEY VALUE`, and the draft with `mealplan plan set`.
+The planning week is the week of the **next Saturday pickup** (`mealplan plan show` defaults to it;
+the brief's `planning` line shows its status, whether the first message went out, whether anyone
+has replied, and how many dinners are drafted). Three scheduled wakes, all 17:00 Mountain:
+
+- **Wednesday 17:00 — the first text** (`schedule: mealplan-wednesday`; the Whole Foods sale week
+  starts Wednesday, so the flyer is fresh and still valid at Saturday's pickup). Read `mealplan
+  brief` — it carries the family's **constraints** (dinners per week, weeknight minutes, servings,
+  leftovers, no-repeat window, sale picks, budget cap), their **rules** (e.g. pregnancy-safe food),
+  the **questions** they want asked, candidates from the cookbooks scored by sale matches/ratings/
+  recency, each with its recipe **link**, and the sales as a hint. Pick candidates that satisfy the
+  constraints and what you know about Hal and Dani (person notes), then send ONE message to the
+  `Collette Haus` group (Hal, Dani and you; label from `signal-contacts`), else one each to Hal and
+  Dani: the candidates, one per line as **`Title — <link>`**, then the questions from `mealplan
+  prefs`, nothing else. Then `mealplan plan proposed`.
+- **Replies.** Back and forth about meals and staples is normal and welcome — answer in the
+  group, adjust the draft (`mealplan plan set --dinner DATE=SLUG …`, one dinner per day of the
+  week they cook, dates from the pickup Saturday onward), record tastes in person notes, standing
+  rules and constraint changes with `mealplan learn rules …` / `mealplan constraint KEY VALUE`. The
+  first reply from either of them about the plan → `mealplan plan engaged`. **Declining is a valid
+  answer**: "not this week", "skip it", "we're away" → `mealplan plan skip --note "…"`, one-line
+  acknowledgement, and nothing more that week — no reminder, no cart. `mealplan plan resume` if
+  they change their mind.
+- **Thursday 17:00** (`schedule: mealplan-thursday`): `mealplan plan show`. If the week is
+  skipped: nothing. If no first message went out yet (no `proposed`): propose now exactly as on
+  Wednesday. If it went out but nobody replied (no `engaged`): one short reminder in the group
+  with the draft as day-by-day links. If they have engaged: nothing, unless a decision is still
+  open (then ask that one question).
+- **Friday 17:00 — cart setup** (`schedule: mealplan-friday`). Skipped week: nothing. No reply all
+  week: treat it as declined — one line in the group ("no plan this week; say the word if you want
+  one") and stop. Otherwise `mealplan plan finalize` (writes the meal plan into the catalog),
+  `mealplan list build` (ingredients → grocery items, pantry staples skipped, quantities rounded to
+  packages), then `mealplan cart fill`. Read the result: items placed, items it could not match,
+  subtotal. Then message the group: the plan **day by day, each day as `Weekday: Title — <link>`**,
+  the list, the subtotal, what could not be matched, and how the order gets placed (see Money:
+  Hal places it from the Amazon app and picks the Saturday window). Keep the goal open until the
+  order is placed.
 - **The knobs are theirs.** Dani and Hal want to iterate on what you ask and how you optimize
-  (2026-09-09). When either of them says "ask us X on Mondays" or "never plan more than N
+  (2026-09-09). When either of them says "ask us X on Wednesdays" or "never plan more than N
   new recipes a week" — in the group or in a DM, Dani's word counts exactly like Hal's here —
   change the questions/rules/constraints with `mealplan learn` / `mealplan constraint` and
   confirm in one line. The starting constraints were seeded by the deploy agent, not by them,
-  so treat every one as provisional until they have weighed in. Don't hard-code preferences in your own
-  memory that belong in those lists; the lists are what the brief shows you every week.
-- **Wednesday** (`schedule: mealplan-wednesday`, no message): `mealplan sales --refresh`.
-  If a sale changes a pick for the better, swap it in the draft; do not message unless a
-  swap needs a decision.
-- **Thursday wake** (`schedule: mealplan-thursday`): send the draft plan (day → dish,
-  one line each) and the shopping list summary (`mealplan list preview`), ask for last
-  changes. One message per person.
-- **Friday wake** (`schedule: mealplan-friday`): `mealplan plan finalize` (writes the
-  meal plan into the catalog), `mealplan list build` (ingredients → grocery items,
-  pantry staples skipped, quantities rounded to packages), then `mealplan cart fill`.
-  Read the result: items placed, items it could not match, subtotal. Then message Hal
-  and Dani: the plan, the list, the subtotal, and what could not be matched — and how
-  the order gets placed this week (see Money). Keep the goal open until the order
-  receipt exists (`mealplan order status`).
+  so treat every one as provisional until they have weighed in. Don't hard-code preferences in your
+  own memory that belong in those lists; the lists are what the brief shows you every week.
+- **Links, always.** Every recipe you name in Signal carries its Mealie link (the `url` in the
+  brief, `mealplan recipes`, `mealplan plan show`): `https://recipes.ha1.io/g/home/r/<slug>`, open
+  on the LAN without a login. A plan without links is not a plan they can read.
 - Record what you learn (a dish they loved, a brand they prefer, "never again") in
-  person notes and with `mealplan learn`, not in new goals.
+  person notes and with `mealplan learn`, not in new goals. One goal per planning week; reuse it.
 
 ## The cookbooks (Hal, 2026-09-10: "hoist it into tasks that Custos gets to over time")
 
@@ -64,13 +80,13 @@ https://recipes.ha1.io. You review and remember. Two triggers:
   `mealplan recipe SLUG`, and for each write `mealplan studied SLUG --note "…"` — one line that
   ties the recipe to this family (time on a weeknight, the pregnancy rule, a brand or cut they
   buy, who would like it, a swap that would make it fit). Ten a wake is plenty; the notes feed
-  the Monday brief and your own recall.
+  the Wednesday brief and your own recall.
 
 Never copy recipes into memory — the catalog holds them. Memory is for judgment: what fits, what
-they said, what worked. **Thin start:** on any scheduled wake, if the catalog holds fewer than
-about 20 recipes or there is no draft plan yet for the week, send one line to Hal only ("catalog
-is thin, N recipes; I'll start planning once the books are in" / "no plan drafted this week,
-nothing to remind about") and stop — no message to Dani or the group until there is a real plan.
+they said, what worked. **Thin start:** if the catalog holds fewer than about 20 recipes, send
+one line to Hal only ("catalog is thin, N recipes; I'll start planning once the books are in") and
+stop. (Since 2026-09-10 the catalog holds the Molly Baz Website cookbook, so this no longer applies
+unless something is wrong.)
 
 ## The Whole Foods cart (Tier 1: you fill it, Hal places the order)
 

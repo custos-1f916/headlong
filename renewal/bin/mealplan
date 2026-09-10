@@ -5,8 +5,11 @@
   mealplan sales [--refresh]             this week's Whole Foods deals for the family's store
   mealplan recipes [--q text] [--book B] one line per recipe
   mealplan recipe SLUG                   ingredients + steps
-  mealplan plan show [--week YYYY-Www]   the week's plan (default: next week)
+  mealplan plan show [--week YYYY-Www]   the week's plan (default: the week of the next Saturday pickup)
   mealplan plan set --week W --dinner DATE=SLUG ... [--note text]
+  mealplan plan proposed                 record that the week's first message went out
+  mealplan plan engaged                  record that Hal or Dani replied about the plan
+  mealplan plan skip [--note text]       they declined this week: no reminder, no cart (plan resume undoes it)
   mealplan plan finalize [--week W]      writes dinners into the catalog's meal planner
   mealplan list build [--week W]         ingredients -> grocery lines (pantry staples set aside)
   mealplan list preview [--week W]       print the current list
@@ -66,7 +69,8 @@ def call(method, path, body=None, params=None):
 
 
 def next_week():
-    d = date.today() + timedelta(weeks=1); y, w, _ = d.isocalendar(); return f"{y}-W{w:02d}"
+    """The week being planned: the ISO week of the next Saturday pickup strictly after today."""
+    d = date.today(); d = d + timedelta(days=((5 - d.weekday()) % 7) or 7); y, w, _ = d.isocalendar(); return f"{y}-W{w:02d}"
 
 
 def show_prefs(p):
@@ -78,9 +82,9 @@ def show_prefs(p):
 
 
 def show_plan(p):
-    print(f"week {p['week']} (pickup {p['pickup']}) status={p['status']}")
+    print(f"week {p['week']} (pickup {p['pickup']}) status={p['status']} proposed={p.get('proposed_at') or '-'} engaged={p.get('engaged_at') or '-'}")
     for d in p.get("dinners", []):
-        print(f"  {d.get('date') or '????-??-??'}  {d['title']}  [{d['slug']}]" + (f"  — {d['note']}" if d.get("note") else ""))
+        print(f"  {d.get('date') or '????-??-??'}  {d['title']}  [{d['slug']}]  {d.get('url') or ''}" + (f"  — {d['note']}" if d.get("note") else ""))
     for n in p.get("notes", [])[-3:]:
         print(f"  note {n['at']}: {n['text']}")
     if p.get("list"):
@@ -98,12 +102,13 @@ def main():
         b = call("GET", "/brief")
         if a.json:
             print(json.dumps(b, indent=1)); return
-        print(f"brief {b['generated']}: catalog {b['catalog_size']} recipes; planning {b['next_week']}; sales at {b['sales']['store']} valid to {b['sales']['valid']} ({b['sales']['count']} deals)")
+        pl = b.get("plan") or {}
+        print(f"brief {b['generated']}: catalog {b['catalog_size']} recipes; planning {b['next_week']} (pickup {b['week_pickup']}, status={pl.get('status') or 'draft'}, proposed={pl.get('proposed_at') or '-'}, engaged={pl.get('engaged_at') or '-'}, {len(pl.get('dinners') or [])} dinners drafted); sales at {b['sales']['store']} valid to {b['sales']['valid']} ({b['sales']['count']} deals)")
         print("cookbooks:", "; ".join(f"{b['book']} ({b['recipes']} recipes, {b['flags']} flags{'' if b['reviewed'] else ', NOT reviewed'})" for b in b.get("books", [])) or "(none scanned yet)", f"| {b.get('unstudied_recipes', 0)} recipes not yet studied")
         print("candidates (score: sale matches, rating, not recent):")
         for c in b["candidates"]:
             flags = (" ON SALE: " + ", ".join(c["on_sale"]) if c["on_sale"] else "") + (" (recent)" if c["recent"] else "")
-            print(f"  - {c['title']} [{c['slug']}] {c['book'] or ''} {c['yield'] or ''} {c['time'] or ''} rating={c['rating'] or '-'}{flags}")
+            print(f"  - {c['title']} [{c['slug']}] {c['book'] or ''} {c['yield'] or ''} {c['time'] or ''} rating={c['rating'] or '-'}{flags}\n    {c.get('url') or ''}")
         print("top sales:"); [print("  - " + s) for s in b["sales"]["top"]]
         show_prefs(b["prefs"])
         print("recent plans:"); [print(f"  {r['week']}: {', '.join(r['dinners']) or '(none)'}") for r in b["recent_plans"]]
@@ -132,10 +137,15 @@ def main():
             if a.note:
                 body["note"] = a.note
             show_plan(call("POST", f"/plans/{wk}", body))
+        elif a.sub in ("proposed", "engaged", "skip", "resume"):
+            body = {a.sub: True}
+            if a.note:
+                body["note"] = a.note
+            show_plan(call("POST", f"/plans/{wk}", body))
         elif a.sub == "finalize":
             show_plan(call("POST", f"/plans/{wk}/finalize", {}))
         else:
-            sys.exit("plan show|set|finalize")
+            sys.exit("plan show|set|proposed|engaged|skip|resume|finalize")
     elif a.cmd == "list":
         p = call("POST", f"/plans/{wk}/list", {}) if a.sub == "build" else call("GET", f"/plans/{wk}")
         show_plan(p)

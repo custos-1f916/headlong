@@ -81,20 +81,12 @@
   },
   "schedules": [
     {
-      "name": "mealplan-monday",
-      "weekday": "monday",
-      "at": "09:00",
-      "tz": "America/Denver",
-      "grace_seconds": 21600,
-      "content": "Meal-planning week starts. Follow skill custos-mealplan: read `mealplan brief`, propose dinners from the cookbooks within the family's constraints, one message to the Collette Haus group (or one each to Hal and Dani) with the questions from `mealplan prefs`. Track it on one goal for the week (reuse it if it exists)."
-    },
-    {
       "name": "mealplan-wednesday",
       "weekday": "wednesday",
-      "at": "10:00",
+      "at": "17:00",
       "tz": "America/Denver",
-      "grace_seconds": 21600,
-      "content": "New Whole Foods sale week. Follow skill custos-mealplan: `mealplan sales --refresh`, adjust the draft for real sales, no message unless a swap needs a decision."
+      "grace_seconds": 14400,
+      "content": "Meal-planning week starts (first text). Follow skill custos-mealplan: `mealplan brief`, propose dinners for the coming Saturday pickup within the family's constraints, one message to the Collette Haus group (or one each to Hal and Dani) — candidates as `Title — <link>` lines, then the questions from `mealplan prefs` — then `mealplan plan proposed`. Track it on one goal for the week (reuse it if it exists)."
     },
     {
       "name": "mealplan-thursday",
@@ -102,15 +94,15 @@
       "at": "17:00",
       "tz": "America/Denver",
       "grace_seconds": 14400,
-      "content": "Reminder day. Follow skill custos-mealplan: send the Collette Haus group (or Hal and Dani) the draft plan and the list summary, ask for last changes before Friday's order."
+      "content": "Check-in day. Follow skill custos-mealplan: `mealplan plan show`. Skipped week → nothing. No first message yet → propose now exactly as on Wednesday (candidates with links, the questions, then `mealplan plan proposed`). Proposed but nobody engaged → one short reminder in the Collette Haus group with the draft as day-by-day links. Engaged → nothing unless one decision is still open."
     },
     {
       "name": "mealplan-friday",
       "weekday": "friday",
-      "at": "09:00",
+      "at": "17:00",
       "tz": "America/Denver",
-      "grace_seconds": 21600,
-      "content": "Order day. Follow skill custos-mealplan: finalize the plan, build the list, fill the cart, then message Hal and Dani the plan, groceries, subtotal and how the order is placed this week. Money rules apply: never check out without the host-verified GO."
+      "grace_seconds": 14400,
+      "content": "Cart setup. Follow skill custos-mealplan: skipped week or no reply all week → one line to the group at most, no cart. Otherwise finalize the plan, build the list, fill the cart, then message the Collette Haus group the plan day by day (`Weekday: Title — <link>`), groceries, subtotal, and that Hal places the order and picks the Saturday window in the Amazon app. Money rules apply: never check out."
     }
   ]
 }
