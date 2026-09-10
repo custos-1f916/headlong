@@ -3,7 +3,7 @@ import json,os,pathlib,shutil,subprocess,tempfile,unittest
 
 class Handoff(unittest.TestCase):
  def test_yield_after_atomic_step(self):
-  root=pathlib.Path(os.environ['HEADLONG_ROOT'])
+  root=pathlib.Path(os.environ.get('HEADLONG_ROOT',pathlib.Path(__file__).resolve().parents[2]/'runtime/headlong'))
   with tempfile.TemporaryDirectory() as d:
    p=pathlib.Path(d);b=p/'bin';shutil.copytree(root/'bin',b)
    marker=p/'maintenance';calls=p/'calls';completed=p/'completed'
