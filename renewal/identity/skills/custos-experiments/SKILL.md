@@ -28,8 +28,10 @@ Never start a second chooser, a background model worker, a retry loop, or anothe
 Long non-model jobs (a Godot test suite, a build, an emulator boot) are different: start them in the background with their output in a file and read the file in a later step or wake, instead of waiting inside a step:
 
 ```bash
-nohup godot --headless --path . --main-scene res://scenes/unit_test_runner.tscn > /tmp/unit.log 2>&1 &
+nohup hermetic --cwd "$PWD" --timeout 600 -- godot --headless --path /work --main-scene res://scenes/unit_test_runner.tscn > /tmp/unit.log 2>&1 &
 echo $! > /tmp/unit.pid   # later: tail -20 /tmp/unit.log; kill "$(cat /tmp/unit.pid)" if it hangs
 ```
 
 The inactivity watchdog kills a step that prints nothing for five minutes; a background job never trips it. Killing a child you started is fine; the shellm guard refuses signals aimed at your own run, dispatcher or service.
+
+For your own harness, use `skills show custos-harness`: editable upstream source, sealed tests, exact artifacts and host-supervised deployment are the standing path.

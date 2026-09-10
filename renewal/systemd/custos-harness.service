@@ -1,0 +1,13 @@
+[Unit]
+Description=Custos LXC122 harness deployment supervisor
+After=network-online.target
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/custos-harness/harness/host_service.py
+Restart=always
+RestartSec=10
+UMask=0077
+TimeoutStopSec=10
+KillMode=control-group
+[Install]
+WantedBy=multi-user.target
