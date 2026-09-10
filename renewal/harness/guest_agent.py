@@ -89,11 +89,12 @@ def alive(pid):
 def drain(rid):
  c=checkpoint_dir(rid);atomic_json(MAINT,{'request_id':rid,'since':time.time()})
  call(['systemctl','stop',TIMER])
+ call(['systemctl','stop','headlong-web.service'],timeout=100)
  # Intake is durable at the upstream relays; stop pulling new work, but let
  # current observer writes finish. Observer is bounded; never kill it mid-write.
  deadline=time.monotonic()+660
  while time.monotonic()<deadline:
-  if call(['systemctl','is-active','custos-observe.service'],check=False).returncode:break
+  if call(['systemctl','show','-p','ActiveState','--value','custos-observe.service']).stdout.strip() in {'inactive','failed'}:break
   time.sleep(1)
  else:raise TimeoutError('observer did not drain')
  call(['systemctl','stop','custos-relay-bridge.service'])
@@ -128,6 +129,7 @@ def abort_drain(rid):
  pid=int(call(['systemctl','show','-p','MainPID','--value',MIND]).stdout.strip() or '0')
  if pid>1 and alive(pid):os.kill(pid,signal.SIGCONT)
  MAINT.unlink(missing_ok=True)
+ call(['systemctl','start','headlong-web.service'])
  if not paused():call(['systemctl','start','custos-relay-bridge.service',TIMER])
  return {'ok':True}
 
@@ -142,7 +144,7 @@ def stop(rid):
  except (FileNotFoundError,ProcessLookupError):pass
  deadline=time.monotonic()+45
  while time.monotonic()<deadline:
-  if all(call(['systemctl','is-active',n],check=False).returncode for n in WRITERS):break
+  if all(call(['systemctl','show','-p','ActiveState','--value',n]).stdout.strip() in {'inactive','failed'} for n in WRITERS):break
   time.sleep(1)
  else:raise TimeoutError('guest services did not stop')
  return {'ok':True}

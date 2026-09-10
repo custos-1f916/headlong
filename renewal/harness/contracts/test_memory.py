@@ -21,7 +21,7 @@ sys.path.insert(0, os.environ.get("CUSTOS_RENEWAL_DIR", "/work/renewal"))
 import custos_memory as cm
 import custos_transport as ct
 
-HEADLONG = Path(os.environ.get("HEADLONG_ROOT", Path(__file__).resolve().parents[3] / "headlong"))
+HEADLONG = Path(os.environ.get("HEADLONG_ROOT", "/work/runtime/headlong"))
 
 
 def capture_worker(directory, native_mem, payload):
