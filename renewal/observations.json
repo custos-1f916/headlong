@@ -32,6 +32,14 @@
       ],
       "interval_seconds": 21600,
       "enabled": true
+    },
+    {
+      "name": "kitchen",
+      "url": "http://192.168.86.63:8090/feed.xml",
+      "terms": [],
+      "interval_seconds": 3600,
+      "enabled": true,
+      "purpose": "Hal's kitchen service: cookbook imports and page flags (skill custos-mealplan)"
     }
   ],
   "github_projects": [
@@ -70,5 +78,39 @@
       "tooling",
       "results"
     ]
-  }
+  },
+  "schedules": [
+    {
+      "name": "mealplan-monday",
+      "weekday": "monday",
+      "at": "09:00",
+      "tz": "America/Denver",
+      "grace_seconds": 21600,
+      "content": "Meal-planning week starts. Follow skill custos-mealplan: read `mealplan brief`, propose dinners from the cookbooks within the family's constraints, one message to the Kitchen group (or one each to Hal and Dani) with the questions from `mealplan prefs`. Track it on one goal for the week (reuse it if it exists)."
+    },
+    {
+      "name": "mealplan-wednesday",
+      "weekday": "wednesday",
+      "at": "10:00",
+      "tz": "America/Denver",
+      "grace_seconds": 21600,
+      "content": "New Whole Foods sale week. Follow skill custos-mealplan: `mealplan sales --refresh`, adjust the draft for real sales, no message unless a swap needs a decision."
+    },
+    {
+      "name": "mealplan-thursday",
+      "weekday": "thursday",
+      "at": "17:00",
+      "tz": "America/Denver",
+      "grace_seconds": 14400,
+      "content": "Reminder day. Follow skill custos-mealplan: send the Kitchen group (or Hal and Dani) the draft plan and the list summary, ask for last changes before Friday's order."
+    },
+    {
+      "name": "mealplan-friday",
+      "weekday": "friday",
+      "at": "09:00",
+      "tz": "America/Denver",
+      "grace_seconds": 21600,
+      "content": "Order day. Follow skill custos-mealplan: finalize the plan, build the list, fill the cart, then message Hal and Dani the plan, groceries, subtotal and how the order is placed this week. Money rules apply: never check out without the host-verified GO."
+    }
+  ]
 }
