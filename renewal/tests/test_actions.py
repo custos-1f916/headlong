@@ -38,6 +38,69 @@ class ActionsTests(unittest.TestCase):
         self.assertEqual(self.channel.handle(self.p)['phase'],'submitted')
         with self.assertRaises(ValueError): self.channel.handle({**self.p,'message':'different'})
 
+    def test_inline_ask_holds_the_dm_until_the_answer_is_read_or_the_wait_ends(self):
+        """Hal/Jack/Kim 2026-09-10: Custos asks Kim inline; her reply is read by the asking step,
+        never delivered as a wake, until the hold is released or expires (then it is annotated)."""
+        KIM = '00000000-0000-4000-8000-00000000000b'
+        policy = copy.deepcopy(POLICY); policy['people'][KIM] = {'label': 'Kim', 'authority': 'external', 'bot': True}
+        self.policy.write_text(json.dumps(policy))
+        self.channel.spool = str(self.root / 'signal.sqlite')
+        ask = {'action': 'signal-ask', 'request_id': 'ask-1', 'target': 'Kim', 'message': 'Research request: what is a levain? [done] please', 'wait_seconds': 120}
+        with self.assertRaises(ValueError):  # groups cannot be held
+            self.channel.handle({**ask, 'target': 'Group'})
+        r = self.channel.handle(ask)
+        self.assertEqual((r['phase'], r['conversation']), ('queued', 'dm:' + KIM))
+        with self.assertRaises(ValueError):  # one open ask per conversation
+            self.channel.handle({**ask, 'request_id': 'ask-2'})
+        with patch.object(cs, 'paused', return_value=False):
+            self.bridge.proactive()
+        self.bridge.rpc.call.assert_called_once_with('send', {'message': ask['message'], 'recipient': [KIM]})
+        # Kim answers in two messages: pending in the spool, but never delivered while held.
+        base = int((r['hold_expires'] - 120) * 1000) + 5000
+        from test_signal import envelope
+        for n, text in enumerate(['A levain is a sourdough preferment.', 'Flour, water, starter. [done]']):
+            item = cs.classify(envelope(sender=KIM, message=text, timestamp=base + n * 1000), policy)
+            self.bridge.spool.receive(item)
+            with self.bridge.spool.db:
+                self.bridge.spool.db.execute('UPDATE inbox SET arrived=? WHERE id=?', (0.0, item['request_id']))
+        sent = []
+        with patch.object(cs, 'transport', side_effect=lambda args, content='': sent.append(content) or {'queued': True}):
+            self.bridge.deliver_pending(self.bridge.spool.db)
+        self.assertEqual(sent, [])
+        got = self.channel.handle({'action': 'signal-await', 'request_id': 'ask-1'})
+        self.assertEqual([x['body'] for x in got['replies']], ['A levain is a sourdough preferment.', 'Flour, water, starter. [done]'])
+        self.assertTrue(got['hold_active'])
+        self.assertEqual({row[0] for row in self.bridge.spool.db.execute("SELECT phase FROM inbox")}, {'consumed'})
+        self.assertEqual(self.channel.handle({'action': 'signal-await', 'request_id': 'ask-1'})['replies'][0]['body'], 'A levain is a sourdough preferment.')
+        self.assertTrue(self.channel.handle({'action': 'signal-release', 'request_id': 'ask-1'})['released'])
+        self.assertFalse(self.channel.handle({'action': 'signal-await', 'request_id': 'ask-1'})['hold_active'])
+        # Consumed rows never surface as wakes even after release.
+        with patch.object(cs, 'transport', side_effect=lambda args, content='': sent.append(content) or {'queued': True}):
+            self.bridge.deliver_pending(self.bridge.spool.db)
+        self.assertEqual(sent, [])
+        # A second ask too soon is refused; after the spacing it is fine; the budget is a day's worth.
+        with self.assertRaises(ValueError):
+            self.channel.handle({**ask, 'request_id': 'ask-3'})
+        with ca.connect(self.state) as db:
+            db.execute("UPDATE actions SET created=created-100 WHERE id='ask-1'")
+        r3 = self.channel.handle({**ask, 'request_id': 'ask-3', 'wait_seconds': 30})
+        # The wait ends without an answer: the late reply is delivered as a wake, annotated.
+        with ca.connect(self.state) as db:
+            db.execute("UPDATE holds SET expires=? WHERE request_id='ask-3'", (r3['hold_expires'] - 31,))
+        late = cs.classify(envelope(sender=KIM, message='Sorry, late: it is a preferment.', timestamp=base + 900000), policy)
+        self.bridge.spool.receive(late)
+        with self.bridge.spool.db:
+            self.bridge.spool.db.execute('UPDATE inbox SET arrived=? WHERE id=?', (0.0, late['request_id']))
+        with patch.object(cs, 'transport', side_effect=lambda args, content='': sent.append(content) or {'queued': True}):
+            self.bridge.deliver_pending(self.bridge.spool.db)
+        self.assertEqual(len(sent), 1); self.assertIn('answer to your inline ask ask-3', sent[0])
+        with ca.connect(self.state) as db:
+            for n in range(ca.ASK_DAILY):
+                db.execute('INSERT INTO actions(id,payload,created) VALUES(?,?,?)', ('b%d' % n, ca.encoded({'action': 'signal-ask'}), 1e12))
+            db.execute("UPDATE actions SET created=strftime('%s','now')-1000 WHERE id LIKE 'b%'")
+        with self.assertRaises(ValueError):
+            self.channel.handle({**ask, 'request_id': 'ask-9'})
+
     def test_every_allowlisted_person_and_only_the_approved_group_resolve(self):
         for dest in ca.destinations(POLICY): self.assertEqual(ca.resolve(dest['target'],POLICY),dest['target'])
         labelled = {**POLICY, 'groups': ['g1', 'g2'], 'group_labels': {'g1': 'Collette Haus'}}

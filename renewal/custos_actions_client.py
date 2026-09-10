@@ -7,6 +7,7 @@ custos-actions automata-status
 custos-actions automata-deploy < {request_id,goal_id,commit}.json
 custos-actions automata-rollback < {request_id,goal_id}.json
 custos-actions status REQUEST_ID
+(inline asks: see bin/ask-agent — signal-ask / signal-await / signal-release)
 Queue acceptance is not delivery. Reuse the exact request ID/payload on timeout.
 
 signal-send goes through the same conversation guard as `chat` (when the caller
@@ -79,17 +80,17 @@ def record(route, message, request_id, phase):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('action', choices=['signal-contacts', 'signal-send', 'automata-status', 'automata-deploy', 'automata-rollback', 'status'])
+    p.add_argument('action', choices=['signal-contacts', 'signal-send', 'signal-ask', 'signal-await', 'signal-release', 'automata-status', 'automata-deploy', 'automata-rollback', 'status'])
     p.add_argument('request_id', nargs='?'); args = p.parse_args()
     try:
-        if args.action in ('signal-send', 'automata-deploy', 'automata-rollback'):
+        if args.action in ('signal-send', 'signal-ask', 'automata-deploy', 'automata-rollback'):
             raw = sys.stdin.buffer.read(32769)
             if len(raw) > 32768: raise ValueError('request too large')
             payload = json.loads(raw)
             if not isinstance(payload, dict) or 'action' in payload: raise ValueError('object without action required')
         else:
             payload = {}
-        if args.action == 'status':
+        if args.action in ('status', 'signal-await', 'signal-release'):
             if not args.request_id: raise ValueError('request ID required')
             payload['request_id'] = args.request_id
         elif args.request_id:

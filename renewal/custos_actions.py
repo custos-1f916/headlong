@@ -22,6 +22,8 @@ from custos_signal import load_policy, encoded, MAX_TEXT
 
 STATE = '/var/lib/custos-actions/actions.sqlite'
 POLICY = '/etc/custos-signal/policy.json'
+SPOOL = '/var/lib/custos-signal-bridge/spool.sqlite'  # the bridge's inbox, read here for inline asks
+ASK_DAILY, ASK_SPACING, ASK_WAIT_MAX, ASK_ANNOTATE = 8, 60, 900, 1800  # Jack and Kim approved ~8/day (2026-09-10)
 CHECKOUT = '/opt/custos/work/repos/collettiquette/automata'
 MAX_BODY = 32768
 
@@ -41,7 +43,27 @@ def connect(path=STATE):
     db.execute('PRAGMA synchronous=FULL')
     db.execute('CREATE TABLE IF NOT EXISTS actions (id TEXT PRIMARY KEY, payload TEXT NOT NULL, '
                "phase TEXT NOT NULL DEFAULT 'queued', receipt TEXT, created REAL NOT NULL)")
+    # An inline ask holds one DM conversation: the bridge does not deliver its replies as wakes
+    # while the hold is live; the asking step reads them through signal-await instead.
+    db.execute('CREATE TABLE IF NOT EXISTS holds (conversation TEXT PRIMARY KEY, request_id TEXT NOT NULL, '
+               'created REAL NOT NULL, expires REAL NOT NULL, released REAL)')
     return db
+
+
+def active_hold(db, conversation, now=None):
+    row = db.execute('SELECT * FROM holds WHERE conversation=?', (conversation,)).fetchone()
+    if row and row['released'] is None and row['expires'] > (now or time.time()):
+        return row
+    return None
+
+
+def recent_ask(db, conversation, now=None):
+    """An ask whose hold ended (expired, not released) within ASK_ANNOTATE: a late answer is probably its."""
+    row = db.execute('SELECT * FROM holds WHERE conversation=?', (conversation,)).fetchone()
+    now = now or time.time()
+    if row and row['released'] is None and row['expires'] <= now < row['expires'] + ASK_ANNOTATE:
+        return row['request_id']
+    return None
 
 
 def destinations(policy):
@@ -65,17 +87,22 @@ def validate(payload, policy):
     if not isinstance(payload, dict):
         raise ValueError('object required')
     action = payload.get('action')
-    fields = {'signal-send': {'target', 'message'}, 'automata-deploy': {'commit', 'goal_id'},
-              'automata-rollback': {'goal_id'}}
+    fields = {'signal-send': {'target', 'message'}, 'signal-ask': {'target', 'message', 'wait_seconds'},
+              'automata-deploy': {'commit', 'goal_id'}, 'automata-rollback': {'goal_id'}}
     if action not in fields or set(payload) != fields[action] | {'action', 'request_id'}:
         raise ValueError('invalid action fields')
     if not isinstance(payload['request_id'], str) or not re.fullmatch(r'[A-Za-z0-9:._-]{1,128}', payload['request_id']):
         raise ValueError('stable request_id required')
     p = dict(payload)
-    if action == 'signal-send':
+    if action in ('signal-send', 'signal-ask'):
         p['target'] = resolve(p['target'], policy)
         if not isinstance(p['message'], str) or not p['message'].strip() or len(p['message'].encode()) > MAX_TEXT:
             raise ValueError('message must contain 1..12000 UTF-8 bytes')
+        if action == 'signal-ask':
+            if not p['target'].startswith('dm:'):
+                raise ValueError('an inline ask goes to one person or bot by DM, never a group')
+            if type(p['wait_seconds']) is not int or not 30 <= p['wait_seconds'] <= ASK_WAIT_MAX:
+                raise ValueError('wait_seconds must be 30..%d' % ASK_WAIT_MAX)
     else:
         if not isinstance(p['goal_id'], str) or not re.fullmatch(r'[0-9a-f]{8}', p['goal_id']):
             raise ValueError('native goal_id required')
@@ -90,15 +117,60 @@ def receipt(row):
 
 
 class Channel:
-    def __init__(self, state=STATE, policy=POLICY):
-        self.state, self.policy = state, policy
+    def __init__(self, state=STATE, policy=POLICY, spool=SPOOL):
+        self.state, self.policy, self.spool = state, policy, spool
         connect(state).close()
+
+    def ask_lookup(self, db, payload):
+        if not isinstance(payload.get('request_id'), str):
+            raise ValueError('request_id required')
+        row = db.execute('SELECT * FROM actions WHERE id=?', (payload['request_id'],)).fetchone()
+        if not row or json.loads(row['payload']).get('action') != 'signal-ask':
+            raise ValueError('unknown ask')
+        hold = db.execute('SELECT * FROM holds WHERE request_id=?', (row['id'],)).fetchone()
+        return row, hold
+
+    def await_(self, payload):
+        """Replies that arrived in the held conversation since the ask, taken out of the bridge's
+        delivery path (phase consumed) so they never also become a wake."""
+        with connect(self.state) as db:
+            row, hold = self.ask_lookup(db, payload)
+        if not hold:
+            raise ValueError('ask has no hold record')
+        now = time.time(); replies = []
+        spool = sqlite3.connect(self.spool, timeout=15); spool.row_factory = sqlite3.Row
+        try:
+            with spool:
+                for r in spool.execute("SELECT id,payload,phase FROM inbox WHERE json_extract(payload,'$.conversation')=? "
+                                       "AND json_extract(payload,'$.timestamp')>? AND phase IN ('pending','consumed') "
+                                       "ORDER BY json_extract(payload,'$.timestamp')", (hold['conversation'], int(row['created'] * 1000))):
+                    item = json.loads(r['payload'])
+                    if item.get('reaction') or item['sender_aci'] != hold['conversation'][3:]:
+                        continue
+                    if r['phase'] == 'pending':
+                        spool.execute("UPDATE inbox SET phase='consumed',receipt=? WHERE id=? AND phase='pending'",
+                                      (encoded({'consumed_by': row['id']}), r['id']))
+                    replies.append({'at': item['timestamp'], 'label': item['label'], 'body': item['body']})
+        finally:
+            spool.close()
+        return {'ok': True, 'request_id': row['id'], 'phase': row['phase'], 'replies': replies,
+                'hold_active': hold['released'] is None and hold['expires'] > now, 'hold_expires': hold['expires']}
+
+    def release(self, payload):
+        with connect(self.state) as db:
+            row, hold = self.ask_lookup(db, payload)
+            db.execute('UPDATE holds SET released=? WHERE request_id=? AND released IS NULL', (time.time(), row['id']))
+        return {'ok': True, 'request_id': row['id'], 'released': True}
 
     def handle(self, payload):
         if not isinstance(payload, dict):
             raise ValueError('object required')
         if payload == {'action': 'signal-contacts'}:
             return {'ok': True, 'contacts': destinations(load_policy(self.policy))}
+        if payload.get('action') == 'signal-await' and set(payload) == {'action', 'request_id'}:
+            return self.await_(payload)
+        if payload.get('action') == 'signal-release' and set(payload) == {'action', 'request_id'}:
+            return self.release(payload)
         if payload.get('action') == 'status' and set(payload) == {'action', 'request_id'}:
             if not isinstance(payload['request_id'], str): raise ValueError('request_id required')
             with connect(self.state) as db:
@@ -116,10 +188,27 @@ class Channel:
             if old:
                 if old['payload'] != encoded(p): raise ValueError('request_id belongs to different content')
                 return receipt(old)
+            now = time.time()
+            if p['action'] == 'signal-ask':
+                open_hold = active_hold(db, p['target'], now)
+                if open_hold:
+                    raise ValueError('an ask is already open in that conversation: ' + open_hold['request_id'])
+                day = db.execute("SELECT COUNT(*) FROM actions WHERE json_extract(payload,'$.action')='signal-ask' AND created>?",
+                                 (now - 86400,)).fetchone()[0]
+                if day >= ASK_DAILY:
+                    raise ValueError('daily ask budget (%d) is used up; try tomorrow' % ASK_DAILY)
+                last = db.execute("SELECT MAX(created) FROM actions WHERE json_extract(payload,'$.action')='signal-ask'").fetchone()[0]
+                if last and now - last < ASK_SPACING:
+                    raise ValueError('asks are at least %d s apart' % ASK_SPACING)
+                db.execute('INSERT OR REPLACE INTO holds(conversation,request_id,created,expires,released) VALUES(?,?,?,?,NULL)',
+                           (p['target'], p['request_id'], now, now + p['wait_seconds']))
             db.execute('INSERT INTO actions(id,payload,created) VALUES(?,?,?)',
-                       (p['request_id'], encoded(p), time.time()))
+                       (p['request_id'], encoded(p), now))
             row = db.execute('SELECT * FROM actions WHERE id=?', (p['request_id'],)).fetchone()
-        return receipt(row)
+        result = receipt(row)
+        if p['action'] == 'signal-ask':
+            result.update({'conversation': p['target'], 'hold_expires': now + p['wait_seconds']})
+        return result
 
 
 def run_bounded(args, timeout=90, maximum=1048576):

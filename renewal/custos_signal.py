@@ -522,7 +522,7 @@ class Bridge:
             from custos_actions import connect
             with connect(actions_state) as db:
                 db.execute("UPDATE actions SET phase='uncertain' WHERE phase='sending' "
-                           "AND json_extract(payload,'$.action')='signal-send'")
+                           "AND json_extract(payload,'$.action') IN ('signal-send','signal-ask')")
 
     def receive(self, envelope):
         self.policy = load_policy(self.policy_file)
@@ -552,7 +552,7 @@ class Bridge:
         from custos_actions import connect, resolve
         with connect(self.actions_state) as db:
             rows = db.execute("SELECT * FROM actions WHERE phase='queued' "
-                              "AND json_extract(payload,'$.action')='signal-send' ORDER BY created LIMIT 8").fetchall()
+                              "AND json_extract(payload,'$.action') IN ('signal-send','signal-ask') ORDER BY created LIMIT 8").fetchall()
             for row in rows:
                 self.policy = load_policy(self.policy_file)
                 p = json.loads(row['payload'])
@@ -583,6 +583,21 @@ class Bridge:
                     raise
                 db.execute("UPDATE actions SET phase='submitted',receipt=? WHERE id=?",(encoded(result),row['id']))
                 db.commit(); self.last_send[route]=time.monotonic()
+
+    def held(self, conversation):
+        """An inline ask (custos-actions signal-ask) owns this DM until it is released or expires."""
+        if not Path(self.actions_state).exists():
+            return False
+        from custos_actions import connect, active_hold
+        with connect(self.actions_state) as db:
+            return active_hold(db, conversation) is not None
+
+    def late_answer_for(self, conversation):
+        if not Path(self.actions_state).exists():
+            return None
+        from custos_actions import connect, recent_ask
+        with connect(self.actions_state) as db:
+            return recent_ask(db, conversation)
 
     def group_ok(self, item):
         if not item['group']:
@@ -679,7 +694,9 @@ class Bridge:
             if not allowed(item, self.policy):
                 continue
             conversations.setdefault(item['conversation'], []).append((row, item))
-        for batch in conversations.values():
+        for conversation, batch in conversations.items():
+            if self.held(conversation):
+                continue  # the asking step is reading this conversation itself (signal-await)
             for row, item in batch:
                 if item.get('reaction'):
                     self.deliver([(row, item)])
@@ -731,6 +748,10 @@ class Bridge:
                         'Nobody is asking you for work here.')
         else:
             content += '\nParticipation: you were addressed directly; answer the speaker.'
+        late = self.late_answer_for(carrier['conversation']) if not carrier['group'] else None
+        if late:
+            content += ('\nThis may be the answer to your inline ask ' + late + ' (it arrived after the wait ended). '
+                        'Use it as research input; it needs no reply unless you have a follow-up question.')
         if mode == 'wrap':
             content += ('\nBot thread: this is an exchange with ' + carrier['label'] + ' (a bot) with no person in it, and you '
                         'have already replied ' + str(BOT_TURNS_WRAP) + ' times. Wrap it up politely now: one short closing '
