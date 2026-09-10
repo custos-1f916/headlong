@@ -31,7 +31,8 @@ correlation and reactions remain intact. For a new conversation/message:
 
 1. Run `custos-actions signal-contacts` to read current labels and opaque targets.
    Use the returned exact target, or a unique contact label such as `Dani`.
-   `Group` names the one approved group. Do not guess usernames, phone numbers
+   Groups carry their policy label (`Collette Haus` is the family group with Hal and
+   Dani; `Group` is the unlabelled friends group). Do not guess usernames, phone numbers
    or destination IDs. A contact need not have messaged you first.
 2. Pipe JSON to `custos-actions signal-send`:
 

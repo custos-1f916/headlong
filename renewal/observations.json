@@ -86,7 +86,7 @@
       "at": "09:00",
       "tz": "America/Denver",
       "grace_seconds": 21600,
-      "content": "Meal-planning week starts. Follow skill custos-mealplan: read `mealplan brief`, propose dinners from the cookbooks within the family's constraints, one message to the Kitchen group (or one each to Hal and Dani) with the questions from `mealplan prefs`. Track it on one goal for the week (reuse it if it exists)."
+      "content": "Meal-planning week starts. Follow skill custos-mealplan: read `mealplan brief`, propose dinners from the cookbooks within the family's constraints, one message to the Collette Haus group (or one each to Hal and Dani) with the questions from `mealplan prefs`. Track it on one goal for the week (reuse it if it exists)."
     },
     {
       "name": "mealplan-wednesday",
@@ -102,7 +102,7 @@
       "at": "17:00",
       "tz": "America/Denver",
       "grace_seconds": 14400,
-      "content": "Reminder day. Follow skill custos-mealplan: send the Kitchen group (or Hal and Dani) the draft plan and the list summary, ask for last changes before Friday's order."
+      "content": "Reminder day. Follow skill custos-mealplan: send the Collette Haus group (or Hal and Dani) the draft plan and the list summary, ask for last changes before Friday's order."
     },
     {
       "name": "mealplan-friday",

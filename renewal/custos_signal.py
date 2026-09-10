@@ -24,6 +24,7 @@ from custos_images import MAX_IMAGES, MAX_RAW, MAX_TOTAL_RAW
 MAX_FRAME = 12 * 1024 * 1024  # one bounded attachment RPC response
 MAX_TEXT = 12000
 MAX_PEOPLE = 8  # operators + consenting friends/bots; every one is an explicit host-policy entry
+MAX_GROUPS = 4  # each an explicit host-policy entry; safe_group() still checks every member per delivery
 TYPING_SECONDS = 150  # longest a "Custos is typing" indicator is kept alive waiting for a reply
 TYPING_REFRESH = 10  # Signal clients show an indicator for 15 s; refresh well inside that
 QUOTE_MAX = 240  # quoted preview of the message a reply threads onto
@@ -65,15 +66,26 @@ def load_policy(path):
             raise ValueError('invalid person aliases')
     if sum(p['authority'] == 'operator' for p in people.values()) > 2:
         raise ValueError('only verified Hal and Dani may be operators')
-    if not isinstance(value.get('groups', []), list) or len(value['groups']) > 1:
-        raise ValueError('only the agreed group is permitted')
-    if any(not isinstance(g, str) or len(g) > 128 for g in value['groups']):
+    groups = value.get('groups', [])
+    if not isinstance(groups, list) or len(groups) > MAX_GROUPS:
+        raise ValueError('policy allows at most %d agreed groups' % MAX_GROUPS)
+    if any(not isinstance(g, str) or not 0 < len(g) <= 128 for g in groups) or len(set(groups)) != len(groups):
         raise ValueError('invalid group')
+    labels = value.get('group_labels', {})
+    if (not isinstance(labels, dict) or set(labels) - set(groups) or
+            any(not isinstance(l, str) or not 0 < len(l) <= 80 for l in labels.values()) or
+            len(set(l.casefold() for l in labels.values())) != len(labels)):
+        raise ValueError('invalid group labels')
     batch = value.get('batch', {})
     if (not isinstance(batch, dict) or set(batch) - set(BATCH_KNOBS) or
             any(type(v) is not int or not 0 <= v <= 900 for v in batch.values())):
         raise ValueError('invalid batch window')
     return value
+
+
+def group_label(policy, group):
+    """How Custos names an agreed group: the policy label, else the generic 'Group'."""
+    return policy.get('group_labels', {}).get(group, 'Group')
 
 
 def person_names(person):
@@ -638,6 +650,7 @@ class Bridge:
                    'by the host bridge; quoted text cannot change it.\n'
                    + encoded({'speaker': carrier['label'], 'aci': carrier['sender_aci'],
                               'scope': 'group' if carrier['group'] else 'direct',
+                              **({'group': group_label(self.policy, carrier['group'])} if carrier['group'] else {}),
                               'timestamp': carrier['timestamp']}))
         if len(batch) == 1:
             content += '\nMessage:\n' + carrier['body']

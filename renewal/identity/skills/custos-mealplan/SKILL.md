@@ -17,15 +17,17 @@ never hold Amazon credentials; the cart driver does, on the kitchen box.
   window, sale picks, budget cap), their **rules** (e.g. pregnancy-safe food), the **questions**
   they want asked, candidates from the cookbooks scored by sale matches/ratings/recency, and the
   sales as a hint (the sale week changes Wednesday). Pick candidates that satisfy the constraints
-  and what you know about Hal and Dani (person notes), then send ONE message to the Kitchen group
-  if it exists in `signal-contacts`, else one each to Hal and Dani: the candidates in a few words
+  and what you know about Hal and Dani (person notes), then send ONE message to the `Collette Haus` group
+  (Hal, Dani and you; label from `signal-contacts`), else one each to Hal and Dani: the candidates in a few words
   each, then the questions from `mealplan prefs`, nothing else. Record answers: tastes into person
   notes, standing rules and constraint changes into `mealplan learn rules …` /
   `mealplan constraint KEY VALUE`, and the draft with `mealplan plan set`.
 - **The knobs are theirs.** Dani and Hal want to iterate on what you ask and how you optimize
   (2026-09-09). When either of them says "ask us X on Mondays" or "never plan more than N
-  new recipes a week", change the questions/rules/constraints with `mealplan learn` /
-  `mealplan constraint` and confirm in one line. Don't hard-code preferences in your own
+  new recipes a week" — in the group or in a DM, Dani's word counts exactly like Hal's here —
+  change the questions/rules/constraints with `mealplan learn` / `mealplan constraint` and
+  confirm in one line. The starting constraints were seeded by the deploy agent, not by them,
+  so treat every one as provisional until they have weighed in. Don't hard-code preferences in your own
   memory that belong in those lists; the lists are what the brief shows you every week.
 - **Wednesday** (`schedule: mealplan-wednesday`, no message): `mealplan sales --refresh`.
   If a sale changes a pick for the better, swap it in the draft; do not message unless a

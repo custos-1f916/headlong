@@ -47,7 +47,8 @@ def connect(path=STATE):
 def destinations(policy):
     return ([{'target': 'dm:' + who, 'label': p['label'], 'kind': 'dm'}
              for who, p in policy['people'].items()] +
-            [{'target': 'group:' + g, 'label': 'Group', 'kind': 'group'} for g in policy['groups']])
+            [{'target': 'group:' + g, 'label': policy.get('group_labels', {}).get(g, 'Group'), 'kind': 'group'}
+             for g in policy['groups']])
 
 
 def resolve(target, policy):

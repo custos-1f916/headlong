@@ -40,6 +40,11 @@ class ActionsTests(unittest.TestCase):
 
     def test_every_allowlisted_person_and_only_the_approved_group_resolve(self):
         for dest in ca.destinations(POLICY): self.assertEqual(ca.resolve(dest['target'],POLICY),dest['target'])
+        labelled = {**POLICY, 'groups': ['g1', 'g2'], 'group_labels': {'g1': 'Collette Haus'}}
+        groups = [d for d in ca.destinations(labelled) if d['kind'] == 'group']
+        self.assertEqual([d['label'] for d in groups], ['Collette Haus', 'Group'])
+        self.assertEqual(ca.resolve('collette haus', labelled), 'group:g1')
+        self.assertEqual(ca.resolve('group:g2', labelled), 'group:g2')
         for target in ('dm:'+STRANGER,'group:other','wife-not-verified'):
             with self.assertRaises(ValueError): self.channel.handle({**self.p,'target':target})
         for key in ('socket','command','container','recipient'):

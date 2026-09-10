@@ -186,6 +186,31 @@ class SignalPolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             cs.load_policy(write(policy))
 
+    def test_policy_admits_labelled_groups_up_to_max_groups(self):
+        def write(policy):
+            path = Path(tempfile.mkdtemp()) / 'policy.json'
+            path.write_text(json.dumps(policy))
+            return path
+        policy = copy.deepcopy(POLICY)
+        policy['groups'] = ['g%d' % n for n in range(cs.MAX_GROUPS)]
+        policy['group_labels'] = {'g0': 'Collette Haus', 'g1': 'Friends'}
+        loaded = cs.load_policy(write(policy))
+        self.assertEqual(cs.group_label(loaded, 'g0'), 'Collette Haus')
+        self.assertEqual(cs.group_label(loaded, 'g2'), 'Group')  # unlabelled groups keep the generic name
+        policy['groups'].append('one-too-many')
+        with self.assertRaises(ValueError):
+            cs.load_policy(write(policy))
+        for bad in ({'not-a-group': 'X'}, {'g0': ''}, {'g0': 'Same', 'g1': 'same'}, ['g0']):
+            policy = copy.deepcopy(POLICY)
+            policy['groups'] = ['g0', 'g1']
+            policy['group_labels'] = bad
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                cs.load_policy(write(policy))
+        policy = copy.deepcopy(POLICY)
+        policy['groups'] = ['dup', 'dup']
+        with self.assertRaises(ValueError):
+            cs.load_policy(write(policy))
+
     def test_unknown_member_ids_and_disappearing_group_fail_closed(self):
         self.assertFalse(cs.safe_group({'isMember': True, 'members': ['+15551234567', BOT]}, POLICY))
         self.assertFalse(cs.safe_group({'isMember': True, 'members': [HAL, BOT],
