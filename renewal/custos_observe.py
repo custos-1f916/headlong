@@ -1,6 +1,6 @@
 """Bounded observation, durable intake before acknowledgement, no model calls."""
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
@@ -438,6 +438,34 @@ class Observer:
                     continue
                 self.emit(identity, "Native goal " + reminder["goal_id"] + " " + reminder.get("kind", "review") + " due. Read custos-memory show; verify current state before acting. " + reminder.get("reason", ""))
 
+    WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+    def schedules(self):
+        """Recurring wakes the operator configured (weekly, local time). One observation
+        per slot; a slot older than its grace window is recorded as missed, never replayed
+        as a flood after downtime. Authority is operator: the config is deployed by Hal."""
+        from zoneinfo import ZoneInfo
+        for item in self.config.get("schedules", [])[:16]:
+            if not item.get("enabled", True):
+                continue
+            zone = ZoneInfo(item.get("tz", "UTC"))
+            local = datetime.fromtimestamp(self.now, zone)
+            weekday = self.WEEKDAYS.index(str(item["weekday"]).lower()[:3])
+            hour, minute = (int(x) for x in str(item["at"]).split(":"))
+            slot = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            slot -= timedelta(days=(local.weekday() - weekday) % 7)
+            if slot > local:
+                slot -= timedelta(days=7)
+            identity = "schedule:" + item["name"] + ":" + slot.strftime("%Y-%m-%dT%H:%M")
+            if self.store.seen(identity):
+                continue
+            age = (local - slot).total_seconds()
+            if age > int(item.get("grace_seconds", 6 * 3600)):
+                self.store.disposition(identity, "schedule_missed", {"name": item["name"], "slot": slot.isoformat(), "late_seconds": int(age)})
+                continue
+            if not self.emit(identity, "Scheduled wake \"" + item["name"] + "\" (" + slot.strftime("%A %Y-%m-%d %H:%M %Z") + "): " + item["content"], authority="operator", schedule=item["name"]):
+                return
+
     def daily_metrics(self):
         """Once a day: Custos's own numbers for the last 24 h as an observation,
         with the previous day's beside them for the trend (custos-observe metrics)."""
@@ -694,6 +722,7 @@ class Observer:
             if feed.get("enabled", True):
                 self.source("research:" + feed["name"], max(3600, int(feed.get("interval_seconds", 21600))), lambda feed=feed: self.feed(feed))
         self.source("reviews", 3600, self.reviews)
+        self.source("schedules", 60, self.schedules)
 
 
 def classify_opportunity(detail, now):

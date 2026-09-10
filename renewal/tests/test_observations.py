@@ -489,3 +489,60 @@ class SelfMetricsTests(unittest.TestCase):
         self.assertEqual([k for k in native.messages if k.startswith("metrics:")], ["metrics:2026-09-09"])
         self.assertIn("Daily self-metrics", native.messages["metrics:2026-09-09"]["content"])
         self.assertIsNotNone(store.get("metrics:latest"))
+
+
+class ScheduleTests(unittest.TestCase):
+    """Weekly operator schedules: one wake per slot, local time, no catch-up flood."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = Store(self.temp.name)
+        self.addCleanup(self.store.db.close)
+        self.native = NativeFixture()
+        self.config = {"schedules": [{"name": "mealplan-monday", "weekday": "monday", "at": "09:00",
+                                      "tz": "America/Denver", "content": "Plan next week's dinners."}]}
+
+    def run_at(self, iso):
+        from datetime import datetime
+        now = datetime.fromisoformat(iso).timestamp()
+        observer = Observer(self.config, self.store, None, self.native, now=now)
+        observer.source("schedules", 60, observer.schedules)
+        return observer
+
+    def emitted(self):
+        return [k for k in self.native.messages if k.startswith("schedule:")]
+
+    def test_fires_once_at_or_after_the_slot_and_never_before(self):
+        self.run_at("2026-09-14T08:59:00-06:00")  # Monday, one minute early
+        self.assertEqual(self.emitted(), [])
+        self.run_at("2026-09-14T09:03:00-06:00")
+        self.assertEqual(self.emitted(), ["schedule:mealplan-monday:2026-09-14T09:00"])
+        envelope = self.native.messages["schedule:mealplan-monday:2026-09-14T09:00"]
+        self.assertEqual(envelope["authority"], "operator")
+        self.assertIn("Monday 2026-09-14 09:00 MDT", envelope["content"])
+        self.assertIn("Plan next week's dinners.", envelope["content"])
+        self.run_at("2026-09-14T09:30:00-06:00")  # same slot again: no duplicate
+        self.run_at("2026-09-15T09:30:00-06:00")  # Tuesday: nothing
+        self.assertEqual(len(self.emitted()), 1)
+
+    def test_next_week_is_a_new_slot(self):
+        self.run_at("2026-09-14T09:03:00-06:00")
+        self.run_at("2026-09-21T09:03:00-06:00")
+        self.assertEqual(self.emitted(), ["schedule:mealplan-monday:2026-09-14T09:00",
+                                          "schedule:mealplan-monday:2026-09-21T09:00"])
+
+    def test_a_slot_missed_beyond_grace_is_recorded_not_replayed(self):
+        self.run_at("2026-09-14T16:00:01-06:00")  # 7 h late, default grace 6 h
+        self.assertEqual(self.emitted(), [])
+        self.assertTrue(self.store.seen("schedule:mealplan-monday:2026-09-14T09:00"))
+        row = self.store.db.execute("SELECT disposition FROM seen WHERE id=?", ("schedule:mealplan-monday:2026-09-14T09:00",)).fetchone()
+        self.assertEqual(row[0], "schedule_missed")
+
+    def test_disabled_and_dst_and_utc_slots(self):
+        self.config["schedules"][0]["enabled"] = False
+        self.run_at("2026-09-14T09:03:00-06:00")
+        self.assertEqual(self.emitted(), [])
+        self.config["schedules"] = [{"name": "friday-order", "weekday": "Fri", "at": "09:00", "tz": "America/Denver", "content": "Order."}]
+        self.run_at("2026-11-06T09:02:00-07:00")  # after the DST change: 09:00 MST is still 09:00 local
+        self.assertEqual(self.emitted(), ["schedule:friday-order:2026-11-06T09:00"])
