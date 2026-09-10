@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""mealplan — Custos's CLI for the kitchen service (recipes, sales, weekly plans, list, cart).
+
+  mealplan brief                         planning brief: candidates with sale matches, top sales, prefs, recent plans
+  mealplan sales [--refresh]             this week's Whole Foods deals for the family's store
+  mealplan recipes [--q text] [--book B] one line per recipe
+  mealplan recipe SLUG                   ingredients + steps
+  mealplan plan show [--week YYYY-Www]   the week's plan (default: next week)
+  mealplan plan set --week W --dinner DATE=SLUG ... [--note text]
+  mealplan plan finalize [--week W]      writes dinners into the catalog's meal planner
+  mealplan list build [--week W]         ingredients -> grocery lines (pantry staples set aside)
+  mealplan list preview [--week W]       print the current list
+  mealplan books                         every scanned cookbook: recipes imported, page flags, reviewed or not
+  mealplan book flags "Title"            the digitizer's flagged pages with their transcripts (judge them, no vision needed)
+  mealplan book reviewed "Title" --note "one paragraph about the book: character, weeknight picks, what to ask Hal/Dani"
+  mealplan study [--n 10]                recipes nobody has studied yet (for a curiosity turn)
+  mealplan studied SLUG --note "…"       record what you learned about a recipe (fit, constraints, who might like it)
+  mealplan prefs                         constraints, rules, questions, likes/dislikes/brands (the family's knobs)
+  mealplan learn KIND "text" [--remove]  KIND: likes | dislikes | brands | pantry | rules | questions
+  mealplan constraint KEY VALUE          dinners_per_week weeknight_max_minutes servings leftover_dinners no_repeat_weeks sale_picks_per_week budget_cap_usd pickup_day
+  mealplan cooked SLUG [--date D] [--note text]
+  mealplan search "text"                 Whole Foods products for a phrase (brand, size, bought-before flag)
+  mealplan cart status                   is Hal's Whole Foods session alive? (needed only to put things IN the cart)
+  mealplan cart login                    make a fresh phone sign-in link for Hal (text him the URL; 15 min)
+  mealplan cart refresh                  try to renew the session silently first (no one has to type)
+  mealplan cart candidates [--week W]    top products per unmatched list line
+  mealplan cart choose "item" ASIN [--qty N]
+  mealplan cart fill [--week W]          add every chosen line to the Whole Foods cart — never checks out
+  mealplan cart show [--week W]          the plan's lines + what the site says is in the cart
+  mealplan cart set ASIN --qty N         change a cart line's quantity (0 removes it)
+  (checkout stays with Hal: he places the order in the Amazon app — Tier 1)
+
+Config: /etc/kitchen.env with KITCHEN_URL and KITCHEN_TOKEN (Hal installs it).
+"""
+import argparse, json, os, re, sys, urllib.parse, urllib.request
+from datetime import date, timedelta
+
+
+def cfg():
+    c = {"KITCHEN_URL": "http://192.168.86.63:8090", "KITCHEN_TOKEN": ""}
+    for path in ("/etc/kitchen.env", os.path.expanduser("~/.kitchen.env")):
+        try:
+            for line in open(path):
+                m = re.match(r"^\s*(KITCHEN_URL|KITCHEN_TOKEN)\s*=\s*(.*?)\s*$", line)
+                if m:
+                    c[m.group(1)] = m.group(2).strip('"')
+        except OSError:
+            pass
+    c.update({k: v for k, v in os.environ.items() if k in c})
+    return c
+
+
+def call(method, path, body=None, params=None):
+    c = cfg()
+    url = c["KITCHEN_URL"].rstrip("/") + path + ("?" + urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v}) if params else "")
+    req = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None, method=method,
+                                 headers={"Authorization": "Bearer " + c["KITCHEN_TOKEN"], "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            return json.loads(r.read() or b"null")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:400]
+        sys.exit(f"kitchen service said {e.code}: {detail}")
+    except urllib.error.URLError as e:
+        sys.exit(f"kitchen service unreachable ({e.reason}); say so in the goal, do not improvise")
+
+
+def next_week():
+    d = date.today() + timedelta(weeks=1); y, w, _ = d.isocalendar(); return f"{y}-W{w:02d}"
+
+
+def show_prefs(p):
+    print("constraints:", ", ".join(f"{k}={v}" for k, v in p.get("constraints", {}).items()))
+    for k in ("rules", "questions", "likes", "dislikes", "brands"):
+        if p.get(k):
+            print(f"{k}:"); [print("  - " + x) for x in p[k]]
+    print(f"pantry: {len(p.get('pantry', []))} staples assumed on hand (`mealplan learn pantry \"item\"` / --remove)")
+
+
+def show_plan(p):
+    print(f"week {p['week']} (pickup {p['pickup']}) status={p['status']}")
+    for d in p.get("dinners", []):
+        print(f"  {d.get('date') or '????-??-??'}  {d['title']}  [{d['slug']}]" + (f"  — {d['note']}" if d.get("note") else ""))
+    for n in p.get("notes", [])[-3:]:
+        print(f"  note {n['at']}: {n['text']}")
+    if p.get("list"):
+        print(f"  list: {len(p['list'])} lines, {sum(1 for x in p['list'] if x.get('status') == 'unmatched')} unmatched, pantry assumed: {len(p.get('pantry_assumed', []))}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd"); ap.add_argument("sub", nargs="?"); ap.add_argument("arg", nargs="?")
+    ap.add_argument("--week"); ap.add_argument("--q"); ap.add_argument("--book"); ap.add_argument("--refresh", action="store_true")
+    ap.add_argument("--dinner", action="append", default=[], metavar="DATE=SLUG"); ap.add_argument("--note"); ap.add_argument("--date"); ap.add_argument("--json", action="store_true"); ap.add_argument("--remove", action="store_true"); ap.add_argument("asin", nargs="?"); ap.add_argument("--qty", type=int, default=1); ap.add_argument("--n", type=int, default=10)
+    a = ap.parse_args()
+    wk = a.week or next_week()
+    if a.cmd == "brief":
+        b = call("GET", "/brief")
+        if a.json:
+            print(json.dumps(b, indent=1)); return
+        print(f"brief {b['generated']}: catalog {b['catalog_size']} recipes; planning {b['next_week']}; sales at {b['sales']['store']} valid to {b['sales']['valid']} ({b['sales']['count']} deals)")
+        print("cookbooks:", "; ".join(f"{b['book']} ({b['recipes']} recipes, {b['flags']} flags{'' if b['reviewed'] else ', NOT reviewed'})" for b in b.get("books", [])) or "(none scanned yet)", f"| {b.get('unstudied_recipes', 0)} recipes not yet studied")
+        print("candidates (score: sale matches, rating, not recent):")
+        for c in b["candidates"]:
+            flags = (" ON SALE: " + ", ".join(c["on_sale"]) if c["on_sale"] else "") + (" (recent)" if c["recent"] else "")
+            print(f"  - {c['title']} [{c['slug']}] {c['book'] or ''} {c['yield'] or ''} {c['time'] or ''} rating={c['rating'] or '-'}{flags}")
+        print("top sales:"); [print("  - " + s) for s in b["sales"]["top"]]
+        show_prefs(b["prefs"])
+        print("recent plans:"); [print(f"  {r['week']}: {', '.join(r['dinners']) or '(none)'}") for r in b["recent_plans"]]
+    elif a.cmd == "sales":
+        s = call("GET", "/sales", params={"refresh": "1" if a.refresh else ""})
+        print(f"{s.get('store_name')} (store {s.get('store_id')}) fetched {s.get('fetched')}: {s.get('count')} deals")
+        for d in s.get("deals", []):
+            b = f"{d['brand']} " if d.get("brand") else ""
+            print(f"  - {b}{d['name']}: {d.get('prime_price') or d.get('sale_price')}" + (f" (reg {d['regular_price']})" if d.get("regular_price") else "") + (f" valid {d['valid_from']}-{d['valid_to']}" if d.get("valid_from") else ""))
+    elif a.cmd == "recipes":
+        for r in call("GET", "/recipes", params={"q": a.q, "book": a.book}):
+            print(f"  - {r['title']} [{r['slug']}] {r['book'] or ''} {r['yield'] or ''} {r['total_time'] or ''} rating={r['rating'] or '-'} last={r['last_made'] or '-'}")
+    elif a.cmd == "recipe":
+        r = call("GET", "/recipes/" + urllib.parse.quote(a.sub or ""))
+        print(f"{r['title']} — {r['book'] or ''} {r['yield'] or ''} {r['total_time'] or ''}\n{r.get('description') or ''}\ningredients:")
+        [print("  - " + i) for i in r["ingredients"]]
+        print("steps:"); [print(f"  {n}. {s}") for n, s in enumerate(r["steps"], 1)]
+    elif a.cmd == "plan":
+        if a.sub == "show":
+            show_plan(call("GET", f"/plans/{wk}"))
+        elif a.sub == "set":
+            dinners = []
+            for spec in a.dinner:
+                d, s = spec.split("=", 1); dinners.append({"date": d, "slug": s})
+            body = {"dinners": dinners} if dinners else {}
+            if a.note:
+                body["note"] = a.note
+            show_plan(call("POST", f"/plans/{wk}", body))
+        elif a.sub == "finalize":
+            show_plan(call("POST", f"/plans/{wk}/finalize", {}))
+        else:
+            sys.exit("plan show|set|finalize")
+    elif a.cmd == "list":
+        p = call("POST", f"/plans/{wk}/list", {}) if a.sub == "build" else call("GET", f"/plans/{wk}")
+        show_plan(p)
+        for x in p.get("list", []):
+            print(f"  [{x.get('status', '?'):9s}] {x['item']}  ({x['need']})  for {', '.join(x['for'])}")
+        if p.get("pantry_assumed"):
+            print("  pantry assumed:", "; ".join(p["pantry_assumed"]))
+    elif a.cmd == "books":
+        for b in call("GET", "/books"):
+            rv = b.get("reviewed"); print(f"  - {b['book']}: {b['recipes_imported']} recipes imported ({b['recipes_extracted']} extracted from {b['pages']} pages), {b['flags']} flag(s), last import {b['last_import'] or '-'}" + (f"; reviewed {rv['at']}: {rv['note'][:80]}" if rv else "; NOT reviewed"))
+    elif a.cmd == "book":
+        if a.sub == "flags":
+            r = call("GET", f"/books/{urllib.parse.quote(a.arg or '')}/flags")
+            print(f"{r['book']}: {len(r['flags'])} flag(s); imported slugs: {', '.join(list(r['imported'].values())[:12])}")
+            for f in r["flags"]:
+                print(f"  - page file {f['page_file']} (printed {f['printed_pages']}): {f['why']}; recipes on page: {f['recipes_on_page']}; confidence {f['confidence']}")
+                print("    transcript: " + (f["transcript"] or "").replace("\n", " / ")[:600])
+        elif a.sub == "reviewed":
+            print(json.dumps(call("POST", f"/books/{urllib.parse.quote(a.arg or '')}/reviewed", {"note": a.note or ""})))
+        else:
+            sys.exit("book flags|reviewed \"Title\"")
+    elif a.cmd == "study":
+        r = call("GET", "/books/study", params={"n": str(a.n)})
+        print(f"{r['unstudied']} recipes not studied yet ({r['studied']} done). Next:")
+        for x in r["next"]: print(f"  - {x['title']} [{x['slug']}] {x['book'] or ''} {x['yield'] or ''} {x['time'] or ''}")
+    elif a.cmd == "studied":
+        print(json.dumps(call("POST", f"/recipes/{urllib.parse.quote(a.sub or '')}/studied", {"note": a.note or ""})))
+    elif a.cmd == "prefs":
+        show_prefs(call("GET", "/prefs"))
+    elif a.cmd == "learn":
+        show_prefs(call("POST", "/prefs/learn", {"kind": a.sub, "text": a.arg, "remove": a.remove}))
+    elif a.cmd == "constraint":
+        show_prefs(call("POST", "/prefs/set", {"key": a.sub, "value": a.arg}))
+    elif a.cmd == "cooked":
+        print(json.dumps(call("POST", "/cooked", {"slug": a.sub, "date": a.date, "note": a.note})))
+    elif a.cmd == "search":
+        for pr in call("GET", "/shopper/search", params={"q": a.sub or "", "n": "8"}):
+            flags = (" BOUGHT-BEFORE" if pr.get("bought_before") else "") + (f" ${pr['price']}" if pr.get("price") else "")
+            print(f"  - {pr['asin']}  {pr.get('brand') or ''} | {pr.get('name')}{flags}")
+    elif a.cmd == "cart":
+        if a.sub == "status":
+            s = call("GET", "/shopper/status", params={"force": "1" if a.refresh else ""})
+            print(("signed in as " + json.dumps(s.get("customer"))) if s.get("logged_in") else "NOT signed in" + (f" ({s.get('error')})" if s.get("error") else ""),
+                  f"| session from {s.get('captured_at')} via {s.get('how')}" if s.get("has_session") else "| no session on file")
+            if s.get("login_in_progress"):
+                print("  a phone login is in progress:", s["login_in_progress"]["url"], s["login_in_progress"]["phase"])
+        elif a.sub == "login":
+            r = call("POST", "/shopper/login/start", {})
+            print(f"Send Hal this link (valid ~15 min, LAN only): {r['url']}")
+        elif a.sub == "refresh":
+            r = call("POST", "/shopper/refresh", {})
+            print("refreshed" if r.get("refreshed") else "could not refresh silently — use `mealplan cart login`", "| logged_in:", r.get("status", {}).get("logged_in"))
+        elif a.sub == "candidates":
+            r = call("GET", f"/plans/{wk}/cart/candidates")
+            for line in r["lines"]:
+                if line.get("chosen"):
+                    print(f"  [{line.get('status')}] {line['item']} -> {line['chosen'].get('asin')} {line['chosen'].get('name')}"); continue
+                if line.get("error"):
+                    print(f"  [error] {line['item']}: {line['error']}"); continue
+                print(f"  {line['item']}  (need: {line.get('need')})")
+                for pr in line.get("candidates", []):
+                    flags = (" BOUGHT-BEFORE" if pr.get("bought_before") else "") + (f" ${pr['price']}" if pr.get("price") else "")
+                    print(f"      {pr['asin']}  {pr.get('brand') or ''} | {pr.get('name')}{flags}")
+        elif a.sub == "choose":
+            line = call("POST", f"/plans/{wk}/cart/choose", {"item": a.arg, "asin": a.asin, "quantity": a.qty})
+            print(f"  {line['item']} -> {line['product'].get('asin')} x{line['product'].get('quantity')} {line['product'].get('name') or ''}")
+        elif a.sub == "fill":
+            r = call("POST", f"/plans/{wk}/cart/fill", {})
+            if r.get("error"):
+                print("NOT filled:", r["error"])
+            print(f"added {len(r.get('added', []))}, failed {len(r.get('failed', []))}, skipped (no choice) {len(r.get('skipped', []))}")
+            for x in r.get("added", []): print(f"  + {x['item']} -> {x.get('name') or x['asin']} x{x['quantity']}")
+            for x in r.get("failed", []): print(f"  ! {x['item']}: {x['why']}")
+            for x in r.get("skipped", []): print(f"  - skipped: {x}")
+            print("cart:", json.dumps(r.get("cart"))[:600])
+        elif a.sub == "set":
+            r = call("POST", "/shopper/cart/set", {"asin": a.arg, "quantity": a.qty})
+            print("cart now:", json.dumps(r)[:300])
+        elif a.sub == "show":
+            r = call("GET", f"/plans/{wk}/cart")
+            for l in r["lines"]:
+                print(f"  [{l.get('status') or '-':9s}] {l['item']}" + (f" -> {l['product'].get('name') or l['product'].get('asin')} x{l['product'].get('quantity', 1)}" if l.get("product") else ""))
+            print("site cart:", json.dumps(r.get("cart"))[:800])
+        else:
+            sys.exit("cart status|login|refresh|candidates|choose|fill|show|set")
+    elif a.cmd == "order":
+        print("Tier 1: checkout is Hal's, in the Amazon app. `mealplan cart fill` puts the groceries in his cart; then tell him.")
+    else:
+        ap.print_help()
+
+
+if __name__ == "__main__":
+    main()
