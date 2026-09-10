@@ -149,7 +149,9 @@ export function buildTimeline(mindlog: Pick<Mindlog, "steps" | "runs">): Timelin
     return idx;
   };
   const laneIdFor = (step: NormalizedStep): string => {
-    if (step.source === "chat") return "chat";
+    // Incoming bridge messages and native chat replies form one conversation.
+    // Group only in the view; preserve transport/authority on the original step.
+    if (step.source === "chat" || step.source === "operator-transport") return "chat";
     if (step.source) return step.source;
     const assocRun = runsById.get(rawStr(step, "run_id") ?? "");
     return assocRun?.launched_by ?? "shellm";
