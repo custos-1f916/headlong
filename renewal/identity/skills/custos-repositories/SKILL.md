@@ -59,7 +59,12 @@ available direction when useful. Do not grant yourself new access or bypass rule
    `custos-work` client and its single active claim rule are specific to Voidle;
    other repositories need no Voidle issue, claim, or database access.
 5. Implement and verify the selected outcome using appropriate local tests and
-   fixtures. With write access, push your branch, open/update PRs and integrate
+   fixtures. **Another project's test suite never runs inside your activated identity:**
+   run it as `hermetic <command>` (`hermetic --help`), which strips your identity,
+   trajectory and shellm variables and gives the child a throwaway HOME. Upstream
+   headlong's own tests once created six stray identities in your live `.identities`
+   directory because they inherited `IDENTITY_DIR` from your wake (2026-09-10).
+   With write access, push your branch, open/update PRs and integrate
    verified changes following repository conventions and required checks. Ordinary
    source delivery does not require another approval. With read access, you can
    investigate, test local changes and contribute through supported permissions;

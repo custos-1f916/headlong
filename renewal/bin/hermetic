@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# hermetic — run another project's code (its test suite, its CLI, an install script) with none of
+# Custos's identity in the environment. Upstream headlong's `identity` tool resolves its root from
+# an inherited IDENTITY_NAME/IDENTITY_DIR, so a foreign test suite run inside an activated wake
+# created stray identities in the live .identities directory (audit 2026-09-10). This wrapper
+# unsets every identity/trajectory/shellm variable, gives the command a throwaway HOME and
+# HEADLONG_APP_DIR, and removes that HOME afterwards. Your own identity, memories and trajectory
+# are untouched; the child cannot find them by accident.
+#
+#   hermetic <command> [args…]                run one command hermetically
+#   hermetic --keep <command> [args…]         keep the throwaway HOME (printed) for inspection
+#   hermetic --cwd DIR <command> [args…]      run in DIR
+set -euo pipefail
+keep=0; cwd=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --keep) keep=1; shift ;;
+    --cwd) cwd="$2"; shift 2 ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    *) break ;;
+  esac
+done
+[[ $# -gt 0 ]] || { echo "hermetic: a command is required (hermetic --help)" >&2; exit 2; }
+scratch="$(mktemp -d /tmp/hermetic.XXXXXX)"
+mkdir -p "$scratch/home" "$scratch/app"
+unset_list=()
+for v in $(env | cut -d= -f1); do
+  case "$v" in
+    IDENTITY_*|TRAJ_ID|ROOT_TRAJ_ID|MEM_DIR|MEMORIES_DIR|SKILLS_DIR|KERNEL_DIR|SHELLM_*|HEADLONG_*|LLM_*|CUSTOS_*|MONOLITH_*|SOCIAL_*|CHAT_*|THINK_*) unset_list+=("-u" "$v") ;;
+  esac
+done
+rc=0
+( [[ -n "$cwd" ]] && cd "$cwd"
+  env "${unset_list[@]}" HOME="$scratch/home" HEADLONG_APP_DIR="$scratch/app" XDG_CONFIG_HOME="$scratch/home/.config" \
+      PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin" "$@" ) || rc=$?
+if [[ $keep -eq 1 ]]; then echo "hermetic: kept $scratch" >&2; else rm -rf "$scratch"; fi
+exit $rc
