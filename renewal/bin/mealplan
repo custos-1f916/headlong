@@ -32,7 +32,7 @@
   mealplan cart status                   is the Whole Foods session alive, and whose? (Dani's account since 2026-09-10)
   mealplan cart login                    make a fresh phone sign-in link (text it to Hal or Dani only; 15 min)
   mealplan cart refresh                  try to renew the session silently first (no one has to type)
-  mealplan cart logout                   drop the session AND the browser profile (only when switching accounts)
+  mealplan cart logout                   operator-only (Hal, from the Mac: kitchen-logout); this CLI refuses
   mealplan cart candidates [--week W]    top products per unmatched list line
   mealplan cart choose "item" ASIN [--qty N]
   mealplan cart fill [--week W] [--force]  add every chosen line to the Whole Foods cart — never checks out; refuses a second fill unless --force
@@ -304,7 +304,8 @@ def main():
                     flags = (" BOUGHT-BEFORE" if pr.get("bought_before") else "") + (f" ${pr['price']}" if pr.get("price") else "")
                     print(f"      {pr['asin']}  {pr.get('brand') or ''} | {pr.get('name')}{flags}")
         elif a.sub == "logout":
-            print(json.dumps(call("DELETE", "/shopper/session", params={"profile": "1"})))
+            sys.exit("cart logout is operator-only: it wipes the family's signed-in session and browser profile (it happened at 2026-09-11 02:01Z, "
+                     "and Dani had to sign in again). Ask Hal; he runs kitchen-logout on the Mac.")
         elif a.sub == "diff":
             r = call("GET", f"/plans/{wk}/cart/diff", params={"snapshot": "1" if a.snapshot else ""})
             if r.get("error"):
