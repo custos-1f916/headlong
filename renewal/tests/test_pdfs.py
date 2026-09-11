@@ -49,6 +49,10 @@ class PdfExtractionTests(unittest.TestCase):
         self.run_patcher = mock.patch.object(cp.subprocess, 'run')
         self.run_mock = self.run_patcher.start()
         self.addCleanup(self.run_patcher.stop)
+        self.which_patcher = mock.patch.object(cp.shutil, 'which',
+                                               return_value='/usr/bin/pdftotext')
+        self.which_mock = self.which_patcher.start()
+        self.addCleanup(self.which_patcher.stop)
 
     def test_extract_one_bounded_and_persisted(self):
         raw = minimal_pdf(MARKER)
@@ -122,6 +126,10 @@ class PdfBatchTests(unittest.TestCase):
         self.run_patcher = mock.patch.object(cp.subprocess, 'run')
         self.run_mock = self.run_patcher.start()
         self.addCleanup(self.run_patcher.stop)
+        self.which_patcher = mock.patch.object(cp.shutil, 'which',
+                                               return_value='/usr/bin/pdftotext')
+        self.which_mock = self.which_patcher.start()
+        self.addCleanup(self.which_patcher.stop)
 
     def test_empty_is_a_noop(self):
         self.assertEqual(cp.extract_pdfs([]), ([], []))
