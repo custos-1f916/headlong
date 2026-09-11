@@ -178,16 +178,18 @@ def validate_record(record):
     return record
 
 
-def parse_memory_file(path):
+def parse_memory_file(path, strict_person=False):
     """One store file as (path, header, body, fields, record), checked the way the
-    store reads it. A person note must carry a parseable `Custos person note v1`
-    line with a person_key."""
+    store reads it. With strict_person (validate, and the write hook in mem), a
+    person note must also carry a parseable `Custos person note v1` line with a
+    person_key; the store's own reads stay lenient there, as People.find always
+    was, so one hand-broken note cannot block every capture."""
     raw = path.read_text(encoding="utf-8")
     header, body, fields = split_memory(raw)
     record = None
     if MARKER in body:
         record = validate_record(strict_json(body.split(MARKER, 1)[1]))
-    if fields.get("type") == "person" and PERSON_MARKER in body:
+    if strict_person and fields.get("type") == "person" and PERSON_MARKER in body:
         meta = strict_json(body.rsplit(PERSON_MARKER, 1)[1])
         if not isinstance(meta, dict) or not isinstance(meta.get("person_key"), str) or not meta["person_key"]:
             raise MemoryError("person note without a person_key")
@@ -232,8 +234,10 @@ class Store:
         return rejected
 
     def record_rejections(self, rejections):
-        """Set aside incoming steps the reader could not reconcile: one state entry
-        each and ONE observation for the pass, never a memory record per step.
+        """Set aside incoming steps whose captured record no longer matches them:
+        one state entry each and ONE observation for the pass, never a memory
+        record per step. (A step the reader cannot parse at all is rarer and
+        still gets its own review note; see reconcile.)
 
         On 2026-09-11 a bulk rewrite of 55 ambient records changed their captured
         provenance; the next reconcile wrote 55 `type: note` records saying
@@ -279,7 +283,7 @@ class Store:
             for raw in paths:
                 path = Path(raw)
                 try:
-                    parse_memory_file(path)
+                    parse_memory_file(path, strict_person=True)
                 except (MemoryError, OSError, UnicodeError, ValueError) as error:
                     problems.append({"file": path.name, "error": str(error)})
             return {"checked": len(paths), "problems": problems, "conflicts": []}
@@ -287,7 +291,7 @@ class Store:
         with self.lock():
             for path in sorted(self.directory.glob("*.md")):
                 try:
-                    items.append(parse_memory_file(path))
+                    items.append(parse_memory_file(path, strict_person=True))
                 except (MemoryError, OSError, UnicodeError, ValueError) as error:
                     problems.append({"file": path.name, "error": str(error)})
         conflicts = []
@@ -670,7 +674,15 @@ class Store:
                 # The complete original remains in the append-only trajectory.
                 # Storage/command failures are NOT caught here: they must fail
                 # intake honestly rather than be mistaken for malformed input.
-                rejections.append((rejection, str(step.get("step_id", "(missing)")), str(error)))
+                if "captured provenance" in str(error):
+                    # The store copy was rewritten under a live message: a class
+                    # that arrives 55 at a time, so it is set aside in bulk.
+                    rejections.append((rejection, str(step.get("step_id", "(missing)")), str(error)))
+                else:
+                    with self.lock():
+                        self.commit("Unusable incoming message requires review; other requests remain actionable. "
+                                    + "Raw native step: " + str(step.get("step_id", "(missing)"))
+                                    + ". Reason: " + str(error) + NOTE_MARKER + rejection, "note")
                 rejected.add(rejection)
         if rejections:
             with self.lock():
