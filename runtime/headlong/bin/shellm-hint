@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""shellm-hint — did-you-mean lines for a block's output.
+
+Reads a block's captured output on stdin and prints, for each "No such file
+or directory" path or "command not found" name, a sibling that exists within
+two edits of the missing component:
+
+    [shellm hint] '/opt/costos/work/x' does not exist; did you mean '/opt/custos/work/x'?
+    [shellm hint] command 'costos-memory' not found; did you mean 'custos-memory'?
+
+A sampled model slips one token in a rare name and cannot see that it did; the
+raw "No such file" then reads as the filesystem changing under it (Custos,
+2026-09-11, "the worktree path is flapping"). This is a hint, not a rewrite:
+bin/shellm appends the lines to the output the model sees. No inference, no
+side effects. SHELLM_HINT_CWD resolves relative paths (default: cwd).
+"""
+import os
+import re
+import sys
+
+MAX_HINTS = 5
+MAX_DISTANCE = 2
+MIN_LEN = 4                      # never guess on very short names
+MAX_SIBLINGS = 4000              # give up on huge directories
+
+_PATH_PATTERNS = [
+    re.compile(r"cannot access '([^']+)'"),
+    re.compile(r"cannot (?:open|stat|read|remove|create directory) '([^']+)'"),
+    re.compile(r"can't (?:read|open|cd to) ([^\s:]+)"),
+    re.compile(r"(?:^|[\s:])cd: ([^\s:]+): No such file"),
+    re.compile(r"(?:^|[\s:])([~./][^\s:'\"]+): No such file or directory"),
+    re.compile(r"No such file or directory: '([^']+)'"),
+]
+_CMD_PATTERNS = [
+    re.compile(r"bash: (?:line \d+: )?([^\s:/]+): command not found"),
+    re.compile(r"(?:^|\n)([^\s:/]+): command not found"),
+]
+
+
+def distance(a, b):
+    """Levenshtein distance, capped early at MAX_DISTANCE + 1."""
+    if abs(len(a) - len(b)) > MAX_DISTANCE:
+        return MAX_DISTANCE + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        if min(cur) > MAX_DISTANCE:
+            return MAX_DISTANCE + 1
+        prev = cur
+    return prev[-1]
+
+
+def nearest(name, candidates):
+    best, best_d = None, MAX_DISTANCE + 1
+    for c in candidates:
+        if c == name:
+            return None          # it exists after all; nothing to suggest
+        d = distance(name, c)
+        if d < best_d or (d == best_d and best is not None and c < best):
+            best, best_d = c, d
+    return best if best_d <= MAX_DISTANCE else None
+
+
+def suggest_path(raw, cwd):
+    path = os.path.expanduser(raw.rstrip("/"))
+    if not os.path.isabs(path):
+        path = os.path.join(cwd, path)
+    path = os.path.normpath(path)
+    if os.path.lexists(path):
+        return None
+    parts = path.split(os.sep)
+    # Walk down to the first component that does not exist.
+    here = os.sep
+    for i, part in enumerate(parts[1:], 1):
+        nxt = os.path.join(here, part)
+        if os.path.lexists(nxt):
+            here = nxt
+            continue
+        if len(part) < MIN_LEN:
+            return None
+        try:
+            siblings = os.listdir(here)
+        except OSError:
+            return None
+        if len(siblings) > MAX_SIBLINGS:
+            return None
+        alt = nearest(part, siblings)
+        if alt is None:
+            return None
+        fixed = os.path.join(here, alt, *parts[i + 1:])
+        return raw, fixed
+    return None
+
+
+def suggest_command(name):
+    if len(name) < MIN_LEN or "/" in name:
+        return None
+    seen = set()
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if not d:
+            continue
+        try:
+            for entry in os.listdir(d):
+                if entry not in seen:
+                    seen.add(entry)
+        except OSError:
+            continue
+    # The shell functions/builtins the model commonly types are not on PATH.
+    seen.update({"echo", "test", "type", "read", "wait", "kill", "exec", "exit", "true", "false", "printf", "source"})
+    if name in seen:
+        return None
+    alt = nearest(name, seen)
+    return (name, alt) if alt else None
+
+
+def main():
+    text = sys.stdin.read()
+    if not text:
+        return 0
+    cwd = os.environ.get("SHELLM_HINT_CWD") or os.getcwd()
+    hints, done = [], set()
+    for pat in _PATH_PATTERNS:
+        for m in pat.finditer(text):
+            raw = m.group(1)
+            if raw in done:
+                continue
+            done.add(raw)
+            got = suggest_path(raw, cwd)
+            if got:
+                hints.append("[shellm hint] '%s' does not exist; did you mean '%s'?" % got)
+    for pat in _CMD_PATTERNS:
+        for m in pat.finditer(text):
+            name = m.group(1)
+            key = "cmd:" + name
+            if key in done:
+                continue
+            done.add(key)
+            got = suggest_command(name)
+            if got:
+                hints.append("[shellm hint] command '%s' not found; did you mean '%s'?" % got)
+    for line in hints[:MAX_HINTS]:
+        print(line)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

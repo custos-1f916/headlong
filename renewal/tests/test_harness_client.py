@@ -69,4 +69,33 @@ class ClientTests(unittest.TestCase):
   self.assertIn('unreachable',err.getvalue())
   self.assertNotIn('Traceback',err.getvalue())
   self.assertEqual(out.getvalue(),'')
+ # --- deploy/rollback refuse while a sub-run is alive (2026-09-11: a drain killed one mid-task) ---
+ def test_deploy_refused_while_subrun_alive_and_no_request_sent(self):
+  self.srv.response=(200,{'ok':True,'accepted':True})
+  hits=[]
+  orig=client.request
+  def spy(payload,url=None,timeout=None):hits.append(payload);return orig(payload,url,timeout)
+  with mock.patch.object(client,'live_subruns',return_value=[4242,4243]),mock.patch.object(client,'request',side_effect=spy):
+   code,stdout,stderr=self.call(['deploy','a'*64,'--request-id','r1','--expected-current','b'*64])
+  self.assertEqual(code,1);self.assertIn('refused',stderr);self.assertIn('4242',stderr);self.assertIn('--allow-live-subrun',stderr)
+  self.assertEqual(hits,[]);self.assertEqual(stdout,'')
+ def test_allow_live_subrun_sends_without_the_flag_in_payload(self):
+  self.srv.response=(200,{'ok':True,'accepted':True})
+  hits=[]
+  orig=client.request
+  def spy(payload,url=None,timeout=None):hits.append(payload);return orig(payload,url,timeout)
+  with mock.patch.object(client,'live_subruns',return_value=[4242]),mock.patch.object(client,'request',side_effect=spy):
+   code,stdout,stderr=self.call(['rollback','a'*64,'--request-id','r2','--expected-current','b'*64,'--allow-live-subrun'])
+  self.assertEqual(code,0);self.assertEqual(len(hits),1);self.assertNotIn('allow_live_subrun',hits[0]);self.assertEqual(hits[0]['action'],'rollback')
+ def test_qualify_never_checks_subruns(self):
+  self.srv.response=(200,{'ok':True,'accepted':True})
+  with mock.patch.object(client,'live_subruns',side_effect=AssertionError('must not be called')):
+   code,stdout,stderr=self.call(['qualify','a'*64,'--request-id','q1'])
+  self.assertEqual(code,0)
+ def test_live_subruns_reads_proc_cmdlines(self):
+  import tempfile
+  with tempfile.TemporaryDirectory() as proc:
+   for pid,cmd in(('101',b'bash\0/x/bin/shellm\0--prompt-file\0/tmp/subrun.Ab12\0'),('102',b'bash\0/x/bin/shellm\0--prompt-file\0/state/monolith_prompt.x\0'),('103',b'python3\0/tmp/subrun.Zz\0'),('notpid',b'')):
+    os.mkdir(os.path.join(proc,pid));open(os.path.join(proc,pid,'cmdline'),'wb').write(cmd)
+   self.assertEqual(client.live_subruns(proc),[101])
 if __name__=='__main__':unittest.main()

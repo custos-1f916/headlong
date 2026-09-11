@@ -149,6 +149,25 @@ SHELLM_TEMP_DOCKER="${SHELLM_TEMP_DOCKER:-0}"
 SHELLM_INACTIVITY_TIMEOUT="${SHELLM_INACTIVITY_TIMEOUT:-30}"
 SHELLM_INACTIVITY_MAX="${SHELLM_INACTIVITY_MAX:-900}"
 SHELLM_BEACON_INTERVAL="${SHELLM_BEACON_INTERVAL:-5}"
+# Spelling autocorrect for the model's scripts: "wrong=right[,wrong=right…]".
+# A sampled model slips one token in a rare name about 1 time in 80 (Custos
+# wrote /opt/costos for /opt/custos 43 times in five days, read the resulting
+# "No such file" as a flapping filesystem, and 13 of those commands failed
+# silently behind 2>/dev/null — audit 2026-09-11). The slip is fixed before the
+# block runs and named on stderr, so the corrected spelling is what the run
+# history then shows. Empty disables. Custos gets its own name by default.
+if [[ -z "${SHELLM_AUTOCORRECT+x}" && "${IDENTITY_NAME:-}" == custos ]]; then
+    SHELLM_AUTOCORRECT="costos=custos"
+fi
+SHELLM_AUTOCORRECT="${SHELLM_AUTOCORRECT:-}"
+# Harness maintenance: the flag file the host supervisor sets while it waits to
+# switch code. The loop yields between steps when it appears. With
+# SHELLM_MAINTENANCE_WARN=1 (the monolith sets it) the run first gets ONE more
+# block, with a feedback step telling it to record its state, so a drain no
+# longer discards a goal's working position (audit 2026-09-11: the drain killed
+# a live sub-run and the next wake restarted the task from zero).
+SHELLM_MAINTENANCE_FLAG="${SHELLM_MAINTENANCE_FLAG:-/var/lib/custos/harness-maintenance}"
+SHELLM_MAINTENANCE_WARN="${SHELLM_MAINTENANCE_WARN:-0}"
 VERBOSE=0
 QUIET=0
 
@@ -1512,6 +1531,38 @@ _shellm_protected_pids() {
     done
     printf '%s' "${chain# }"
 }
+# Process-tree helpers. The watchdog used to signal only the block's own pid:
+# a sub-run started by the block outlived the kill as an orphan, kept queueing
+# on the one model slot in competition with the parent's next steps, and its
+# report went to a pipe nobody read (Custos, 2026-09-11 16:47Z). A block the
+# watchdog tears down now takes its whole tree with it. A sub-run the model
+# detached on purpose (setsid, tmux) is not a descendant and is untouched.
+_shellm_descendants() {
+    local p
+    for p in $(pgrep -P "$1" 2>/dev/null); do
+        _shellm_descendants "$p"
+        printf '%s ' "$p"
+    done
+}
+_shellm_kill_tree() {
+    local pid="$1" sig="${2:-TERM}" p
+    for p in $(_shellm_descendants "$pid") "$pid"; do
+        command kill -"$sig" "$p" 2>/dev/null || true
+    done
+}
+# Live sub-runs in this guest: shellm processes (and the subrun wrappers around
+# them) whose prompt file is the one bin/subrun writes. A sub-run a block
+# backgrounded is an orphan once the block ends, so a descendant walk would
+# miss it; the prompt-file name is the stable marker, and it never matches a
+# thinker step (their prompt files live in the identity's state dir).
+_shellm_live_subruns() {
+    local p cmd
+    for p in $(pgrep -f 'shellm' 2>/dev/null); do
+        [[ "$p" == "$$" ]] && continue
+        cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || continue
+        case "$cmd" in *"/subrun."*) printf '%s ' "$p" ;; esac
+    done
+}
 _shellm_guard_preamble() {
     [[ "${SHELLM_GUARD:-1}" == "0" ]] && return 0
     local guard_file
@@ -1817,16 +1868,40 @@ extract_code() {
         [[ "$code" =~ [^[:space:]] ]] && no_fence=1
     fi
 
+    # Spelling autocorrect (SHELLM_AUTOCORRECT, see the config note). Literal
+    # substring replacement, case-sensitive, applied before the syntax check so
+    # the model's history shows the corrected line. The notice names each fix.
+    local autocorrect_fixes=""
+    if [[ -n "${SHELLM_AUTOCORRECT:-}" && -n "$code" ]]; then
+        local _fixed="$code" _pair _wrong _right
+        local -a _pairs=()
+        IFS=',' read -r -a _pairs <<<"$SHELLM_AUTOCORRECT"
+        for _pair in "${_pairs[@]}"; do
+            _wrong="${_pair%%=*}"; _right="${_pair#*=}"
+            [[ -z "$_wrong" || -z "$_right" || "$_pair" != *=* ]] && continue
+            if [[ "$_fixed" == *"$_wrong"* ]]; then
+                _fixed="${_fixed//"$_wrong"/"$_right"}"
+                autocorrect_fixes="$autocorrect_fixes $_wrong→$_right"
+            fi
+        done
+        [[ -n "$autocorrect_fixes" ]] && code="$_fixed"
+    fi
+
     # Prepend notices to stderr. Stderr is captured and shown back to the model
     # on its next turn, so these teach it what shellm did with its last reply.
     # Prepend rather than append so a notice fires even if the code exits early.
+    if [[ -n "$autocorrect_fixes" ]]; then
+        local autocorrect_notice
+        autocorrect_notice="[shellm: autocorrected${autocorrect_fixes} in your script before running it — a one-token spelling slip; the corrected spelling is the only one that exists here.]"
+        code="printf '%s\\n' $(printf '%q' "$autocorrect_notice") >&2"$'\n'"$code"
+    fi
     if [[ "$truncation_signal" == *TRUNCATED* ]]; then
         code=$'echo "[rest of model response truncated after first code block]" >&2\n'"$code"
     fi
     if [[ "$toolcall_lifted" -eq 1 ]]; then
         local toolcall_notice
         toolcall_notice=$(cat <<'NOTICE'
-printf '%s\n' '[shellm: your reply used <tool_call>/<function=bash> markup. This runtime only reads ```bash fences; it lifted your code into one and ran it this time. Next time put the script inside a ```bash block, nothing else.]' >&2
+printf '%s\n' '[shellm: your reply used <tool_call>/<function=bash> markup. This runtime only reads ```bash fences; it lifted your code into one and ran it this time. Next time put the script inside a ```bash block, nothing else: start the reply with a line that is exactly ```bash and end the block with a line that is exactly ```.]' >&2
 NOTICE
 )
         code="$toolcall_notice"$'\n'"$code"
@@ -1834,7 +1909,7 @@ NOTICE
     if [[ "$no_fence" -eq 1 ]]; then
         local nofence_notice
         nofence_notice=$(cat <<'NOTICE'
-printf '%s\n' '[shellm: your reply had no ```bash code block, so your whole message was run as one shell command and most likely failed. Put commands inside a ```bash block. To END the run, set FINAL="your handoff sentence" inside a ```bash block. Do not finish with a bare sentence outside a block.]' >&2
+printf '%s\n' '[shellm: your reply had no ```bash code block, so your whole message was run as one shell command and most likely failed. Put commands inside a ```bash block: a line that is exactly ```bash, the script, then a line that is exactly ```. To END the run, set FINAL="your handoff sentence" inside a ```bash block. Do not finish with a bare sentence outside a block.]' >&2
 NOTICE
 )
         code="$nofence_notice"$'\n'"$code"
@@ -1846,7 +1921,7 @@ NOTICE
     local syntax_error
     if ! syntax_error=$(bash -n <<<"$code" 2>&1); then
         local rejected_notice
-        rejected_notice='[shellm: rejected invalid bash syntax before execution; NONE of this script ran. Return one valid ```bash fenced script. Do not use XML <bash> or </bash> tags as code. Correct the syntax below before retrying.]'
+        rejected_notice='[shellm: rejected invalid bash syntax before execution; NONE of this script ran. Return one valid ```bash fenced script: a line that is exactly ```bash, the script, then a line that is exactly ```. Prose belongs before the fence, never inside it. Do not use XML <bash> or </bash> tags as code. Correct the syntax below before retrying.]'
         printf 'printf %s %q %q >&2\nexit 2\n' "'%s\n'" "$rejected_notice" "$syntax_error"
         return
     fi
@@ -2594,13 +2669,34 @@ run_loop() {
     local iteration=0
     # Spin/stall guard state (see SHELLM_MAX_*_FAILURES).
     local _consec_fail=0 _repeat_fail=0 _prev_fail_code=""
+    local _maintenance_warned=0
     while [[ -z "$SHELLM_MAX_ITERATIONS" || "$iteration" -lt "$SHELLM_MAX_ITERATIONS" ]]; do
-        if [[ -f /var/lib/custos/harness-maintenance && "${IDENTITY_NAME:-}" == custos ]]; then
-            progress "Harness maintenance: yielding between completed steps"
-            printf '%s' "$(jq -nc --arg run_id "$_run_step_id" '{type:"harness-handoff",run_id:$run_id,content:"Yielded for harness maintenance; unfinished commitments remain active."}')" \
-                | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
-            printf 'Yielded for harness maintenance; unfinished work remains active.\n'
-            return 0
+        if [[ -f "$SHELLM_MAINTENANCE_FLAG" && "${IDENTITY_NAME:-}" == custos ]]; then
+            if [[ "$SHELLM_MAINTENANCE_WARN" == "1" && "$_maintenance_warned" -eq 0 && "$iteration" -gt 0 ]]; then
+                # One more block, and the model is told what it is for.
+                _maintenance_warned=1
+                progress "Harness maintenance: one more step to record state, then yielding"
+                printf '%s' "$(jq -nc --arg run_id "$_run_step_id" \
+                    --arg content '[harness maintenance] A harness release is waiting to switch code. This run yields after your NEXT block, so use that block to record where you are: a scratchpad note on your active goal (custos-memory note GOAL_ID "…") naming the files and paths you are working in, the exact next command, and the id of any live sub-run — or set FINAL if the work is done. Any sub-run still running when the run yields is stopped with it; its files on disk stay.' \
+                    '{type:"feedback",content:$content,run_id:$run_id}')" \
+                    | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
+            else
+                local _live_subruns _handoff
+                _live_subruns=$(_shellm_live_subruns)
+                _handoff="Yielded for harness maintenance; unfinished commitments remain active."
+                if [[ -n "${_live_subruns// }" ]]; then
+                    _handoff="$_handoff Live sub-run process(es) stopped with it: ${_live_subruns% }."
+                    local _sp
+                    for _sp in $_live_subruns; do _shellm_kill_tree "$_sp" TERM; done
+                    sleep 1
+                    for _sp in $_live_subruns; do _shellm_kill_tree "$_sp" KILL; done
+                fi
+                progress "Harness maintenance: yielding between completed steps"
+                printf '%s' "$(jq -nc --arg run_id "$_run_step_id" --arg content "$_handoff" '{type:"harness-handoff",run_id:$run_id,content:$content}')" \
+                    | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
+                printf 'Yielded for harness maintenance; unfinished work remains active.\n'
+                return 0
+            fi
         fi
         iteration=$((iteration + 1))
         local iter_label
@@ -2925,12 +3021,12 @@ exit \$__shellm_rc
                     # Name the target: a silent watchdog kill is
                     # indistinguishable from an external one in a
                     # post-mortem (2026-08-12 dispatcher death).
-                    printf '%s [shellm-watchdog] %s timeout (%ss): killing exec pid %s\n' \
+                    printf '%s [shellm-watchdog] %s timeout (%ss): killing exec pid %s and its process tree\n' \
                         "$(date -u +%FT%TZ)" "$kill_reason" "$kill_limit" "$exec_pid" >&2
-                    kill "$exec_pid" 2>/dev/null || true
+                    _shellm_kill_tree "$exec_pid" TERM
                     # Give it a moment, then force-kill if needed
                     sleep 2
-                    kill -9 "$exec_pid" 2>/dev/null || true
+                    _shellm_kill_tree "$exec_pid" KILL
                     break
                 fi
             done
@@ -2995,6 +3091,19 @@ exit \$__shellm_rc
         # Clean output: strip xtrace lines for storage
         local clean_output
         clean_output=$(printf '%s' "$output" | grep -v '^+\+ ' | grep -v '^+ ' || true)
+        # "No such file" / "command not found" with a near-identical name that
+        # does exist is almost always the model's own spelling slip. The model
+        # cannot see its own tokens, so it theorises about the filesystem
+        # instead (Custos, 2026-09-11: "the worktree path is flapping"). Add a
+        # did-you-mean line; bin/shellm-hint does the sibling search.
+        if [[ "$clean_output" == *"No such file or directory"* || "$clean_output" == *"command not found"* ]]; then
+            local _hint_tool _hints
+            _hint_tool="$(dirname "$_SHELLM_SCRIPT_PATH")/shellm-hint"
+            if [[ -x "$_hint_tool" ]]; then
+                _hints=$(printf '%s' "$clean_output" | SHELLM_HINT_CWD="$workdir" "$_hint_tool" 2>/dev/null || true)
+                [[ -n "$_hints" ]] && clean_output="$clean_output"$'\n'"$_hints"
+            fi
+        fi
         # Write to temp file to avoid ARG_MAX when passing large output to jq
         local _stdout_tmp
         _stdout_tmp=$(mktemp)

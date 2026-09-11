@@ -114,5 +114,32 @@ else
     bad "a real fence wins over tool-call words in prose" "$out"
 fi
 
+# --- every notice says how to write the fence ---------------------------------
+# The notices are shell-quoted inside the script, so read them as the model
+# does: from the stderr of the executed block.
+for probe in "Idle — nothing to do now." $'<tool_call>\necho x' $'```bash\nprintf x\n</bash>\n```'; do
+    out=$(extract_code "$probe")
+    seen=$(bash -c "$out" 2>&1 >/dev/null)
+    grep -q 'exactly ```bash' <<<"$seen" && ok "notice carries the literal fence line" || bad "notice carries the literal fence line" "$seen"
+done
+
+# --- SHELLM_AUTOCORRECT fixes a one-token spelling slip before the run --------
+# Custos wrote /opt/costos for /opt/custos 43 times in five days (2026-09-11).
+out=$(SHELLM_AUTOCORRECT="costos=custos" extract_code $'```bash\nls /opt/costos/work && costos-memory show x\n```')
+grep -q '/opt/custos/work && custos-memory show x' <<<"$out" && ok "autocorrect rewrites every occurrence" || bad "autocorrect rewrite" "$out"
+seen=$(bash -c "$out" 2>&1 >/dev/null)
+grep -q 'autocorrected costos→custos' <<<"$seen" && ok "autocorrect names the fix in a stderr notice" || bad "autocorrect notice" "$seen"
+grep -q 'costos' <<<"$(grep -v autocorrected <<<"$out")" && bad "no misspelling survives outside the notice" "$out" || ok "no misspelling survives outside the notice"
+out=$(SHELLM_AUTOCORRECT="costos=custos" extract_code $'```bash\nls /opt/custos/work\n```')
+[[ "$out" == "ls /opt/custos/work" ]] && ok "a correct script is untouched (no notice)" || bad "untouched script" "$out"
+out=$(SHELLM_AUTOCORRECT="" extract_code $'```bash\nls /opt/costos/work\n```')
+[[ "$out" == "ls /opt/costos/work" ]] && ok "empty SHELLM_AUTOCORRECT disables the rewrite" || bad "disabled rewrite" "$out"
+out=$(SHELLM_AUTOCORRECT="costos=custos,jonah=johan" extract_code $'```bash\necho ssh jonah ls /opt/costos\n```')
+seen=$(bash -c "$out" 2>&1 >/dev/null)
+grep -q 'echo ssh johan ls /opt/custos' <<<"$out" && grep -q 'costos→custos jonah→johan' <<<"$seen" && ok "several pairs apply and are all named" || bad "several pairs" "$out / $seen"
+result=$(bash -c "$(SHELLM_AUTOCORRECT="costos=custos" extract_code $'```bash\necho /opt/costos/x\n```')" 2>/tmp/notice.$$)
+[[ "$result" == "/opt/custos/x" ]] && grep -q 'autocorrected' /tmp/notice.$$ && ok "the corrected script runs and the notice lands on stderr" || bad "corrected script runs" "$result / $(cat /tmp/notice.$$)"
+rm -f /tmp/notice.$$
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

@@ -86,3 +86,20 @@ The host supervisor, fixed acceptance contracts, network/admission controls,
 operator pause and access grants are external operator-owned controls. You may
 propose changes to them in the repo, but a guest harness release cannot install
 those changes. Do not erase identity or bypass an external boundary as an experiment.
+
+## Sub-runs and drains (2026-09-11)
+
+A deploy or rollback drains the mind between steps and then stops it. A sub-run that is
+mid-task dies with it, and the parent's next wake starts the task over (the PDF-bridge run,
+2026-09-11 16:19Z). So:
+
+- `custos-harness deploy` / `rollback` **refuse while a sub-run is alive** (a `shellm` whose
+  prompt file is `subrun`'s). Wait for it, read its report file, or pass `--allow-live-subrun`
+  knowing it will be killed. The same rule binds the deploy agent: no release while a directed
+  goal is mid-implementation with a live sub-run.
+- When the maintenance flag appears, the monolith run gets **one more block** and a feedback
+  step telling it to write a scratchpad note (`custos-memory note GOAL_ID "…"`) with its files,
+  next command and any sub-run id. Use that block for exactly that.
+- `subrun` with `--max-iterations` above 12 now **detaches itself** and prints a report path;
+  read the report in a later step (`tail -n 20 FILE`). Sub-runs see command output whole up to
+  24 KB, so read a file once, then write.

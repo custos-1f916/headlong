@@ -348,6 +348,37 @@ headlong-skills remove old-skill      # Remove a skill
 
 The core `skills` (in `bin/`) only lists, shows, and renders skills; the package manager `headlong-skills` (in `tools/`) does the rest and shares its code. `skills install ...` and the other manager subcommands forward to it when it is on PATH. Skills can declare requirements (env vars, binaries, OS) in their YAML frontmatter under `metadata.shelllm.requires`. By default, `skills list` only shows skills whose requirements are met. Use `headlong-skills check <name>` to diagnose a specific skill's requirements. Skills live in `SKILLS_DIR` (default: `./.skills/`); the bundled core skills are installed to `~/.skills/core-skills` and added as a remote.
 
+## Slips, hints, sub-runs and drains (2026-09-11)
+
+Four fixes from one audit (`custos-audit-2026-09-11-pdf-bridge.md`): a sampled model slipped one
+token in a rare name (`/opt/costos` for `/opt/custos`, 43 times in five days), read the resulting
+"No such file" as a flapping filesystem, ran a 40-iteration sub-run in the foreground and lost it at
+the block ceiling, and had its working state discarded by a harness drain.
+
+- **`SHELLM_AUTOCORRECT="wrong=right[,wrong=right…]"`** rewrites literal substrings of the model's
+  script before the syntax check and prepends a stderr notice naming each fix, so the run history
+  shows the corrected spelling. Empty disables. `IDENTITY_NAME=custos` defaults to `costos=custos`.
+- **`bin/shellm-hint`** appends a `[shellm hint] … did you mean …?` line to a block's output for
+  each `No such file or directory` path or `command not found` name whose nearest existing sibling
+  (or PATH entry) is within two edits. Hint only; nothing is rewritten.
+- **The watchdog kills the block's whole process tree** (`_shellm_kill_tree`), not just the block's
+  pid. A sub-run the model detached on purpose (`setsid`, tmux, or `subrun` above its sync limit)
+  is not a descendant and survives.
+- **`subrun`** runs tasks up to `SUBRUN_SYNC_MAX_ITER` (12) iterations in the foreground and
+  **detaches** bigger ones under `setsid`, printing the report path (`--report FILE`, default
+  `$TMPDIR/subrun-<utc>-<pid>.report`) and returning at once; `--wait` / `--detach` override. The
+  child sees outputs whole (`SHELLM_STDOUT_PROMPT_LIMIT` 24 KB, block limit 32 KB), defaults to
+  `--effort medium`, and is told to write after at most ten read-only steps.
+- **Maintenance yield with a warning.** `SHELLM_MAINTENANCE_FLAG` (default
+  `/var/lib/custos/harness-maintenance`) still makes the loop yield between steps; with
+  `SHELLM_MAINTENANCE_WARN=1` (the monolith step sets it) the run first gets one more block, preceded
+  by a feedback step that says to record its state. Live sub-runs are stopped at the yield and named
+  in the `harness-handoff` step.
+- The syntax-rejection, no-fence and tool-call notices now say literally how to write the fence.
+
+Tests: `test_extract_code_notice.sh`, `test_shellm_hint.sh`, `test_inactivity_beacon.sh`,
+`test_shellm_maintenance_warn.sh`, `test_subrun_detach.sh`.
+
 ## Options
 
 All configuration is available as both CLI flags and environment variables. Flags take precedence.

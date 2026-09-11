@@ -457,8 +457,12 @@ _mind_guard_hours=2
 _mgh=$(jq -r '.mind_double_text_hours // empty' "$IDENTITY_DIR/social-policy.json" 2>/dev/null) || _mgh=""
 [[ "$_mgh" =~ ^[0-9]+$ ]] && _mind_guard_hours="$_mgh"
 run_rc=0
+# SHELLM_MAINTENANCE_WARN: a harness drain gives the mind one more block, with
+# a feedback step saying to record its state, before the run yields (a drain on
+# 2026-09-11 discarded a goal's working position and killed its sub-run).
 run_response=$(SHELLM_NO_BANNER=1 \
     CHAT_DOUBLE_TEXT_GUARD_HOURS="$_mind_guard_hours" \
+    SHELLM_MAINTENANCE_WARN="${SHELLM_MAINTENANCE_WARN:-1}" \
     SHELLM_TRIGGER_STEP_ID="$trigger_step_id" \
     SHELLM_WAKE="$wake_reason" \
     SHELLM_RUN_ID_OUT="$run_id_file" \

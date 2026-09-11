@@ -118,6 +118,15 @@ if grep -q 'shellm-watchdog\] nested timeout' "$WORK/err"; then
 else
     bad "nested run past SHELLM_INACTIVITY_MAX is killed" "$(tail -3 "$WORK/err")"
 fi
+# The kill takes the whole tree: the nested shellm and its stalled llm stub
+# (sleep 30) must be gone, not orphaned to keep competing for the model slot.
+sleep 1
+if pgrep -f "sub task" >/dev/null 2>&1 || pgrep -f "$WORK/toolbin/llm" >/dev/null 2>&1; then
+    bad "watchdog kill takes the nested run's process tree" "$(pgrep -af 'sub task|toolbin/llm' | head -3)"
+    pkill -9 -f "sub task" 2>/dev/null; pkill -9 -f "$WORK/toolbin/llm" 2>/dev/null
+else
+    ok "watchdog kill takes the nested run's process tree"
+fi
 # The feedback the model sees is a trajectory step, not terminal output.
 ceiling_traj=("$HEADLONG_HOME/trajectories"/*ceiling-case/trajectory.jsonl)
 if grep -q 'A nested shellm run was still alive' "${ceiling_traj[@]}" 2>/dev/null; then

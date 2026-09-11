@@ -37,19 +37,43 @@ def request(payload,url=None,timeout=None):
  if not isinstance(out,dict):raise HarnessTransportError('non-object JSON response body: got %s'%type(out).__name__)
  return out
 
+def live_subruns(proc='/proc'):
+ """PIDs of nested shellm sub-runs alive in this guest (their prompt file is the subrun temp file).
+
+ A deploy or rollback drains the mind between steps and then stops it; a sub-run
+ that is mid-task dies with it and the parent's next wake starts over (Custos,
+ 2026-09-11 16:19Z). The CLI refuses those two actions while a sub-run is alive
+ unless --allow-live-subrun is given.
+ """
+ found=[]
+ try:entries=os.listdir(proc)
+ except OSError:return found
+ for pid in entries:
+  if not pid.isdigit():continue
+  try:
+   with open(os.path.join(proc,pid,'cmdline'),'rb') as f:cmd=f.read().split(b'\0')
+  except OSError:continue
+  if any(a.startswith(b'/tmp/subrun.') or b'/subrun.' in a for a in cmd) and any(b'shellm' in a for a in cmd):found.append(int(pid))
+ return found
+
 def main(argv=None):
  p=argparse.ArgumentParser(description=__doc__);s=p.add_subparsers(dest='command',required=True)
  s.add_parser('current');q=s.add_parser('status');q.add_argument('request_id',nargs='?')
  for name in ['qualify','deploy','rollback']:
   q=s.add_parser(name);q.add_argument('artifact');q.add_argument('--request-id',required=True);q.add_argument('--expected-current',required=name!='qualify')
+  if name!='qualify':q.add_argument('--allow-live-subrun',action='store_true',help='drain even though a sub-run is mid-task (it will be killed)')
  q=s.add_parser('build');q.add_argument('--repo',default='/opt/custos/repo');q.add_argument('--commit',default='HEAD')
  a=p.parse_args(argv)
+ if a.command in('deploy','rollback') and not getattr(a,'allow_live_subrun',False):
+  live=live_subruns()
+  if live:
+   print('harness: %s refused: %d live sub-run(s) (pid %s) would be killed by the drain and their task lost. Wait for them, read their report files, or pass --allow-live-subrun.'%(a.command,len(live),', '.join(map(str,live))),file=sys.stderr);return 1
  if a.command=='build':
   from harness.build import build
   try:out=build(a.repo,a.commit)
   except Exception as e:print('harness: build: %s'%e,file=sys.stderr);return 3
  else:
-  payload={'action':a.command};payload.update({k:v for k,v in vars(a).items() if k!='command' and v is not None})
+  payload={'action':a.command};payload.update({k:v for k,v in vars(a).items() if k not in('command','allow_live_subrun') and v is not None})
   try:out=request(payload)
   except HarnessTransportError as e:print('harness: %s'%e,file=sys.stderr);return 3
  print(json.dumps(out,indent=2));return 0 if out.get('ok',True) else 1

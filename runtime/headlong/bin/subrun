@@ -4,30 +4,44 @@
 # The mind's own wake carries its charter, life summary, recent stream and goals
 # in every model call; a code task on top of that starves the run of working
 # memory (a 15 KB file could not be read whole on 2026-09-09). A sub-run gets
-# only: the hard lines, the task, the directory, and its own steps. It runs
-# synchronously in a child trajectory (a `fork` step links it), bounded by
-# --max-iterations, and prints its FINAL report on stdout for the caller to
-# verify. Same model, same effort, same guard as the parent; nothing else.
+# only: the hard lines, the task, the directory, and its own steps, and it sees
+# each command's output whole up to 24 KB (the parent's window is 2–6 KB), so
+# it reads a source file once instead of in slices. Bounded by --max-iterations.
 #
-#   subrun [--cwd DIR] [--max-iterations N] [--effort LEVEL] [-f FILE]... "task text"
+#   subrun [--cwd DIR] [--max-iterations N] [--effort LEVEL] [--report FILE]
+#          [--wait|--detach] [-f FILE]... "task text"
 #   subrun [--cwd DIR] ... --task-file FILE
 #
-# Always redirect to a file when backgrounding (see shellm's sub-run notes);
-# run it in the foreground when the result is needed in this wake.
+# Small tasks (--max-iterations up to SUBRUN_SYNC_MAX_ITER, default 12) run in
+# the foreground and print their FINAL report on stdout. Bigger tasks DETACH:
+# subrun starts the child under setsid, prints the report path and the child's
+# trajectory id, and returns at once; read the report file in a later step.
+# A foreground sub-run cannot outlive its block (SHELLM_INACTIVITY_MAX, 900 s):
+# on 2026-09-11 a 40-iteration foreground sub-run was killed at the ceiling,
+# its orphan kept working against the parent for the one model slot, and its
+# report went to a dead pipe. --wait forces the foreground for a big task;
+# --detach forces detaching for a small one. The report is always written to
+# --report FILE (default /tmp/subrun-<utc>-<pid>.report). Effort defaults to
+# medium: the design is done before a sub-run starts, and xhigh thinking on
+# every `sed -n` is what starved the last two.
 set -euo pipefail
 
 die() { printf 'subrun: error: %s\n' "$*" >&2; exit 2; }
 
-cwd="$PWD"; max_iter="${SUBRUN_MAX_ITERATIONS:-40}"; effort=""; task=""; task_file=""
+cwd="$PWD"; max_iter="${SUBRUN_MAX_ITERATIONS:-40}"; effort="${SUBRUN_EFFORT:-medium}"; task=""; task_file=""
+report=""; mode="auto"
 files=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --cwd|--workdir) cwd="${2:?--cwd requires a directory}"; shift 2 ;;
         --max-iterations) max_iter="${2:?--max-iterations requires N}"; shift 2 ;;
         --effort) effort="${2:?--effort requires a level}"; shift 2 ;;
+        --report) report="${2:?--report requires a file}"; shift 2 ;;
+        --wait) mode="wait"; shift ;;
+        --detach) mode="detach"; shift ;;
         -f) files+=("${2:?-f requires a file}"); shift 2 ;;
         --task-file) task_file="${2:?--task-file requires a file}"; shift 2 ;;
-        -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         --) shift; break ;;
         -*) die "unknown option $1" ;;
         *) break ;;
@@ -42,6 +56,15 @@ fi
 [[ -n "${task// }" ]] || die "a task is required (positional text or --task-file FILE)"
 [[ -d "$cwd" ]] || die "directory not found: $cwd"
 [[ "$max_iter" =~ ^[0-9]+$ && "$max_iter" -ge 1 ]] || die "--max-iterations must be a positive integer"
+sync_max="${SUBRUN_SYNC_MAX_ITER:-12}"
+[[ "$sync_max" =~ ^[0-9]+$ ]] || sync_max=12
+if [[ "$mode" == "auto" ]]; then
+    if [[ "$max_iter" -gt "$sync_max" ]]; then mode="detach"; else mode="wait"; fi
+fi
+if [[ -z "$report" ]]; then
+    report="${TMPDIR:-/tmp}/subrun-$(date -u +%Y%m%dT%H%M%SZ)-$$.report"
+fi
+: > "$report" || die "cannot write report file: $report"
 
 # The hard lines travel with every sub-run; the rest of the charter does not.
 hard_lines=""
@@ -49,12 +72,16 @@ if [[ -n "${IDENTITY_DIR:-}" && -f "$IDENTITY_DIR/core_identity_prompt.md" ]]; t
     hard_lines=$(awk '/^## Hard lines/{f=1} f' "$IDENTITY_DIR/core_identity_prompt.md" | head -c 6000)
 fi
 
+# Sub-runs see outputs whole: the point of delegating a code task is to read
+# the file once. The parent's own prompt window stays as configured.
+export SHELLM_STDOUT_PROMPT_LIMIT="${SUBRUN_STDOUT_PROMPT_LIMIT:-24576}"
+export SHELLM_CONTEXT_BLOCK_LIMIT="${SUBRUN_BLOCK_LIMIT:-32768}"
+
 prompt_file=$(mktemp "${TMPDIR:-/tmp}/subrun.XXXXXX")
-trap 'rm -f "$prompt_file"' EXIT
 {
     printf 'You are a focused sub-run of %s working on ONE task in %s. You have this task, this directory and your own steps; nothing else is in your context, on purpose.\n\n' "${IDENTITY_NAME:-the agent}" "$cwd"
     printf 'Task:\n%s\n\n' "$task"
-    printf 'How to work: read files in slices (`sed -n 1,120p FILE`), never whole; write files with heredocs; run the tests or the program to check your work; commit nothing and push nothing unless the task says so. Stop when the task is done or when you are certain it cannot be done here. Finish with `FINAL: ` followed by a short report: what you changed (files and functions), what you ran and its exact result (tests passed/failed, errors verbatim), and what is left. A red test is red; say so.\n'
+    printf 'How to work: read a file WHOLE once (`cat FILE`; up to %s bytes of a command'"'"'s output show in full), and slice with `sed -n` only when a file is bigger than that. Budget: at most 10 read-only steps before you write your first file; the task text already holds the specification, so write from it and check by running the tests, not by re-reading sources. Write files with heredocs; run the tests or the program to check your work; commit nothing and push nothing unless the task says so. Stop when the task is done or when you are certain it cannot be done here. Finish with `FINAL: ` followed by a short report: what you changed (files and functions), what you ran and its exact result (tests passed/failed, errors verbatim), and what is left. A red test is red; say so.\n' "$SHELLM_STDOUT_PROMPT_LIMIT"
     if [[ -n "$hard_lines" ]]; then
         printf '\nThese hold in a sub-run as everywhere:\n%s\n' "$hard_lines"
     fi
@@ -64,4 +91,28 @@ args=(--context-scope run --workdir "$cwd" --max-iterations "$max_iter" --prompt
 [[ -n "$effort" ]] && args+=(--effort "$effort")
 for f in "${files[@]}"; do args+=(-f "$f"); done
 export SHELLM_NO_BANNER=1
-exec shellm "${args[@]}"
+
+if [[ "$mode" == "detach" ]]; then
+    # A detached child is its own session: the parent's block can end, and the
+    # watchdog's tree kill does not reach it. The report file is the contract.
+    printf '# subrun detached %s\n# cwd: %s\n# task: %s\n# state: running\n' "$(date -u +%FT%TZ)" "$cwd" "$(printf '%s' "$task" | head -c 200 | tr '\n' ' ')" > "$report"
+    setsid -f bash -c '
+        prompt_file="$1"; report="$2"; shift 2
+        {
+            shellm "$@" && rc=0 || rc=$?
+            printf "\n# state: exited rc=%s at %s\n" "$rc" "$(date -u +%FT%TZ)"
+        } >> "$report" 2>&1
+        rm -f "$prompt_file"
+    ' _ "$prompt_file" "$report" "${args[@]}" </dev/null >/dev/null 2>&1
+    printf 'subrun: detached (max-iterations %s > %s). Report file: %s\n' "$max_iter" "$sync_max" "$report"
+    printf 'subrun: this step is done; do NOT wait here. In a later step run `tail -n 20 %s` — its last lines are the FINAL report and "# state: exited" once it ends. Child trajectories: `traj list --children all`.\n' "$report"
+    exit 0
+fi
+
+trap 'rm -f "$prompt_file"' EXIT
+set +e
+shellm "${args[@]}" | tee -a "$report"
+rc=${PIPESTATUS[0]}
+set -e
+printf '\n# state: exited rc=%s at %s\n' "$rc" "$(date -u +%FT%TZ)" >> "$report"
+exit "$rc"
