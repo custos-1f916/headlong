@@ -40,6 +40,12 @@ recorded it.** Saying it in Signal is not doing it.
   on their own when Collette Haus messages arrived after the plan was last touched: they print
   the unread lines, you record what they ask, then retry with `--read`. A cart built from a stale
   read is worse than no cart.
+- **Verification is read-only.** On 2026-09-11 02:01Z a "does the new CLI surface exist?" loop ran
+  `mealplan cart logout` and wiped Dani's session minutes after she signed in. To check a command
+  exists, read `mealplan --help`; to check state, use `status`, `show`, `prefs`, `history`, `cart
+  diff`. Never run `cart logout`, `cart fill`, `plan finalize`, `plan proposed`, `list have` or
+  `product` as a test. Account switches are Hal's, from the Mac (`kitchen-logout`); your token
+  cannot do it.
 - Only Hal or Dani add things to the list. A friend's or another agent's conversation (Kim's
   kimjang cabbage on 2026-09-10) is never an extra on their order.
 
