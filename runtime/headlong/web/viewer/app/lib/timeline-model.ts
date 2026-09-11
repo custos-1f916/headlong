@@ -140,7 +140,7 @@ export function buildTimeline(mindlog: Pick<Mindlog, "steps" | "runs">): Timelin
     if (id === "operator" || id.startsWith("operator-") || id === "deployment-operator") {
       id = "dispatcher";
     }
-    if (id === "custos-observe" || id === "custos-memory" || id === "square-outbox") {
+    if (id === "custos-observe" || id === "custos-memory" || id === "square-outbox" || id === "memory-dream" || id === "metrics") {
       id = "observations";
     }
     let idx = laneOf.get(id);
