@@ -140,7 +140,7 @@ export function buildTimeline(mindlog: Pick<Mindlog, "steps" | "runs">): Timelin
     if (id === "operator" || id.startsWith("operator-") || id === "deployment-operator") {
       id = "dispatcher";
     }
-    if (id === "custos-observe" || id === "custos-memory") {
+    if (id === "custos-observe" || id === "custos-memory" || id === "square-outbox") {
       id = "observations";
     }
     let idx = laneOf.get(id);
@@ -155,7 +155,10 @@ export function buildTimeline(mindlog: Pick<Mindlog, "steps" | "runs">): Timelin
     // Conversation events belong together regardless of writer, including
     // source-less square messages and replies/reactions from other components.
     // Keep original transport/authority metadata on the step for details.
-    if (step.type === "message" || step.source === "chat" || step.source === "operator-transport") return "chat";
+    if (
+      step.type === "message" || step.source === "chat" ||
+      step.source === "operator-transport" || step.source === "ask-agent"
+    ) return "chat";
     if (step.source) return step.source;
     const assocRun = runsById.get(rawStr(step, "run_id") ?? "");
     return assocRun?.launched_by ?? "shellm";
