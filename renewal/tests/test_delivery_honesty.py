@@ -155,12 +155,14 @@ class ChatOutboundTests(ChatFixture):
 
     def test_follow_up_delivery_is_exempt_from_the_double_text_guard(self):
         self.inbound(self.alice, UUID_A, "can you build it?")
+        # The identity spoke last (a nudge of its own, answering nothing) and Alice has not replied.
         self.append({"type": "message", "step_id": "custos-said-1", "from": "custos", "to": self.alice,
-                     "reply_to": UUID_A, "content": "I will look into it", "source": "chat"})
+                     "content": "still there?", "source": "chat"})
         with mock.patch.dict(os.environ, {"CHAT_DOUBLE_TEXT_GUARD_HOURS": "2"}):
             plain = self.chat("reply", "--reply-to", UUID_A, self.alice, "just checking in again")
             self.assertNotEqual(plain.returncode, 0)
             self.assertIn("you spoke last", plain.stderr)
+            self.assertEqual([s["content"] for s in self.outgoing()], ["still there?"])
             delivery = self.chat("reply", "--follow-up", "--reply-to", UUID_A, self.alice, "Built. Here it is.")
             self.assertEqual(delivery.returncode, 0, delivery.stderr)
         self.assertEqual([s["content"] for s in self.outgoing()][-1], "Built. Here it is.")

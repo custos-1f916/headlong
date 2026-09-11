@@ -333,12 +333,15 @@ PYMEM
     # is asked for filenames and can invent them: on 2026-09-11 it returned two
     # goal-typed records that existed nowhere on disk, and a wake spent its
     # iterations looking for them. Lines without a filename pass through.
-    printf '%s\n' "$answer" | MEM_DIR="$MEM_DIR" python3 - <<'PYFILTER'
+    local answer_file
+    answer_file=$(mktemp) || die "mktemp failed"
+    printf '%s\n' "$answer" > "$answer_file"
+    MEM_DIR="$MEM_DIR" python3 - "$answer_file" <<'PYFILTER'
 import os, re, sys
 names = set(os.listdir(os.environ["MEM_DIR"]))
 pattern = re.compile(r"\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_[0-9a-f]{8}_[A-Za-z0-9-]+")
 dropped = 0
-for line in sys.stdin:
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
     match = pattern.search(line)
     if match and match.group(0) + ".md" not in names and match.group(0) not in names:
         dropped += 1
@@ -347,6 +350,7 @@ for line in sys.stdin:
 if dropped:
     print("mem search: dropped %d result line%s naming memories that do not exist (the model invented them); trust only names that survive." % (dropped, "" if dropped == 1 else "s"), file=sys.stderr)
 PYFILTER
+    rm -f "$answer_file"
 )
 
 action_list() {
