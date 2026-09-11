@@ -17,6 +17,7 @@ import sys
 import tempfile
 import uuid
 from custos_images import MAX_UPLOAD, import_images, validate_refs
+from custos_pdfs import extract_pdfs
 
 
 def atomic_json(path, value):
@@ -233,6 +234,33 @@ def reconcile():
     return {'retried': retried, 'still_pending': failed}
 
 
+def unfold_media(media):
+    """Validate a --media envelope; fold bounded extracted PDF text after content."""
+    if (not isinstance(media,dict) or not isinstance(media.get('content'),str) or
+            set(media) not in ({'content','images'},{'content','images','pdfs'})):
+        raise ValueError('invalid image transfer')
+    content=media['content']
+    if media.get('pdfs'):
+        blocks,notes=extract_pdfs(media['pdfs'])
+        if blocks or notes:
+            content+='\n'+'\n'.join(blocks+notes)
+    images=media['images']
+    refs,errors=import_images(images) if images else ([],[])
+    return content,refs,errors
+
+
+def fit_content(content,limit=32768):
+    """Keep the captured message inside the transport byte budget, honestly."""
+    marker='\n[... PDF text truncated]'
+    if len(content.encode())<=limit:
+        return content
+    data=content.encode()
+    cut=limit-len(marker.encode())
+    while cut>0 and (data[cut]&0xC0)==0x80:
+        cut-=1
+    return data[:cut].decode('utf-8')+marker
+
+
 def main():
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest='command', required=True)
@@ -259,10 +287,8 @@ def main():
                 raw=sys.stdin.read(MAX_UPLOAD+1)
                 if len(raw)>MAX_UPLOAD: raise ValueError('image transfer too large')
                 media=json.loads(raw)
-                if not isinstance(media,dict) or set(media)!={'content','images'} or not isinstance(media['content'],str):
-                    raise ValueError('invalid image transfer')
-                refs,errors=import_images(media['images'])
-                result=send(args, media['content'] + ('\n'+'\n'.join(errors) if errors else ''), refs)
+                content,refs,errors=unfold_media(media)
+                result=send(args, fit_content(content + ('\n'+'\n'.join(errors) if errors else '')), refs)
             else:
                 result = send(args, sys.stdin.read(32769))
         elif args.command == 'outbox':

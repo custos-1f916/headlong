@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -33,6 +34,39 @@ def reaction(sender=HAL, target=BOT, stamp=98765, removed=False, **changes):
 
 
 class SignalPolicyTests(unittest.TestCase):
+    def test_pdf_attachments_are_admitted_and_not_announced_unreadable(self):
+        pdf={'contentType':'application/pdf','id':'paper.pdf','size':2048}
+        item=cs.classify(envelope(message='Read this',attachments=[pdf]),POLICY)
+        self.assertEqual(item['pdf_attachments'],
+                         [{'id':'paper.pdf','size':2048,'mime':'application/pdf'}])
+        self.assertNotIn('not readable',item['body'])
+        big={'contentType':'application/pdf','id':'big.pdf','size':9*1024*1024}
+        item=cs.classify(envelope(message='Read this',attachments=[big]),POLICY)
+        self.assertNotIn('pdf_attachments',item)
+        self.assertIn('not readable',item['body'])
+        pdf3={'contentType':'application/pdf','id':'c.pdf','size':11}
+        item=cs.classify(envelope(message='Read this',attachments=[pdf,pdf,pdf3]),POLICY)
+        self.assertEqual(len(item['pdf_attachments']),2)
+
+    def test_pdf_only_message_gets_an_honest_body_marker(self):
+        pdf={'contentType':'application/pdf','id':'paper.pdf','size':2048}
+        item=cs.classify(envelope(message=None,attachments=[pdf]),POLICY)
+        self.assertEqual(item['body'],'[PDF attached]')
+        item=cs.classify(envelope(message=None,attachments=[pdf,pdf]),POLICY)
+        self.assertEqual(item['body'],'[PDFs attached]')
+        image={'contentType':'image/png','id':'12345','size':1234}
+        item=cs.classify(envelope(message=None,attachments=[image,pdf]),POLICY)
+        self.assertEqual(item['body'],'[Image attached]')
+
+    def test_digest_is_unchanged_for_text_and_image_only_messages(self):
+        self.assertEqual(cs.classify(envelope(),POLICY)['digest'],
+                         hashlib.sha256('Hello Custos'.encode()).hexdigest())
+        image={'contentType':'image/png','id':'12345','size':1234}
+        expected=cs.encoded({'body':'[Image attached]','images':[
+            {'id':'12345','size':1234,'mime':'image/png'}]})
+        item=cs.classify(envelope(message=None,attachments=[image]),POLICY)
+        self.assertEqual(item['digest'],hashlib.sha256(expected.encode()).hexdigest())
+
     def test_image_only_and_caption_preserve_direct_and_ambient_routing(self):
         image={'contentType':'image/png','id':'12345','size':1234}
         dm=cs.classify(envelope(message=None,attachments=[image]),POLICY)
@@ -219,6 +253,30 @@ class SignalPolicyTests(unittest.TestCase):
 
 
 class SignalSpoolTests(unittest.TestCase):
+    def test_pdf_request_is_prepared_once_and_replayed_after_transport_failure(self):
+        pdf={'contentType':'application/pdf','id':'42.pdf','size':1234}
+        self.spool.receive(cs.classify(envelope(message='Look',attachments=[pdf]),POLICY))
+        bridge=cs.Bridge(self.policy_path,self.spool,str(self.policy_path)+'.actions.sqlite'); bridge.rpc=mock.Mock()
+        bridge.rpc.call.return_value={'data':'JVBERi0xLjQ='}
+        calls=[]
+        def transport(args,content=''):
+            if args[0]=='send':
+                calls.append(content)
+                self.assertIn('--media',args)
+                if len(calls)==1: raise RuntimeError('interrupted after native capture')
+                return {'queued':True}
+            return {'events':[],'trajectory':'one','offset':0}
+        with mock.patch.object(cs,'paused',return_value=False),mock.patch.object(cs,'transport',side_effect=transport):
+            with self.assertRaises(RuntimeError): bridge.tick()
+            def no_refetch(method,params=None):
+                if method=='getAttachment': raise AssertionError('attachment must not be fetched again')
+                return {}
+            bridge.rpc.call.side_effect=no_refetch
+            bridge.tick()
+        self.assertEqual(calls[0],calls[1])
+        self.assertIn('pdfs',json.loads(calls[0]))
+        self.assertEqual(self.spool.db.execute('SELECT prepared FROM inbox').fetchone()[0],None)
+
     def test_image_request_is_prepared_once_and_replayed_after_transport_failure(self):
         image={'contentType':'image/png','id':'12345','size':3}
         self.spool.receive(cs.classify(envelope(message='Look',attachments=[image]),POLICY))

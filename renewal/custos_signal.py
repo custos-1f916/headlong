@@ -21,6 +21,7 @@ import time
 import uuid
 from custos_reactions import valid_emoji
 from custos_images import MAX_IMAGES, MAX_RAW, MAX_TOTAL_RAW
+from custos_pdfs import MAX_PDFS
 
 MAX_FRAME = 12 * 1024 * 1024  # one bounded attachment RPC response
 MAX_TEXT = 12000
@@ -204,14 +205,27 @@ def classify(envelope, policy):
             images.append({'id':attachment['id'],'size':attachment['size'],'mime':attachment['contentType']})
     if images and reaction is None and body in (None,''):
         body='[Image attached]' if len(images)==1 else '[Images attached]'
+    pdfs=[]
+    for attachment in attachments:
+        if len(pdfs)>=MAX_PDFS:
+            break
+        if (isinstance(attachment,dict) and attachment.get('contentType')=='application/pdf' and
+                isinstance(attachment.get('id'),str) and len(attachment['id'])<=160 and
+                re.fullmatch(r'[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*',attachment['id']) and
+                type(attachment.get('size')) is int and 0 < attachment['size'] <= MAX_RAW):
+            pdfs.append({'id':attachment['id'],'size':attachment['size'],'mime':attachment['contentType']})
+    if pdfs and reaction is None and not images and body in (None,''):
+        body='[PDF attached]' if len(pdfs)==1 else '[PDFs attached]'
     image_count=sum(isinstance(a,dict) and isinstance(a.get('contentType'),str) and
                     a['contentType'].startswith('image/') for a in attachments)
     if image_count>len(images) and reaction is None:
         body=(body or '')+'\n[Some image attachments are unavailable: unsupported format, too large, or more than four images.]'
     # A video, voice note or file used to vanish here (empty body -> dropped), so
     # Custos never knew something had been shared and guessed. Announce it.
+    admitted_pdfs={a['id'] for a in pdfs}
     others=[a for a in attachments if isinstance(a,dict) and isinstance(a.get('contentType'),str)
-            and not a['contentType'].startswith('image/')]
+            and not a['contentType'].startswith('image/') and
+            not (a.get('contentType')=='application/pdf' and a.get('id') in admitted_pdfs)]
     if others and reaction is None:
         kinds=[]
         for a in others[:3]:
@@ -268,8 +282,10 @@ def classify(envelope, policy):
             **({'addressee': to_other, 'addressee_label': policy['people'][to_other]['label']}
                if to_other and reaction is None else {}),
             **({'image_attachments':images} if images and reaction is None else {}),
+            **({'pdf_attachments':pdfs} if pdfs and reaction is None else {}),
             **({'reaction': reaction, 'self_aci': policy['self_aci']} if reaction is not None else {}),
-            'digest': hashlib.sha256((encoded({'body':body,'images':images}) if images else body).encode()).hexdigest()}
+            'digest': hashlib.sha256((encoded({**{'body':body,'images':images},
+                **({'pdfs':pdfs} if pdfs else {})}) if images or pdfs else body).encode()).hexdigest()}
 
 
 def allowed(item, policy):
@@ -676,6 +692,32 @@ class Bridge:
                 failures.append('An attached image could not be retrieved.')
         return images,failures
 
+    def prepare_pdfs(self, item):
+        pdfs, failures, total = [], [], 0
+        for attachment in item.get('pdf_attachments',[]):
+            if len(pdfs) >= MAX_PDFS:
+                failures.append('A PDF exceeded the attachment transfer limit.')
+                continue
+            if total + attachment['size'] > MAX_TOTAL_RAW:
+                failures.append('A PDF exceeded the attachment transfer limit.')
+                continue
+            params={'id':attachment['id']}
+            params.update({'groupId':item['group']} if item['group'] else {'recipient':item['sender_aci']})
+            try:
+                result=self.rpc.call('getAttachment',params)
+                data=result.get('data') if isinstance(result,dict) else None
+                if not isinstance(data,str) or len(data)>MAX_RAW*4//3+8:
+                    raise ValueError('invalid PDF attachment response')
+                # Count actual encoded bytes too; sender-declared sizes are not
+                # sufficient to bound the combined transfer.
+                size=len(data)*3//4
+                if total+size>MAX_TOTAL_RAW: raise ValueError('PDFs exceed total transfer limit')
+                total+=size
+                pdfs.append({'id':attachment['id'],'size':size,'encoded':data})
+            except (RuntimeError,ValueError):
+                failures.append('An attached PDF could not be retrieved.')
+        return pdfs,failures
+
     def batch_window(self, item):
         knobs = self.policy.get('batch') or {}
         if item['group']:
@@ -826,10 +868,20 @@ class Bridge:
                     failures += failed
                 elif item.get('image_attachments'):
                     failures.append('An image exceeded the attachment transfer limit.')
+            pdf_data = []
+            for row, item in batch:
+                if item.get('pdf_attachments') and len(pdf_data) < MAX_PDFS:
+                    data, failed = self.prepare_pdfs(item)
+                    pdf_data += data[:MAX_PDFS - len(pdf_data)]
+                    failures += failed
+                elif item.get('pdf_attachments'):
+                    failures.append('A PDF exceeded the attachment transfer limit.')
             if failures:
                 content += '\n' + '\n'.join(failures)
-            prepared = {'media': bool(image_data), 'content':
-                        encoded({'content': content, 'images': image_data}) if image_data else content}
+            prepared = {'media': bool(image_data or pdf_data), 'content':
+                        encoded({**{'content': content, 'images': image_data},
+                                 **({'pdfs': pdf_data} if pdf_data else {})})
+                        if image_data or pdf_data else content}
             prepared['ambient'] = ambient
             prepared['allow_reaction'] = not bool(carrier.get('reaction'))
             if route:
