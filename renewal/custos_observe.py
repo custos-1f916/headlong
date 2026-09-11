@@ -79,8 +79,8 @@ class Native:
 
 
 def self_metrics(path, now=None, hours=24, me="custos"):
-    """Custos's own numbers for the last `hours`, from the root trajectory: how
-    its wakes went, what its inference bought, what actually reached people.
+    """Custos's own numbers for the last `hours`, from the root trajectory:
+    observed starts and ends, durable logging markers, and what reached people.
     A living benchmark it can read about itself (independent evaluation,
     2026-09-09) instead of waiting for a human audit."""
     now = time.time() if now is None else now
@@ -89,6 +89,7 @@ def self_metrics(path, now=None, hours=24, me="custos"):
     reasoning = []
     responder = {"replied": 0, "no-reply": 0, "deferred": 0, "failed": 0}
     composed = delivered = signal_out = social_msgs = opened = closed = 0
+    durable_types = ("thought", "observation", "message", "idle", "final")
     with open(path, "rb") as f:
         for line in f:
             if b'"ts"' not in line:
@@ -100,7 +101,11 @@ def self_metrics(path, now=None, hours=24, me="custos"):
             ts = s.get("ts", "")
             t = s.get("type")
             if t == "shellm-run" and ts >= since:
-                runs[s["step_id"]] = {"by": s.get("launched_by", "?"), "n": 0, "llm": 0.0, "first_durable": None, "rc": None, "cap": False}
+                runs[s["step_id"]] = {
+                    "by": s.get("launched_by", "?"), "n": 0, "llm": 0.0,
+                    "first_durable": None, "has_final": False,
+                    "has_other_durable": False, "ended": False, "rc": None,
+                }
                 continue
             rid = s.get("run_id")
             r = runs.get(rid)
@@ -108,9 +113,17 @@ def self_metrics(path, now=None, hours=24, me="custos"):
                 r["n"] += 1
                 r["llm"] += float(s.get("llm_s") or 0)
                 reasoning.append(((s.get("thought") or ""), (s.get("cmd") or ""), r["by"]))
-            elif t in ("thought", "observation", "message", "idle") and r is not None and r["first_durable"] is None:
-                r["first_durable"] = r["n"]
+            elif t in durable_types and r is not None:
+                if r["first_durable"] is None:
+                    r["first_durable"] = r["n"]
+                if t == "final":
+                    r["has_final"] = True
+                else:
+                    r["has_other_durable"] = True
             elif t == "run-end" and r is not None:
+                # An end record is observable independently of whether it has a
+                # usable return code. Missing and non-integer codes remain unknown.
+                r["ended"] = True
                 r["rc"] = s.get("rc")
             if ts < since:
                 continue
@@ -139,22 +152,44 @@ def self_metrics(path, now=None, hours=24, me="custos"):
             if str(s.get("request_id", "")).startswith("custos-resolve:"):
                 closed += 1
     mono = [r for r in runs.values() if r["by"] == "monolith"]
+    mono_completed = [r for r in mono if r["ended"]]
+    mono_known_rc = [r for r in mono_completed if type(r["rc"]) is int]
+
     def pct(a, b):
         return int(round(100.0 * a / b)) if b else 0
+
     def p(values, q):
         values = sorted(values)
         return values[min(len(values) - 1, int(q * len(values)))] if values else 0
+
     mono_reason = [x for x in reasoning if x[2] == "monolith"]
     trunc = sum(1 for th, cmd, _ in mono_reason if re.search(r"truncat|archaeolog|re-?read|lost (the )?(output|middle)", th, re.I))
     selfread = sum(1 for th, cmd, _ in mono_reason if re.search(r"\btraj (show|tail|search|grep)\b", cmd))
     cap = int(os.environ.get("SHELLM_MAX_ITERATIONS", "150") or 150)
     metrics = {
+        "metrics_schema_version": 2,
         "window_hours": hours, "at": time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(now)),
-        "monolith_wakes": len(mono), "monolith_rc_nonzero_pct": pct(sum(1 for r in mono if r["rc"] not in (None, 0)), len(mono)),
-        "monolith_iterations_p50": p([r["n"] for r in mono], 0.5), "monolith_iterations_p90": p([r["n"] for r in mono], 0.9),
-        "monolith_first_durable_p50": p([r["first_durable"] for r in mono if r["first_durable"] is not None], 0.5),
-        "monolith_no_durable_step": sum(1 for r in mono if r["first_durable"] is None),
-        "monolith_at_cap": sum(1 for r in mono if r["n"] >= cap),
+        # Starts, observed end records, and observed end records without a
+        # usable code are distinct facts; open means no end was observed.
+        "monolith_wakes": len(mono),
+        "monolith_completed_wakes": len(mono_completed),
+        "monolith_open_wakes": len(mono) - len(mono_completed),
+        "monolith_known_rc_wakes": len(mono_known_rc),
+        "monolith_unknown_rc_wakes": len(mono_completed) - len(mono_known_rc),
+        "monolith_rc_nonzero_pct": pct(sum(1 for r in mono_known_rc if r["rc"] != 0), len(mono_known_rc)),
+        # These describe only runs for which a run-end was observed.
+        "monolith_iterations_p50": p([r["n"] for r in mono_completed], 0.5),
+        "monolith_iterations_p90": p([r["n"] for r in mono_completed], 0.9),
+        "monolith_first_durable_p50": p([r["first_durable"] for r in mono_completed if r["first_durable"] is not None], 0.5),
+        "monolith_no_durable_step": sum(1 for r in mono_completed if r["first_durable"] is None),
+        "monolith_at_cap": sum(1 for r in mono_completed if r["n"] >= cap),
+        # A final is a marker, not an outcome: final-only has no other marker.
+        "monolith_completed_final_only_wakes": sum(
+            1 for r in mono_completed if r["has_final"] and not r["has_other_durable"]
+        ),
+        "monolith_completed_other_durable_wakes": sum(
+            1 for r in mono_completed if r["has_other_durable"]
+        ),
         "truncation_thought_pct": pct(trunc, len(mono_reason)), "self_read_cmd_pct": pct(selfread, len(mono_reason)),
         "inference_hours": round(sum(r["llm"] for r in runs.values()) / 3600, 2),
         "inference_hours_monolith": round(sum(r["llm"] for r in mono) / 3600, 2),
@@ -172,23 +207,40 @@ def metrics_text(m, previous=None):
             return ""
         d = m[key] - previous[key]
         return " (%s%d)" % ("+" if d >= 0 else "", d)
-    line = ("Daily self-metrics, last %d h: %d monolith wakes%s, %d%% ended rc≠0, iterations p50 %d / p90 %d, "
-            "first durable step at p50 %d, %d wakes with no durable step, %d at the iteration cap; %d%% of thoughts about lost "
-            "or re-read context, %d%% of commands traj self-reads; inference %.1f h (monolith %.1f h); square %d composed / %d delivered%s; "
-            "Signal %d sent (%d by the social thinker in %d social runs); responder %d replied / %d quiet / %d deferred / %d failed; "
-            "goals %d opened / %d closed."
-            % (m["window_hours"], m["monolith_wakes"], delta("monolith_wakes"), m["monolith_rc_nonzero_pct"],
-               m["monolith_iterations_p50"], m["monolith_iterations_p90"], m["monolith_first_durable_p50"],
-               m["monolith_no_durable_step"], m["monolith_at_cap"], m["truncation_thought_pct"], m["self_read_cmd_pct"],
-               m["inference_hours"], m["inference_hours_monolith"], m["square_composed"], m["square_delivered"],
-               delta("square_delivered"), m["signal_sent"], m["signal_sent_by_social"], m["social_runs"],
-               m["responder"]["replied"], m["responder"]["no-reply"], m["responder"]["deferred"], m["responder"]["failed"],
-               m["goals_opened"], m["goals_closed"]))
-    line += (" These are your numbers, not a verdict: a wake with no durable step is inference that bought nothing, "
-             "a composed reply is not a delivered one, and iterations before the first durable step is how long you take to "
-             "start. If one of them is going the wrong way, the goals function is where to act on it.")
-    return line
 
+    line = (
+        "Daily self-metrics, last %d h: %d monolith wakes%s (observed starts), %d ended wakes, "
+        "%d wakes with no run-end observed; %d ended wakes with known rc / %d with unknown rc, "
+        "%d%% nonzero among known-rc ended wakes; completed-wake iterations p50 %d / p90 %d, "
+        "first durable logging marker at p50 %d, %d completed wakes with no durable logging marker, "
+        "%d completed wakes at the iteration cap, %d completed final-only wakes / %d with other durable markers; "
+        "%d%% of thoughts about lost or re-read context, %d%% of commands traj self-reads; inference %.1f h "
+        "(monolith %.1f h); square %d composed / %d delivered%s; Signal %d sent (%d by the social thinker "
+        "in %d social runs); responder %d replied / %d quiet / %d deferred / %d failed; goals %d opened / %d closed."
+        % (
+            m["window_hours"], m["monolith_wakes"], delta("monolith_wakes"),
+            m["monolith_completed_wakes"], m["monolith_open_wakes"],
+            m["monolith_known_rc_wakes"], m["monolith_unknown_rc_wakes"],
+            m["monolith_rc_nonzero_pct"], m["monolith_iterations_p50"],
+            m["monolith_iterations_p90"], m["monolith_first_durable_p50"],
+            m["monolith_no_durable_step"], m["monolith_at_cap"],
+            m["monolith_completed_final_only_wakes"],
+            m["monolith_completed_other_durable_wakes"],
+            m["truncation_thought_pct"], m["self_read_cmd_pct"],
+            m["inference_hours"], m["inference_hours_monolith"],
+            m["square_composed"], m["square_delivered"], delta("square_delivered"),
+            m["signal_sent"], m["signal_sent_by_social"], m["social_runs"],
+            m["responder"]["replied"], m["responder"]["no-reply"],
+            m["responder"]["deferred"], m["responder"]["failed"],
+            m["goals_opened"], m["goals_closed"],
+        )
+    )
+    line += (
+        " These are observations, not a verdict: marker latency and the absence of a durable "
+        "logging marker describe logging, not work start or value; a final is a logging marker, "
+        "not proof of success. A composed reply is not a delivered one."
+    )
+    return line
 
 class Observer:
     def __init__(self, config, store, square, native, now=None):

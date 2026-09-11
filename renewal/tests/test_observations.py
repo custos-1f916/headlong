@@ -465,8 +465,11 @@ class SelfMetricsTests(unittest.TestCase):
             path = Path(d) / "trajectory.jsonl"
             path.write_text("".join(json.dumps(r) + "\n" for r in rows))
             m = self_metrics(path, now)
-        self.assertEqual((m["monolith_wakes"], m["monolith_rc_nonzero_pct"], m["monolith_no_durable_step"]), (2, 50, 1))
+        self.assertEqual(m["metrics_schema_version"], 2)
+        self.assertEqual((m["monolith_wakes"], m["monolith_completed_wakes"], m["monolith_open_wakes"]), (2, 2, 0))
+        self.assertEqual((m["monolith_known_rc_wakes"], m["monolith_unknown_rc_wakes"], m["monolith_rc_nonzero_pct"]), (2, 0, 50))
         self.assertEqual(m["monolith_first_durable_p50"], 2)
+        self.assertEqual((m["monolith_completed_final_only_wakes"], m["monolith_completed_other_durable_wakes"]), (0, 1))
         self.assertEqual((m["truncation_thought_pct"], m["self_read_cmd_pct"]), (67, 67))
         self.assertEqual((m["square_composed"], m["square_delivered"]), (2, 1))
         self.assertEqual((m["signal_sent"], m["signal_sent_by_social"], m["social_runs"]), (1, 1, 1))
@@ -474,9 +477,92 @@ class SelfMetricsTests(unittest.TestCase):
         self.assertEqual((m["goals_opened"], m["goals_closed"]), (1, 1))
         self.assertEqual(m["inference_hours"], round(120 / 3600, 2))
         text = metrics_text(m, {**m, "square_delivered": 0, "monolith_wakes": 5})
-        self.assertIn("2 monolith wakes (-3)", text)
+        self.assertIn("2 monolith wakes (-3) (observed starts), 2 ended wakes, 0 wakes with no run-end observed", text)
+        self.assertIn("known rc / 0 with unknown rc", text)
         self.assertIn("2 composed / 1 delivered (+1)", text)
-        self.assertIn("a composed reply is not a delivered one", text)
+        self.assertIn("A composed reply is not a delivered one", text)
+        self.assertNotIn("bought nothing", text)
+        self.assertNotIn("how long you take to start", text)
+
+    def test_metrics_completed_only_and_final_is_a_marker(self):
+        from custos_observe import self_metrics
+        now = 1788960000.0
+
+        def ts(ago):
+            import time as _t
+            return _t.strftime("%Y-%m-%dT%H:%M:%S.000Z", _t.gmtime(now - ago))
+
+        rows = [
+            # This high-iteration start has no end record and must not affect
+            # completed-run percentiles or cap/no-marker counts.
+            {"type": "shellm-run", "step_id": "open", "launched_by": "monolith", "ts": ts(500)},
+            *[{"type": "reasoning", "run_id": "open", "llm_s": 1, "ts": ts(499 - n)} for n in range(200)],
+            {"type": "shellm-run", "step_id": "observed", "launched_by": "monolith", "ts": ts(400)},
+            {"type": "reasoning", "run_id": "observed", "llm_s": 1, "ts": ts(399)},
+            {"type": "reasoning", "run_id": "observed", "llm_s": 1, "ts": ts(398)},
+            {"type": "observation", "run_id": "observed", "source": "test", "ts": ts(397)},
+            {"type": "run-end", "run_id": "observed", "rc": 0, "ts": ts(396)},
+            # A final before a zero-code end is a durable marker, but not success evidence.
+            {"type": "shellm-run", "step_id": "final-only", "launched_by": "monolith", "ts": ts(350)},
+            *[{"type": "reasoning", "run_id": "final-only", "llm_s": 1, "ts": ts(349 - n)} for n in range(5)],
+            {"type": "final", "run_id": "final-only", "ts": ts(340)},
+            {"type": "run-end", "run_id": "final-only", "rc": 0, "ts": ts(339)},
+            {"type": "shellm-run", "step_id": "unlogged-failure", "launched_by": "monolith", "ts": ts(300)},
+            {"type": "reasoning", "run_id": "unlogged-failure", "llm_s": 1, "ts": ts(299)},
+            {"type": "run-end", "run_id": "unlogged-failure", "rc": 7, "ts": ts(298)},
+            {"type": "shellm-run", "step_id": "unknown-rc", "launched_by": "monolith", "ts": ts(250)},
+            *[{"type": "reasoning", "run_id": "unknown-rc", "llm_s": 1, "ts": ts(249 - n)} for n in range(3)],
+            {"type": "observation", "run_id": "unknown-rc", "source": "test", "ts": ts(245)},
+            {"type": "run-end", "run_id": "unknown-rc", "ts": ts(244)},
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "trajectory.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            m = self_metrics(path, now)
+
+        self.assertEqual((m["monolith_wakes"], m["monolith_completed_wakes"], m["monolith_open_wakes"]), (5, 4, 1))
+        self.assertEqual((m["monolith_known_rc_wakes"], m["monolith_unknown_rc_wakes"]), (3, 1))
+        self.assertEqual(m["monolith_rc_nonzero_pct"], 33)
+        self.assertEqual((m["monolith_iterations_p50"], m["monolith_iterations_p90"]), (3, 5))
+        self.assertEqual(m["monolith_first_durable_p50"], 3)
+        self.assertEqual((m["monolith_no_durable_step"], m["monolith_at_cap"]), (1, 0))
+        self.assertEqual((m["monolith_completed_final_only_wakes"], m["monolith_completed_other_durable_wakes"]), (1, 2))
+
+    def test_metrics_all_open_and_empty_have_no_completed_denominators(self):
+        from custos_observe import self_metrics, metrics_text
+        now = 1788960000.0
+
+        def ts(ago):
+            import time as _t
+            return _t.strftime("%Y-%m-%dT%H:%M:%S.000Z", _t.gmtime(now - ago))
+
+        open_rows = [
+            {"type": "shellm-run", "step_id": "open-a", "launched_by": "monolith", "ts": ts(30)},
+            *[{"type": "reasoning", "run_id": "open-a", "ts": ts(29)} for _ in range(200)],
+            {"type": "shellm-run", "step_id": "open-b", "launched_by": "monolith", "ts": ts(20)},
+            {"type": "final", "run_id": "open-b", "ts": ts(19)},
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "trajectory.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in open_rows))
+            open_metrics = self_metrics(path, now)
+            path.write_text("")
+            empty_metrics = self_metrics(path, now)
+
+        for metrics, starts in ((open_metrics, 2), (empty_metrics, 0)):
+            self.assertEqual(metrics["metrics_schema_version"], 2)
+            self.assertEqual((metrics["monolith_wakes"], metrics["monolith_completed_wakes"], metrics["monolith_open_wakes"]), (starts, 0, starts))
+            self.assertEqual((metrics["monolith_known_rc_wakes"], metrics["monolith_unknown_rc_wakes"]), (0, 0))
+            self.assertEqual((metrics["monolith_rc_nonzero_pct"], metrics["monolith_iterations_p50"], metrics["monolith_iterations_p90"]), (0, 0, 0))
+            self.assertEqual((metrics["monolith_first_durable_p50"], metrics["monolith_no_durable_step"], metrics["monolith_at_cap"]), (0, 0, 0))
+            self.assertEqual((metrics["monolith_completed_final_only_wakes"], metrics["monolith_completed_other_durable_wakes"]), (0, 0))
+
+        text = metrics_text(open_metrics)
+        self.assertIn("2 monolith wakes (observed starts), 0 ended wakes, 2 wakes with no run-end observed", text)
+        self.assertIn("known-rc ended wakes", text)
+        self.assertIn("logging, not work start or value", text)
+        self.assertNotIn("bought nothing", text)
+        self.assertNotIn("how long you take to start", text)
 
     def test_observer_emits_daily_metrics_once_and_keeps_yesterday(self):
         temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
