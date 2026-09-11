@@ -6,6 +6,7 @@ Call from an activated identity. Operator authority is assigned by the trusted
 CLI/paired-phone bridge, never by quoted message text.
 """
 import argparse
+from custos_signal_targeting import validate as validate_signal_routing
 import fcntl
 import hashlib
 import json
@@ -82,6 +83,8 @@ def send(args, content, images=None):
             original['ambient'] = True
         if getattr(args, 'allow_reaction', False):
             original['allow_reaction'] = True
+        if getattr(args, 'signal_routing', None) is not None:
+            original['signal_routing'] = validate_signal_routing(args.signal_routing)
         if images:
             original['images'] = validate_refs(images)
         if receipt.exists():
@@ -108,6 +111,8 @@ def send(args, content, images=None):
                     event['ambient'] = True
                 if original.get('allow_reaction'):
                     event['allow_reaction'] = True
+                if 'signal_routing' in original:
+                    event['signal_routing'] = original['signal_routing']
                 if original.get('images'):
                     event['images'] = original['images']
                 native(['traj', 'append', root], json.dumps(event))
@@ -215,6 +220,7 @@ def reconcile():
         original = record['original']
         args = argparse.Namespace(**{key: original[key] for key in
                                   ('request_id', 'sender', 'authority', 'source_url')})
+        args.signal_routing = original.get('signal_routing')
         args.ambient = original.get('ambient', False)
         args.allow_reaction = original.get('allow_reaction', False)
         try:
@@ -237,6 +243,7 @@ def main():
     put.add_argument('--source-url', default='')
     put.add_argument('--ambient', action='store_true', help='Observed conversation, not a directed task')
     put.add_argument('--allow-reaction', action='store_true', help='Host can deliver an emoji reaction to this message')
+    put.add_argument('--signal-routing', type=json.loads, help='Verified per-message addressing from the host bridge')
     put.add_argument('--media', action='store_true', help='Read text and bounded base64 images from stdin JSON')
     get = commands.add_parser('poll')
     get.add_argument('--request-id', required=True)

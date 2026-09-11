@@ -101,9 +101,11 @@ class SignalPolicyTests(unittest.TestCase):
     def test_group_observes_all_text_and_marks_direct_addresses(self):
         base = envelope(message='ordinary chat', groupInfo={'groupId': 'agreed-group'})
         self.assertFalse(cs.classify(base, POLICY)['directed'])
-        base['dataMessage']['mentions'] = [{'uuid': BOT}]
+        base['dataMessage']['message'] = '\ufffc ordinary chat'
+        base['dataMessage']['mentions'] = [{'uuid': BOT, 'start': 0, 'length': 1}]
         self.assertTrue(cs.classify(base, POLICY)['directed'])
         base['dataMessage']['mentions'] = []
+        base['dataMessage']['message'] = 'ordinary chat'
         base['dataMessage']['quote'] = {'authorUuid': BOT}
         self.assertTrue(cs.classify(base, POLICY)['directed'])
 
@@ -121,11 +123,10 @@ class SignalPolicyTests(unittest.TestCase):
             self.assertFalse(item['directed'], text)
             self.assertEqual(item['addressee_label'], 'Kim', text)
         self.assertFalse(group('meet Custos', mentions=[{'uuid': kim}])['directed'])  # structured mention of Kim
-        for text in ('Custos, what do you think of Kim?', 'Kim is cool. Custos, agree?',
-                     'my buddy Custos is in the chat', 'Kim is into Custos'):
+        for text in ('Custos, what do you think of Kim?', 'Kim is cool. Custos, agree?'):
             self.assertTrue(group(text)['directed'], text)
-        self.assertTrue(group('Kim, say hi', mentions=[{'uuid': BOT}])['directed'])  # Custos @-mentioned wins
-        self.assertTrue(group('what do you think Custos', quote={'authorUuid': kim})['directed'])
+        self.assertTrue(group('\ufffc, say hi', mentions=[{'uuid': BOT, 'start': 0, 'length': 1}])['directed'])  # Custos @-mentioned wins
+        self.assertFalse(group('what do you think Custos', quote={'authorUuid': kim})['directed'])
         self.assertNotIn('addressee', group('Kim is cool'))
         self.assertTrue(cs.classify(envelope(message='Kim, see this'), policy)['directed'])  # DMs are always to Custos
         self.assertFalse(cs.classify(envelope(message='chatting with Friend'), POLICY).get('addressee'))
@@ -241,6 +242,11 @@ class SignalSpoolTests(unittest.TestCase):
         self.assertEqual(calls[0],calls[1])
         self.assertEqual(self.spool.db.execute('SELECT prepared FROM inbox').fetchone()[0],None)
     def setUp(self):
+        # Fresh sealed VMs boot with monotonic time < TYPING_REFRESH. These
+        # delivery tests model a running bridge, independently of machine uptime.
+        monotonic = cs.time.monotonic
+        clock = mock.patch.object(cs.time, 'monotonic', side_effect=lambda: monotonic() + 1000)
+        clock.start(); self.addCleanup(clock.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -636,7 +642,7 @@ class SignalSpoolTests(unittest.TestCase):
         args, content = sends[0]
         self.assertEqual(args[args.index('--request-id') + 1], items[1]['request_id'])
         self.assertNotIn('--ambient', args)
-        self.assertEqual(content.count('- Friend ('), 3)
+        self.assertEqual(content.count('\"speaker\":\"Friend\"') - 1, 3)
         self.assertEqual([self.phase(i['request_id']) for i in items], ['batched', 'queued', 'batched'])
         self.assertEqual([p for m, p in calls if m == 'sendTyping'], [{'groupId': 'agreed-group'}])
         self.assertEqual(len([m for m, p in calls if m == 'sendReceipt']), 3)
@@ -698,7 +704,7 @@ class SignalSpoolTests(unittest.TestCase):
         with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport', side_effect=transport):
             bridge.tick()
         self.assertEqual(len(sends), 1); self.assertIn('--ambient', sends[0][0])
-        self.assertIn('group conversation not addressed to you', sends[0][1])
+        self.assertIn('Ambient items permit voluntary conversation', sends[0][1])
 
     def test_reactions_skip_the_wait_and_rows_without_arrival_go_at_once(self):
         calls, sends = [], []; bridge, transport = self.waiting_bridge(calls, sends)
@@ -739,7 +745,8 @@ class SignalSpoolTests(unittest.TestCase):
         args, content = sends[0]
         self.assertEqual(args[args.index('--request-id') + 1], items[0]['request_id'])
         self.assertIn('--ambient', args)
-        self.assertIn('addressed to Kim, not to you (you were named in passing). Let Kim answer.', content)
+        self.assertIn('\"category\":\"to_others\"', content)
+        self.assertIn('Reply-eligible message IDs: []', content)
         self.assertEqual([p for m, p in calls if m == 'sendTyping'], [])
 
 

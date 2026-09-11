@@ -7,6 +7,7 @@ policy establishes recipients and authority. SQLite is a delivery spool, not a
 second goals store. Native custos-memory remains the goals authority.
 """
 import argparse
+import custos_signal_targeting as targeting
 import hashlib
 import json
 import os
@@ -240,20 +241,13 @@ def classify(envelope, policy):
         body = 'Signal reaction (ambient event, not a request): ' + encoded(reaction)
     if not isinstance(body, str) or not body.strip() or len(body.encode()) > MAX_TEXT:
         return None
+    target = None
     directed, to_other = True, None
-    if group:
-        if group not in policy['groups']:
-            return None
-        mentions = message.get('mentions') or []
-        quote = message.get('quote') or {}
-        to_self = (any(isinstance(m, dict) and
-                       aci(m.get('uuid') or m.get('author')) == policy['self_aci'] for m in mentions) or
-                   aci(quote.get('authorUuid') or quote.get('author')) == policy['self_aci'] or
-                   vocative(body, ['Custos']))
-        to_other = addressee(body, mentions, sender, policy)
-        # Naming Custos while addressing someone else ("what do you think of my
-        # buddy Custos, Kim?") is that person's question to answer, not Custos's.
-        directed = to_self or (bool(re.search(r'\bcustos\b', body, re.I)) and to_other is None)
+    if group and reaction is None:
+        target = targeting.normalize(body, message.get('mentions') or [], message.get('quote'),
+                                     policy, vocative, person_names)
+        directed = target['category'] == 'to_custos'
+        to_other = next((t['aci'] for t in target['targets'] if t['aci'] != policy['self_aci']), None)
     if reaction is not None:
         directed = False
     conversation = 'group:' + group if group else 'dm:' + sender
@@ -268,6 +262,9 @@ def classify(envelope, policy):
             'conversation': conversation, 'route': route, 'group': group,
             'authority': person['authority'], 'label': person['label'], 'body': body,
             'directed': directed,
+            **({'targeting': target, 'digest_version': 2,
+                'addressing_digest': hashlib.sha256(encoded({'mentions': message.get('mentions'),
+                    'quote': message.get('quote')}).encode()).hexdigest()} if target else {}),
             **({'addressee': to_other, 'addressee_label': policy['people'][to_other]['label']}
                if to_other and reaction is None else {}),
             **({'image_attachments':images} if images and reaction is None else {}),
@@ -349,6 +346,7 @@ class Spool:
           CREATE TABLE IF NOT EXISTS outbox (
             id TEXT PRIMARY KEY, request_id TEXT NOT NULL, content TEXT NOT NULL,
             phase TEXT NOT NULL DEFAULT 'pending', receipt TEXT, created REAL NOT NULL);
+          CREATE TABLE IF NOT EXISTS routing_counts (category TEXT PRIMARY KEY, count INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS cursor (
             route TEXT PRIMARY KEY, trajectory TEXT NOT NULL, offset INTEGER NOT NULL);
         ''')
@@ -365,12 +363,18 @@ class Spool:
             self.db.execute("UPDATE outbox SET phase='uncertain' WHERE phase='sending'")
 
     def receive(self, item):
-        previous = self.db.execute('SELECT digest FROM inbox WHERE id=?', (item['request_id'],)).fetchone()
+        previous = self.db.execute('SELECT digest,payload FROM inbox WHERE id=?', (item['request_id'],)).fetchone()
         if previous:
             if previous['digest'] != item['digest']:
                 raise ValueError('conflicting inbound message identity')
+            old = json.loads(previous['payload'])
+            # Old receipts keep their original digest/interpretation. New captures
+            # additionally detect changed mention/quote identity under the same ID.
+            if old.get('digest_version') == 2 and old.get('addressing_digest') != item.get('addressing_digest'):
+                raise ValueError('conflicting inbound addressing identity')
             return False
         if item.get('reaction'):
+
             # Resolve only inside the same conversation from our existing spool;
             # never fetch a quoted target from another chat or arbitrary URL.
             item = dict(item)
@@ -379,6 +383,10 @@ class Spool:
         with self.db:
             self.db.execute('INSERT INTO inbox(id,digest,payload,arrived) VALUES(?,?,?,?)',
                             (item['request_id'], item['digest'], encoded(item), time.time()))
+            if item.get('targeting'):
+                self.db.execute('INSERT INTO routing_counts(category,count) VALUES(?,1) '
+                                'ON CONFLICT(category) DO UPDATE SET count=count+1',
+                                (item['targeting']['category'],))
         return True
 
     def reaction_target(self, item):
@@ -723,7 +731,17 @@ class Bridge:
                               'scope': 'group' if carrier['group'] else 'direct',
                               **({'group': group_label(self.policy, carrier['group'])} if carrier['group'] else {}),
                               'timestamp': carrier['timestamp']}))
-        if len(batch) == 1:
+        route = targeting.routing(batch)
+        if route:
+            lines = []
+            for row, item in batch:
+                t = item['targeting']
+                lines.append(encoded({'id': item['request_id'], 'speaker': item['label'],
+                                      'category': t['category'], 'targets': t['targets']}) +
+                             '\n' + t['display_body'])
+            content += '\nMessage:\n' + '\n\n'.join(lines)
+            content += '\nReply-eligible message IDs: ' + encoded(route['eligible'])
+        elif len(batch) == 1:
             content += '\nMessage:\n' + carrier['body']
         else:
             lines = []
@@ -736,7 +754,11 @@ class Bridge:
         items = [item for row, item in batch]
         ambient = not any(item.get('directed', True) for item in items)
         addressed = [item.get('addressee_label') for item in items]
-        if ambient and all(addressed):
+        if route:
+            content += ('\nParticipation: each message has its own addressing. Answer or adopt tasks only '
+                        'from reply-eligible items. Other-addressed and unresolved items are context only. '
+                        'Ambient items permit voluntary conversation. No eligible items means no reply.')
+        elif ambient and all(addressed):
             other = addressed[-1]
             named = any(re.search(r'\bcustos\b', item['body'], re.I) for item in items)
             content += ('\nParticipation: group message' + ('s' if len(items) > 1 else '') + ' addressed to ' + other
@@ -770,11 +792,29 @@ class Bridge:
     def deliver(self, batch, mode=None):
         """Send one batch (or one reaction) into Custos and settle the spool rows."""
         db = self.spool.db
-        carrier_row, carrier = next(((row, item) for row, item in reversed(batch) if item.get('directed')), batch[-1])
+        # Do not mix newly classified addressing with legacy rows whose native
+        # mentions were discarded. Legacy/prepared intake keeps its old contract.
+        modern = 'targeting' in batch[0][1]
+        for index, (row, item) in enumerate(batch):
+            if ('targeting' in item) != modern:
+                batch = batch[:index]
+                break
+        while True:
+            route = targeting.routing(batch)
+            selected_mode = 'context_only' if route and not route['eligible'] else mode
+            eligible = [(row, item) for row, item in batch if not route or item['request_id'] in route['eligible']]
+            choices = eligible or batch
+            carrier_row, carrier = next(((row, item) for row, item in reversed(choices) if item.get('directed')), choices[-1])
+            content, ambient = self.render(batch, carrier, selected_mode)
+            # Leave excess items pending instead of creating an oversized native
+            # request. Never change a prepared request's membership or content.
+            if carrier_row['prepared'] or len(content.encode()) <= 28000 or len(batch) == 1:
+                break
+            batch = batch[:-1]
+        mode = selected_mode
         if not self.group_ok(carrier):
             return
         members = [row['id'] for row, item in batch if row['id'] != carrier_row['id']]
-        content, ambient = self.render(batch, carrier, mode)
         if carrier_row['prepared']:
             prepared = json.loads(carrier_row['prepared'])
         else:
@@ -790,6 +830,10 @@ class Bridge:
                 content += '\n' + '\n'.join(failures)
             prepared = {'media': bool(image_data), 'content':
                         encoded({'content': content, 'images': image_data}) if image_data else content}
+            prepared['ambient'] = ambient
+            prepared['allow_reaction'] = not bool(carrier.get('reaction'))
+            if route:
+                prepared['signal_routing'] = route
             # Persist the exact wire request and fold the batch before intake so a
             # crash after native capture replays identically, never twice.
             with db:
@@ -801,7 +845,13 @@ class Bridge:
                                (encoded({'carrier': carrier_row['id']}), member))
         args = ['send', '--sender', carrier['route'], '--authority', carrier['authority'],
                 '--request-id', carrier['request_id'], '--source-url', carrier['request_id']]
-        args += (['--ambient'] if ambient else []) + ([] if carrier.get('reaction') else ['--allow-reaction'])
+        # Replay new prepared requests byte-for-byte, including routing flags.
+        # Legacy prepared requests retain their original argument behavior.
+        ambient = prepared.get('ambient', ambient)
+        args += (['--ambient'] if ambient else [])
+        args += ['--allow-reaction'] if prepared.get('allow_reaction', not bool(carrier.get('reaction'))) else []
+        if prepared.get('signal_routing'):
+            args += ['--signal-routing', encoded(prepared['signal_routing'])]
         if prepared['media']:
             args += ['--media']
         if db.execute('SELECT phase FROM inbox WHERE id=?', (carrier_row['id'],)).fetchone()[0] != 'pending':
@@ -833,6 +883,11 @@ class Bridge:
             incoming = db.execute('SELECT payload,phase,mode FROM inbox WHERE id=?', (row['request_id'],)).fetchone()
             item = json.loads(incoming['payload'])
             if incoming['phase'] != 'queued' or not allowed(item, self.policy) or not self.group_ok(item):
+                continue
+            if incoming['mode'] == 'context_only':
+                with db:
+                    db.execute("UPDATE outbox SET phase='suppressed',receipt=? WHERE id=?",
+                               (encoded({'suppressed': 'context-only addressing: no reply'}), row['id']))
                 continue
             reaction = row['reaction']
             if reaction is None and incoming['mode'] == 'digest':

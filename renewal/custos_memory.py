@@ -7,6 +7,7 @@ Locks and staging files are not a goals database. Origin, evidence, response
 receipts and recovery state all live in the native memory body.
 """
 import argparse
+import custos_signal_targeting as signal_targeting
 import contextlib
 import datetime as dt
 import fcntl
@@ -153,13 +154,22 @@ def split_memory(raw):
     return header, body.strip(), fields
 
 
+def validate_signal_routing(value):
+    try:
+        return signal_targeting.validate(value)
+    except (ValueError, TypeError) as error:
+        raise InvalidInput('invalid Signal targeting provenance') from error
+
+
 def validate_record(record):
     """Shape checks on a captured request record; raises MemoryError."""
     if not isinstance(record, dict) or record.get("version") != 1:
         raise MemoryError("corrupt directed request record")
     if record.get("status") not in {"active", "completed", "declined", "abandoned"}:
         raise MemoryError("invalid directed goal status; refusing to hide work")
-    keys(record.get("origin"), {"request_id", "sender", "source_url", "content", "authority"}, {"ambient", "allow_reaction", "images"})
+    keys(record.get("origin"), {"request_id", "sender", "source_url", "content", "authority"}, {"ambient", "allow_reaction", "images", "signal_routing"})
+    if 'signal_routing' in record['origin']:
+        validate_signal_routing(record['origin']['signal_routing'])
     if 'images' in record['origin']:
         validate_refs(record['origin']['images'])
     if "ambient" in record["origin"] and record["origin"]["ambient"] is not True:
@@ -465,12 +475,14 @@ class Store:
 
     def capture(self, payload, trigger_step=None):
         keys(payload, {"request_id", "sender", "source_url", "content", "authority"},
-             {"outcome", "next_action", "completion", "ambient", "allow_reaction", "images"})
+             {"outcome", "next_action", "completion", "ambient", "allow_reaction", "images", "signal_routing"})
         origin = {key: text(payload[key], key, MAX_CONTENT if key == "content" else 2048,
                             empty=key == "source_url")
                   for key in ("request_id", "sender", "source_url", "content", "authority")}
         if origin["authority"] not in {"operator", "agent", "external"}:
             raise InvalidInput("invalid envelope authority")
+        if 'signal_routing' in payload:
+            origin['signal_routing'] = validate_signal_routing(payload['signal_routing'])
         if "ambient" in payload:
             if payload["ambient"] is not True:
                 raise InvalidInput("invalid ambient provenance")
@@ -1104,6 +1116,8 @@ def envelope_payload(envelope):
     incoming = {"request_id": request_id, "sender": envelope.get("from", "human"),
             "source_url": envelope.get("source_url", ""), "content": envelope.get("content"),
             "authority": envelope.get("authority", "external")}
+    if 'signal_routing' in envelope:
+        incoming['signal_routing'] = validate_signal_routing(envelope['signal_routing'])
     if "ambient" in envelope:
         incoming["ambient"] = envelope["ambient"]
     if "allow_reaction" in envelope:
@@ -1245,7 +1259,7 @@ def promises_work(reply):
 
 
 
-def validate_plan(raw, allow_reaction=True, metadata=None, require_envelope=False):
+def validate_plan(raw, allow_reaction=True, metadata=None, require_envelope=False, signal_routing=None):
     raw = text(raw, "model response", 24576).strip()
     metadata = metadata if metadata is not None else {}
     metadata["format"] = "envelope"
@@ -1267,6 +1281,15 @@ def validate_plan(raw, allow_reaction=True, metadata=None, require_envelope=Fals
         plan = {"reply": raw, "decision": "reply", "goal": None, "memories": [], "person": None}
     if not isinstance(plan, dict):
         raise InvalidInput("invalid JSON")
+    if signal_routing is not None:
+        validate_signal_routing(signal_routing)
+        addressed = plan.get('reply_to_items')
+        if (not isinstance(addressed, list) or any(not isinstance(i, str) for i in addressed) or
+                len(set(addressed)) != len(addressed) or
+                any(i not in signal_routing['eligible'] for i in addressed) or
+                (plan.get('decision') == 'no-reply') != (addressed == [])):
+            raise InvalidInput('response must select only eligible Signal message IDs')
+        metadata['reply_to_items'] = addressed
     # Unknown extra fields are dropped rather than fatal; required ones must exist.
     for key in list(plan):
         if key not in {"reply", "decision", "goal", "memories", "person"}:
@@ -1515,7 +1538,8 @@ def compose_plan(raw, argv, incoming, attempt, started):
     metadata = {}
     attempt["stage"], attempt["raw"] = "validation", raw
     try:
-        plan = validate_plan(raw, allow_reaction=bool(incoming.get("allow_reaction")), metadata=metadata)
+        plan = validate_plan(raw, allow_reaction=bool(incoming.get("allow_reaction")), metadata=metadata,
+                             signal_routing=incoming.get("signal_routing"))
     except MemoryError as error:
         had_commitment = promises_work(raw)
         record_invalid_response(raw, "validation: " + failure_code(error), attempt.get("trigger", ""))
@@ -1532,6 +1556,8 @@ def compose_plan(raw, argv, incoming, attempt, started):
                          "person details or new commitments. If the answer promises future work, encode "
                          "that existing promise as defer with a concrete goal based only on the incoming "
                          "request. Do not mark a promise as reply. No tools or actions.\\n" + RESPONSE_CONTRACT)
+        if incoming.get('signal_routing'):
+            repair_system += signal_targeting.contract(incoming['signal_routing'])
         repair_data = encode({"incoming_message": incoming["content"], "candidate": raw[:24576],
                               "validation_error": failure_code(error)})
         repair_argv = list(argv)
@@ -1540,13 +1566,15 @@ def compose_plan(raw, argv, incoming, attempt, started):
                                  "-s", repair_system], timeout=remaining)
         attempt["raw"] = raw
         plan = validate_plan(raw, allow_reaction=bool(incoming.get("allow_reaction")),
-                             metadata=metadata, require_envelope=True)
+                             metadata=metadata, require_envelope=True, signal_routing=incoming.get("signal_routing"))
         if had_commitment and plan["decision"] != "defer":
             raise InvalidInput("repair lost an existing commitment")
         metadata["repaired"] = True
     if metadata.get("person_candidate"):
         attempt["person_candidate"] = metadata["person_candidate"]
         attempt["person_update_warning"] = metadata["person_update_warning"]
+    if 'reply_to_items' in metadata:
+        plan['reply_to_items'] = metadata['reply_to_items']
     attempt["format"] = metadata.get("format", "envelope")
     attempt["repaired"] = metadata.get("repaired", False)
     return plan
@@ -1580,7 +1608,8 @@ def response(store, payload):
         who_key = person_key(incoming["sender"], incoming["content"])
         who = speaker_of(incoming["sender"], incoming["content"])
         me = os.environ.get("IDENTITY_NAME", "custos")
-        if not saved and is_reaction_event(incoming["content"]):
+        context_only = bool(incoming.get('signal_routing')) and not incoming['signal_routing']['eligible']
+        if not saved and (context_only or is_reaction_event(incoming["content"])):
             # An emoji on someone's message is social signal, not a question.
             # Recording it is enough; a model call to decide "no reply" cost
             # up to a minute of the shared slot per reaction (8 of them on the
@@ -1592,7 +1621,7 @@ def response(store, payload):
                 plan = {"reply": "", "decision": "no-reply", "goal": None, "memories": [], "person": None}
                 record["response"] = {"state": "no-reply", "plan": plan, "at": now(), "inference": False}
                 record["responder_attempt"]["state"] = "succeeded"
-                resolution = {"disposition": "completed", "evidence": "Reaction event noted; no reply needed."}
+                resolution = {"disposition": "completed", "evidence": ("Signal context-only message noted; no reply or task accepted." if context_only else "Reaction event noted; no reply needed.")}
                 record["status"] = "completed"
                 record["resolution"] = resolution
                 record["events"].append({"at": now(), "resolution": resolution})
@@ -1601,10 +1630,12 @@ def response(store, payload):
             metrics["compose_ms"] = int(metrics.get("compose_ms", 0)) + int((time.monotonic() - started) * 1000)
             append_step({**metrics, "type": "observation", "source": "responder", "trigger_step": trigger,
                          "goal_id": goal_id, "decision": "no-reply", "deferred": False, "person_key": who_key,
-                         "content": "Noted a reaction from " + who + " (no model call)"})
+                         "content": ("Noted context-only Signal conversation (no model call)" if context_only else "Noted a reaction from " + who + " (no model call)")})
             return {"goal_id": goal_id, "decision": "no-reply", "replayed": False}
         if not saved:
             system = text(payload["system"], "system prompt", 98304) + RESPONSE_CONTRACT
+            if incoming.get('signal_routing'):
+                system += signal_targeting.contract(incoming['signal_routing'])
             system += "\n" + people.prompt(who_key, who)
             policy, policy_path = social_policy()
             if incoming.get("ambient"):
@@ -1880,7 +1911,9 @@ def replay_unanswered(store, older_than=900, limit=3):
             else:
                 # Old capture-only records keep their existing direct-message
                 # policy. Prepared/applied responses resume even when ambient.
-                if (record["origin"].get("ambient") and not saved) or is_task(record) and not saved:
+                route = record["origin"].get("signal_routing")
+                context_only = route is not None and not route["eligible"]
+                if (record["origin"].get("ambient") and not saved and not context_only) or is_task(record) and not saved:
                     continue
                 if record["received_at"] > cutoff:
                     continue

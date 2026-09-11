@@ -84,20 +84,45 @@ recovered both services successfully.
 
 ## Addressing, batching, threading and courtesies (2026-09-10)
 
-A group message is *directed* when Custos is @-mentioned, quoted, or addressed by
-name at the start or end of a sentence; merely naming Custos while addressing
-another allowlisted person ("what do you think of my buddy Custos, Kim?") is not.
-Addressees are recognised from structured mentions and from vocatives using each
-person's label plus optional policy `aliases` (e.g. Kim: `["Kimchi", "Kimchi-Chan"]`).
-The intake's participation line then says "addressed to Kim, not to you"; the
-responder contract already allows no-reply for messages meant for someone else.
+Group intake preserves the original body for receipts/quotes and separately renders
+native mentions as `@Name` using operator-policy labels. Native mention spans use
+UTF-16 offsets; unknown, missing or invalid spans remain visibly unresolved.
+Native targets take precedence over literal vocatives and quote recipients;
+incidental mentions of Custos's name do not imply a request.
+
+Each new group item carries verified target IDs, provenance (`mention`, `literal`,
+`quote`) and one category: `to_custos`, `to_others`, `ambient`, or `unresolved`.
+Only `to_custos` and `ambient` are reply-eligible. The latter keeps voluntary group
+participation. Other-addressed/unresolved items remain context, without accepting
+work or answering on someone else's behalf. Entirely context-only batches settle
+with a durable no-reply record without inference; recovery settles unprocessed
+intakes the same way. The host also suppresses output correlated to those batches.
+
+Mixed batches retain per-item labels and an explicit eligible-ID list. The response
+contract requires `reply_to_items` to select only eligible IDs for any reply,
+reaction or deferred task. This checks declared targets; it cannot prove the model's
+prose never strays onto a neighboring topic. Carrier selection uses eligible items.
+Raw receipts, old captured records and legacy prepared requests are never rewritten;
+legacy and new rows are delivered in separate batches. New captures additionally
+hash mention/quote metadata to detect retargeting under the same message ID.
+
+The host spool's `routing_counts(category,count)` records content-free cumulative
+counts for the four categories, counting each newly admitted message once. Existing
+rows do not backfill counts. Query it locally to inspect unresolved addressing.
+
+Deploy the guest release before enabling the host change. The host installation
+must include both `custos_signal.py` and `custos_signal_targeting.py` from the same
+reviewed commit; preserve the current PDF/media changes, cap-eight policy and
+maintenance integration. A guest harness release does not install host files.
+Keep the previous host files for rollback. Stop/replace/restart the host bridge
+as one unit so it never imports a missing module; retain all spool receipts.
 
 Text messages are spooled and delivered per conversation as one intake once the
 conversation has been quiet for the batch window, or the oldest message has
 waited the maximum (policy `batch`: `quiet_seconds` 120 / `max_wait_seconds` 300
 for the group, `dm_quiet_seconds` 60 / `dm_max_wait_seconds` 180 for DMs; up to
 12 messages per intake). Emoji reactions bypass the wait. The batch's *carrier*
-is the last directed message (else the last message): the wrapper carries its
+is the last directed eligible message (else the last eligible message, or the last item when all are context only): the wrapper carries its
 verified identity, every message is listed in order with speaker and time, the
 other rows are folded (`phase batched`, receipt names the carrier) and settle
 with it; a deleted undelivered carrier frees them for the next batch. Zero
