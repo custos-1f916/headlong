@@ -6,6 +6,8 @@ StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
+# Runs in an unprivileged LXC (131 custos-brain): mount-namespace hardening (ProtectSystem, PrivateTmp,
+# ReadOnlyPaths…) fails there with 226/NAMESPACE, so only the seccomp/prctl-level limits are kept.
 Type=simple
 User=custos-brain
 Group=custos-brain
@@ -20,17 +22,9 @@ TimeoutStopSec=5
 KillMode=control-group
 UMask=0077
 NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
-MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 # Egress: LXC 122 (client), johan, and the cloud tier (chatgpt.com / auth.openai.com / ntfy.sh);
 # the container's own nftables narrows the inbound side to 192.168.86.52:18080.
@@ -39,7 +33,6 @@ AmbientCapabilities=
 LimitNOFILE=256
 TasksMax=32
 MemoryMax=256M
-ReadOnlyPaths=/etc/custos-brain /opt/custos-brain
 
 [Install]
 WantedBy=multi-user.target

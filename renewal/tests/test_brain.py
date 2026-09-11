@@ -117,7 +117,7 @@ class PolicyAndStateTests(unittest.TestCase):
         self.assertEqual(body["instructions"], "be terse"); self.assertEqual(body["model"], "gpt-6-astra")
         self.assertEqual([m["role"] for m in body["input"]], ["user", "assistant", "user"])
         self.assertEqual(body["input"][1]["content"][0]["type"], "output_text"); self.assertEqual(body["input"][0]["content"][0]["text"], "hi")
-        self.assertEqual(body["reasoning"], {"effort": "xhigh", "summary": "auto"}); self.assertEqual(body["max_output_tokens"], 1234)
+        self.assertEqual(body["reasoning"], {"effort": "xhigh", "summary": "auto"}); self.assertNotIn("max_output_tokens", body)
         self.assertFalse(body["store"]); self.assertTrue(body["stream"])
 
     def test_magic_packet(self):

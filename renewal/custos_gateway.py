@@ -468,7 +468,10 @@ class Gateway:
             if not sent[0]:
                 with contextlib.suppress(ConnectionError, OSError, asyncio.TimeoutError):
                     await self.error(writer, denial)
-        except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+        except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError) as failure:
+            # Name the failure in the journal (type and a short message, never request content):
+            # a silent 503 here cost an hour of guessing on 2026-09-11.
+            print("custos-gateway: request failed: %s: %s" % (type(failure).__name__, str(failure)[:200]), flush=True)
             for job in jobs:
                 job.cancel()
             await asyncio.gather(*jobs, return_exceptions=True)

@@ -247,7 +247,10 @@ class Brain:
             quota["observed_at"] = utc_now_iso(self.clock())
             self.state["quota"] = quota
             self._save_state(self.state)
-        exhausted = [k for k, v in quota.items() if k.endswith("used_percent") and isinstance(v, (int, float)) and v >= 100]
+        # Only the account's own windows count (the backend also reports side limits such as
+        # x-codex-<feature>-primary-used-percent, which are not Custos's allowance).
+        exhausted = [k for k in ("primary_used_percent", "secondary_used_percent", "primary_window_used_percent", "secondary_window_used_percent")
+                     if isinstance(quota.get(k), (int, float)) and quota[k] >= 100]
         if exhausted and self.state["mode"] == "cloud":
             self.flip_local("quota exhausted (" + ", ".join(exhausted) + ")")
         return seen
@@ -344,8 +347,8 @@ class Brain:
                 "reasoning": {"effort": cloud_effort, "summary": "auto"},
                 "store": False, "stream": True, "include": ["reasoning.encrypted_content"],
                 "prompt_cache_key": "custos-brain"}
-        if isinstance(chat.get("max_tokens"), int):
-            body["max_output_tokens"] = chat["max_tokens"]
+        # No output cap: the Codex backend rejects max_output_tokens ("Unsupported parameter",
+        # 2026-09-11); the client's max_tokens is honoured by johan only.
         return body
 
     async def complete(self, chat, emit, request_id=None):
@@ -388,8 +391,9 @@ class Brain:
                     self._effort_fallback[cloud_model] = "high"
                     self.log("effort %s rejected for %s; falling back to high" % (cloud_effort, cloud_model))
                 flipped = self.note_error(status, error_body)
-                self.log("call %s/%s effort=%s -> HTTP %d%s %s" % (tier, cloud_model, cloud_effort, status,
-                                                                   " (quota flip)" if flipped else "", json.dumps(seen)))
+                self.log("call %s/%s effort=%s -> HTTP %d%s %s %s" % (tier, cloud_model, cloud_effort, status,
+                                                                      " (quota flip)" if flipped else "", json.dumps(seen),
+                                                                      json.dumps(error_body)[:300]))
                 return status, error_body
             if stream:
                 emit(chunk({"role": "assistant", "content": ""}))
