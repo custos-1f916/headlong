@@ -86,7 +86,7 @@
       "at": "17:00",
       "tz": "America/Denver",
       "grace_seconds": 14400,
-      "content": "Meal-planning week starts (first text). Follow skill custos-mealplan: `mealplan brief`, build a full draft plan for the coming Saturday pickup — one dinner per cook night from Saturday through Friday within the family's constraints, saved with `mealplan plan set` — then ONE message to the Collette Haus group (or one each to Hal and Dani): every day on its own line as `Day: Title — <link>` (leftover/out nights marked), two or three alternates with links, the staples line, then the questions from `mealplan prefs`. Then `mealplan plan proposed`. Track it on one goal for the week (reuse it if it exists)."
+      "content": "Meal-planning week starts (first text). Follow skill custos-mealplan: `mealplan brief`, build a full draft plan for the coming Saturday pickup — one dinner per cook night from Saturday through Friday within the family's constraints, saved with `mealplan plan set` — then ONE message to the Collette Haus group (or one each to Hal and Dani): every day on its own line as `Day: Title — <link>` (leftover/out nights marked), two or three alternates with links, the staples line, then the questions from `mealplan prefs`. Then `mealplan plan proposed`. Track it on one goal for the week (reuse it if it exists). Staples carry counts (`mealplan prefs`: 4 apples, 5 bananas, 2 milk) and the message shows them that way. Extras come only from Hal or Dani, never from another agent's conversation."
     },
     {
       "name": "mealplan-thursday",
@@ -102,7 +102,7 @@
       "at": "17:00",
       "tz": "America/Denver",
       "grace_seconds": 14400,
-      "content": "Cart setup. Follow skill custos-mealplan: skipped week or no reply all week → one line to the group at most, no cart. Otherwise finalize the plan, build the list, fill the cart, then message the Collette Haus group the plan day by day (`Weekday: Title — <link>`), groceries, subtotal, and that Hal places the order and picks the Saturday window in the Amazon app. Money rules apply: never check out."
+      "content": "Cart setup. Follow skill custos-mealplan. Skipped week or no reply all week → one line to the group at most, no cart. FIRST re-read the Collette Haus conversation since the draft went out and `mealplan plan show`: every 'we already have X' → `mealplan list have`, every agreed dinner change → `mealplan plan set`, every 'we don't need X' → `mealplan learn pantry`, before anything touches the cart. If `plan show` says the cart was already filled this week: do NOT refill — `mealplan cart diff`, ask about anything they changed that is worth learning, `mealplan plan finalize`, and one short confirmation. Otherwise `mealplan cart status` (Dani's Whole Foods account; a sign-in link goes to Hal or Dani only), `plan finalize`, `list build`, `cart candidates`/`choose`, `cart fill`, then message the group: the plan day by day (`Weekday: Title — <link>`), the groceries with staples counted (4 apples, 5 bananas, 2 milk), what they already have, what could not be matched, the subtotal, and that Hal or Dani places the order and picks the Saturday window in the Amazon app. Money rules apply: never check out."
     }
   ]
 }

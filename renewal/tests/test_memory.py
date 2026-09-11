@@ -1144,5 +1144,28 @@ class ResponderTests(MemoryFixture):
 
 
 
+class PromiseTripwireTest(unittest.TestCase):
+    """The 2026-09-10 meal-plan misses: claims of a changed list/plan/order are promises."""
+
+    def test_mealplan_phrases_are_promises(self):
+        for reply in (
+            "Noted on both — coconut milk and gnocchi come off the list, and Thursday's no longer out.",
+            "I'll factor the \"already have\" items out of the Saturday pickup order.",
+            "I'll put together the pickup order for Saturday and drop it here when it's ready.",
+            "Thursday locked in with the bake, or do you want a different direction for it?",
+            "Great — I added it to the list.",
+        ):
+            self.assertTrue(cm.promises_work(reply), reply)
+
+    def test_plain_conversation_is_not_a_promise(self):
+        for reply in (
+            "He/him. \"It\" makes me sound like the LXC rather than the one living in it.",
+            "Yes — the TAMG world. It's a shared world, not just me.",
+            "Both yeses in — the channel's green on all three sides.",
+            "Sounds good, enjoy the walk.",
+        ):
+            self.assertFalse(cm.promises_work(reply), reply)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1035,14 +1035,24 @@ def protocol_text(raw):
 
 
 def promises_work(reply):
-    """Conservative tripwire, not a semantic proof of every possible promise."""
+    """Conservative tripwire, not a semantic proof of every possible promise.
+
+    2026-09-10 (meal plan): "coconut milk and gnocchi come off the list", "I'll factor the
+    'already have' items out", "I'll put together the pickup order" and "Thursday locked in"
+    all passed as plain replies; the mind never saw them and bought the gnocchi. The responder
+    has no tools, so any claim that a list, plan, order or record changed is a promise."""
     return bool(re.search(
         r"\b(?:I(?:['’]ll| will| am going to)|we(?:['’]ll| will))\s+"
         r"(?:(?:also|just|go|and|then|definitely|now)\s+)*"
         r"(?:look|check|investigate|read|build|implement|fix|test|verify|research|"
         r"send|report|follow\s+up|come\s+back|get\s+back|return\s+with|file|queue|"
-        r"take\s+(?:a\s+look|the\s+work))\b|"
-        r"\bI(?:['’]ve| have)\s+(?:filed|queued|scheduled)\b", reply, re.I))
+        r"take\s+(?:a\s+look|the\s+work)|"
+        r"factor|put\s+together|add|remove|drop|update|adjust|swap|set|lock|order|handle|sort|note|record|change|pull|fold|work|make\s+sure|take\s+care)\b|"
+        r"\bI(?:['’]ve| have)\s+(?:filed|queued|scheduled)\b|"
+        r"\b(?:come|comes)\s+off\s+(?:the|your|my)\s+(?:list|order|cart|plan)\b|"
+        r"\block(?:ed|s)?\s+in\b|"
+        r"\b(?:added|removed|dropped|swapped|updated|put)\s+(?:it|that|them|this)?\s*(?:to|from|on|in|into)\s+(?:the|your|my)\s+(?:list|order|cart|plan|staples|pantry)\b",
+        reply, re.I))
 
 
 

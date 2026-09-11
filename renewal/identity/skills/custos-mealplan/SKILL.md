@@ -8,7 +8,40 @@ description: Plan the family's weekly dinners from Dani's digitized cookbooks, u
 Hal set this up on 2026-09-09 as a standing job. The kitchen service on LXC 128
 (`192.168.86.63`) holds the recipe catalog, the sales snapshot, the plans and the
 grocery cart driver; `mealplan` is its CLI (`mealplan --help` for every shape). You
-never hold Amazon credentials; the cart driver does, on the kitchen box.
+never hold Amazon credentials; the cart driver does, on the kitchen box. **The Whole Foods
+account is Dani's** (since 2026-09-10 evening: her substitutions are set up the way she likes
+and her order history is the household's real record); either Hal or Dani signs in and either
+places the order.
+
+## The first week, and the one rule it taught (2026-09-10)
+
+The first round went well: a full day-by-day draft with links, pregnancy-safe, Dani's "no
+chicken" and "cabbage isn't a staple" handled in one reply, the cart built and reported the
+same evening. Hal: "Overall, Custos did well!" Then the miss: at 00:02Z Dani wrote "I already
+have coconut milk and gnocchi" and asked for a Thursday work-from-home dinner. The reply said
+"coconut milk and gnocchi come off the list" and "Thursday locked in with the bake" — and
+fifteen minutes later the cart was filled with two packs of gnocchi and a can of coconut milk,
+and Thursday had nothing in the plan or the cart. The reply was written by the responder, which
+has no tools, as a plain answer; the mind's run had started two minutes earlier and never
+re-read the conversation before it touched the cart.
+
+**The rule: a change to the list or the plan exists only once a `mealplan` command has
+recorded it.** Saying it in Signal is not doing it.
+
+- In a reply with no tools (the responder): never say "off the list", "locked in", "I'll factor
+  it out". Say what you *will* do and **defer** it as a goal ("I'll take gnocchi and coconut milk
+  off the order and pencil Thursday in — back shortly"). The harness now trips on those phrases.
+- In a wake with tools (the mind): before **anything** touches the cart, re-read the group
+  conversation since the draft went out (`chat history`), and `mealplan plan show`. Every
+  "we already have X" → `mealplan list have "X" --note "Dani, Thu"`. Every agreed dinner change
+  → `mealplan plan set --dinner DATE=SLUG …` (all dinners, dates from the pickup Saturday).
+  Every "we don't need X" / "we always have X" → `mealplan learn pantry "X"`. Only then
+  `cart candidates` / `choose` / `fill`. `mealplan cart fill` and `mealplan plan proposed` refuse
+  on their own when Collette Haus messages arrived after the plan was last touched: they print
+  the unread lines, you record what they ask, then retry with `--read`. A cart built from a stale
+  read is worse than no cart.
+- Only Hal or Dani add things to the list. A friend's or another agent's conversation (Kim's
+  kimjang cabbage on 2026-09-10) is never an extra on their order.
 
 ## The week (Hal, 2026-09-10: "We can always decline, that's a valid way to stop the week's meal plan")
 
@@ -21,17 +54,17 @@ has replied, and how many dinners are drafted). Three scheduled wakes, all 17:00
   Hal, 2026-09-10: a proposal of recipes for each day "is a helpful starting place". Read `mealplan
   brief` — it carries the family's **constraints** (dinners per week, weeknight minutes, servings,
   leftovers, no-repeat window, sale picks, budget cap), their **rules** (e.g. pregnancy-safe food),
-  the **questions** they want asked, the **staples**, candidates from the cookbooks scored by sale
-  matches/ratings/recency, each with its recipe **link**, and the sales as a hint. Build the draft
-  first: one dinner for each cook night from the pickup Saturday through Friday, honouring the
-  constraints and what you know about Hal and Dani (person notes), and write it down with
+  the **questions** they want asked, the **staples with counts**, candidates from the cookbooks scored
+  by sale matches/ratings/recency/past orders, each with its recipe **link**, and the sales as a hint.
+  Build the draft first: one dinner for each cook night from the pickup Saturday through Friday,
+  honouring the constraints and what you know about Hal and Dani (person notes), and write it down with
   `mealplan plan set --dinner DATE=SLUG …` (as many `--dinner` as cook nights). Then send ONE message
   to the `Collette Haus` group (Hal, Dani and you; label from `signal-contacts`), else one each to
   Hal and Dani, in this order and nothing else:
   1. the plan, **every day Saturday → Friday on its own line**: `Sat 9/13: Title — <link>`; a
      leftover night or a night they said they're out reads `Tue 9/16: leftovers` / `out`;
   2. two or three alternates as `Title — <link>` in case a day misses;
-  3. the staples line (`Staples: milk; extras: —`);
+  3. the staples line with counts (`Staples: 4 apples, 5 bananas, 2 milk; extras: —`);
   4. the questions from `mealplan prefs`.
   Then `mealplan plan proposed`. They edit from there; a draft they can react to beats a menu they
   have to assemble.
@@ -42,7 +75,8 @@ has replied, and how many dinners are drafted). Three scheduled wakes, all 17:00
   first reply from either of them about the plan → `mealplan plan engaged`. **Declining is a valid
   answer**: "not this week", "skip it", "we're away" → `mealplan plan skip --note "…"`, one-line
   acknowledgement, and nothing more that week — no reminder, no cart. `mealplan plan resume` if
-  they change their mind.
+  they change their mind. A day they ask for ("something laid back for Thursday, I'm home") gets a
+  recipe *and* a `plan set` in the same wake, or a deferred goal — never just a sentence.
 - **Thursday 17:00** (`schedule: mealplan-thursday`): `mealplan plan show`. If the week is
   skipped: nothing. If no first message went out yet (no `proposed`): build and send the full draft plan
   exactly as on Wednesday. If it went out but nobody replied (no `engaged`): one short reminder in the group
@@ -50,23 +84,32 @@ has replied, and how many dinners are drafted). Three scheduled wakes, all 17:00
   open (then ask that one question).
 - **Friday 17:00 — cart setup** (`schedule: mealplan-friday`). Skipped week: nothing. No reply all
   week: treat it as declined — one line in the group ("no plan this week; say the word if you want
-  one") and stop. Otherwise `mealplan plan finalize` (writes the meal plan into the catalog),
-  `mealplan list build` (ingredients → grocery items, pantry staples skipped, quantities rounded to
-  packages), then `mealplan cart fill`. Read the result: items placed, items it could not match,
-  subtotal. Then message the group: the plan **day by day, each day as `Weekday: Title — <link>`**,
-  the list, the subtotal, what could not be matched, and how the order gets placed (see Money:
-  Hal places it from the Amazon app and picks the Saturday window). Keep the goal open until the
-  order is placed.
-- **Staples and extras** (Hal, 2026-09-10: "We always need milk, etc. Sometimes need butter"). Two
-  lists, opposite meanings: **pantry** = assumed on hand, skipped when a recipe calls for it;
-  **staples** = bought every week no matter what is cooked (`mealplan prefs` shows both). "Add oat
-  milk to the staples" / "we don't need eggs every week" → `mealplan learn staples "oat milk"` /
-  `--remove`. A one-off — "grab butter this week", "we're out of coffee" — → `mealplan list add
-  "butter" --note "Dani asked Thu"`; it stays on that week's list through rebuilds and goes into the
-  cart with everything else. Staples and extras land on the list as `<staple>` / `<extra>` lines
-  when you `mealplan list build`. Show a short **"Staples: milk, eggs; extras: butter"** line in the
-  Wednesday message (so they can correct it in one reply) and in Friday's cart message. Never drop
-  a staple because a recipe happens to use it — the list merges them.
+  one") and stop. Otherwise, first the re-read above. Then:
+  - **If `plan show` says the cart was already filled this week** (it happens when the plan locks
+    early, as on 2026-09-10): do **not** refill — `mealplan cart fill` refuses anyway. Run
+    `mealplan cart diff`: it lists what they removed, added and re-counted after your fill. That is
+    the learning loop: a removed spice → `learn pantry`; a removed ingredient → ask "pantry, or
+    skip?"; an added item → a staple (`learn staples "4 apples"`) or a one-off; a count change → the
+    real count. Ask about anything you cannot classify, in one message, then `mealplan plan
+    finalize` and one short confirmation.
+  - Otherwise `mealplan plan finalize` (writes the meal plan into the catalog), `mealplan list
+    build` (ingredients → grocery items, pantry and dried spices skipped, staples with counts and
+    pinned products already chosen, "already have" lines kept but never bought), then the cart
+    steps below. Message the group: the plan **day by day, each day as `Weekday: Title — <link>`**,
+    the list with counts, what they already have, what could not be matched, the subtotal, and how
+    the order gets placed (Hal or Dani, from the Amazon app on Dani's account, picking the Saturday
+    window). Keep the goal open until the order is placed.
+- **Staples and extras** (Hal, 2026-09-10: "We always need milk, etc."; that evening: "4 apples and
+  5 bananas as staples each week… 2 containers of milk"). Two lists, opposite meanings: **pantry** =
+  assumed on hand, skipped when a recipe calls for it (dried spices, seeds and cooking oils are
+  pantry by rule — fresh herbs are not); **staples** = bought every week no matter what is cooked,
+  **with a count**: `mealplan learn staples "4 apples"`. "Make it 6 bananas" → remove the old line,
+  add the new. `mealplan product "apples" ASIN` pins the exact product they want (Organic Honeycrisp,
+  Organic Valley whole milk 64 oz…); pinned products are chosen for you every week. A one-off —
+  "grab butter this week", "2 lemons" — → `mealplan list add "2 lemons" --note "Dani asked Thu"`;
+  it stays on that week's list through rebuilds. "I already have X" → `mealplan list have "X"`.
+  Show the staples with counts in the Wednesday message (so they can correct it in one reply) and in
+  Friday's cart message. Never drop a staple because a recipe happens to use it — the list merges them.
 - **The knobs are theirs.** Dani and Hal want to iterate on what you ask and how you optimize
   (2026-09-09). When either of them says "ask us X on Wednesdays" or "never plan more than N
   new recipes a week" — in the group or in a DM, Dani's word counts exactly like Hal's here —
@@ -79,6 +122,18 @@ has replied, and how many dinners are drafted). Three scheduled wakes, all 17:00
   on the LAN without a login. A plan without links is not a plan they can read.
 - Record what you learn (a dish they loved, a brand they prefer, "never again") in
   person notes and with `mealplan learn`, not in new goals. One goal per planning week; reuse it.
+
+## Dani's order history (`mealplan history`)
+
+Her account carries months of real Whole Foods orders. `mealplan history` lists them (date, total,
+items); `mealplan history --products` lists what recurs across orders, most frequent first — that
+is the household's true staple list and their preferred products, and `cart candidates` already
+ranks products they have ordered before (`times_ordered`). Use it in three ways: once, after the
+first sync, read it and propose staples/pinned products to them in one message ("you've ordered X
+in 9 of the last 12 orders — make it a staple?"), and set what they confirm; every week, when a
+line has candidates, prefer the one they have ordered; and to sanity-check the budget against
+what a normal week actually costs them. `mealplan history --sync` pulls it fresh (needs the
+signed-in session); do that when the week's order has been picked up.
 
 ## The cookbooks (Hal, 2026-09-10: "hoist it into tasks that Custos gets to over time")
 
@@ -104,40 +159,42 @@ https://recipes.ha1.io. You review and remember. Two triggers:
 Never copy recipes into memory — the catalog holds them. Memory is for judgment: what fits, what
 they said, what worked. **Thin start:** if the catalog holds fewer than about 20 recipes, send
 one line to Hal only ("catalog is thin, N recipes; I'll start planning once the books are in") and
-stop. (Since 2026-09-10 the catalog holds the Molly Baz Website cookbook, so this no longer applies
-unless something is wrong.)
+stop. (Since 2026-09-10 the catalog holds the Molly Baz Website cookbook and Dani's NYT Cooking
+box, so this no longer applies unless something is wrong.)
 
-## The Whole Foods cart (Tier 1: you fill it, Hal places the order)
+## The Whole Foods cart (Tier 1: you fill it, Hal or Dani places the order)
 
 `mealplan cart …` drives the Whole Foods site's own cart through the kitchen service with an
 honest `Agent/kitchen` identity. Product search works without a login; putting things in the
-cart needs Hal's signed-in session, which lives on the kitchen box, never with you.
+cart needs the signed-in session (Dani's account), which lives on the kitchen box, never with you.
 
-1. `mealplan cart status`. If NOT signed in: `mealplan cart refresh` (a silent renewal from the
-   saved browser profile). If still not: `mealplan cart login` prints a one-time link; send it
-   to **Hal only** (operator — never to Dani, never to the group, never in the square): "Whole
-   Foods session expired — sign in here from your phone on the home Wi-Fi: <link> (15 min)".
-   Then wait for `status` to say signed in; do the rest of the wake without the cart if it
-   doesn't come.
+1. `mealplan cart status` (it names whose session it is). If NOT signed in: `mealplan cart
+   refresh` (a silent renewal from the saved browser profile). If still not: `mealplan cart login`
+   prints a one-time link; send it to **Hal or Dani only** (operators — never to the group, never
+   to a friend, never in the square): "Whole Foods session expired — sign in here from your phone
+   on the home Wi-Fi: <link> (15 min)". Then wait for `status` to say signed in; do the rest of
+   the wake without the cart if it doesn't come. `mealplan cart logout` wipes the session and the
+   browser profile — only for switching accounts, and only when Hal or Dani asks.
 2. `mealplan list build` → `mealplan cart candidates`: each grocery line gets up to three
-   products (brand, size, bought-before flag). Pick with `mealplan cart choose "line" ASIN
-   [--qty N]`: prefer BOUGHT-BEFORE, then the brands in `mealplan prefs`, then 365; match the
-   size to the recipe's need (2 recipes × 1 cup stock = one 32 oz carton). No candidate fits →
-   leave the line unchosen and say so in the message.
+   products (brand, size, bought-before flag, `times_ordered` from the history); pinned products
+   and "have" lines are already settled. Pick with `mealplan cart choose "line" ASIN [--qty N]`:
+   prefer what they have ordered before, then the pinned/preferred brands in `mealplan prefs`,
+   then 365; match the size to the recipe's need (2 recipes × 1 cup stock = one 32 oz carton);
+   a staple's count is the default quantity. No candidate fits → leave the line unchosen and say so.
 3. `mealplan cart fill` adds the chosen lines; read back added / failed / skipped and
    `mealplan cart show`. A "challenge" failure means Amazon asked whether we are a robot: stop,
-   report it to Hal, do not retry.
-4. Friday message: the plan, the list, what is in the cart, what could not be matched, and
-   "the cart is ready in the Amazon app — pick the Saturday window and place it".
+   report it to Hal, do not retry. A "cart was already filled" refusal means go to `cart diff`.
+4. Friday message: the plan, the list, what is in the cart, what they already have, what could
+   not be matched, and "the cart is ready in the Amazon app — pick the Saturday window and place it".
 
 ## Money — hard line
 
 Placing an order spends real money. `mealplan cart fill` never checks out. Checkout
 runs only through `mealplan order place`, which the kitchen service refuses unless the
 subtotal is under Hal's cap AND Hal's fresh `GO` exists on the host record (Tier 2), or
-is disabled entirely (Tier 1: Hal places the order from the Amazon app; your message
-says "the cart is ready in the app"). Never work around a refusal, never ask Dani or a
-friend to approve instead of Hal, never split an order to fit under the cap. A refused
+is disabled entirely (Tier 1: Hal or Dani places the order from the Amazon app; your message
+says "the cart is ready in the app"). Never work around a refusal, never ask a friend to
+approve instead of Hal or Dani, never split an order to fit under the cap. A refused
 checkout is a message to Hal, not a retry loop.
 
 ## Judgment

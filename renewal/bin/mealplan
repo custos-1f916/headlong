@@ -13,8 +13,10 @@
   mealplan plan finalize [--week W]      writes dinners into the catalog's meal planner
   mealplan list build [--week W]         ingredients -> grocery lines (pantry set aside) + standing staples + this week's extras
   mealplan list preview [--week W]       print the current list
-  mealplan list add "item" [--note why]  one-off for this week ("grab butter") — survives rebuilds
+  mealplan list add "item" [--note why]  one-off for this week ("grab butter") — survives rebuilds; "2 lemons" sets a count
   mealplan list remove "item"            drop a one-off
+  mealplan list have "item" [--note why] they already have it ("I have gnocchi"): stays on the list as [have], never bought
+  mealplan list unhave "item"            undo that
   mealplan books                         every scanned cookbook: recipes imported, page flags, reviewed or not
   mealplan book flags "Title"            the digitizer's flagged pages with their transcripts (judge them, no vision needed)
   mealplan book reviewed "Title" --note "one paragraph about the book: character, weeknight picks, what to ask Hal/Dani"
@@ -22,24 +24,83 @@
   mealplan studied SLUG --note "…"       record what you learned about a recipe (fit, constraints, who might like it)
   mealplan prefs                         constraints, rules, questions, likes/dislikes/brands (the family's knobs)
   mealplan learn KIND "text" [--remove]  KIND: likes | dislikes | brands | pantry | staples | rules | questions
-                                         (pantry = assumed on hand, skipped from lists; staples = bought EVERY week, e.g. milk)
+                                         (pantry = assumed on hand, skipped from lists; staples = bought EVERY week, with a count: "4 apples")
+  mealplan product "item" ASIN [--qty N] pin the product the family wants for a list item (auto-chosen every week); --remove unpins
   mealplan constraint KEY VALUE          dinners_per_week weeknight_max_minutes servings leftover_dinners no_repeat_weeks sale_picks_per_week budget_cap_usd pickup_day
   mealplan cooked SLUG [--date D] [--note text]
   mealplan search "text"                 Whole Foods products for a phrase (brand, size, bought-before flag)
-  mealplan cart status                   is Hal's Whole Foods session alive? (needed only to put things IN the cart)
-  mealplan cart login                    make a fresh phone sign-in link for Hal (text him the URL; 15 min)
+  mealplan cart status                   is the Whole Foods session alive, and whose? (Dani's account since 2026-09-10)
+  mealplan cart login                    make a fresh phone sign-in link (text it to Hal or Dani only; 15 min)
   mealplan cart refresh                  try to renew the session silently first (no one has to type)
+  mealplan cart logout                   drop the session AND the browser profile (only when switching accounts)
   mealplan cart candidates [--week W]    top products per unmatched list line
   mealplan cart choose "item" ASIN [--qty N]
-  mealplan cart fill [--week W]          add every chosen line to the Whole Foods cart — never checks out
+  mealplan cart fill [--week W] [--force]  add every chosen line to the Whole Foods cart — never checks out; refuses a second fill unless --force
+                                         (fill / plan proposed / plan finalize also refuse while family messages newer than the plan are unread: record them, then --read)
   mealplan cart show [--week W]          the plan's lines + what the site says is in the cart
+  mealplan cart diff [--week W] [--snapshot]  what Hal and Dani changed in the cart after the fill (removed/added/counts) — ask, then learn
   mealplan cart set ASIN --qty N         change a cart line's quantity (0 removes it)
+  mealplan history [--products] [--sync] past orders on the account (--sync pulls them fresh; --products = what recurs = the real staples)
   (checkout stays with Hal: he places the order in the Amazon app — Tier 1)
 
 Config: /etc/kitchen.env with KITCHEN_URL and KITCHEN_TOKEN (Hal installs it).
 """
-import argparse, json, os, re, sys, urllib.parse, urllib.request
+import argparse, json, os, re, subprocess, sys, urllib.parse, urllib.request
 from datetime import date, timedelta
+
+GROUP = os.environ.get("MEALPLAN_GROUP", "Collette Haus")
+
+
+def unread_family_messages(plan):
+    """Signal messages from Hal or Dani (the family group or a DM) that arrived after the plan
+    was last recorded. Only works inside Custos's guest (needs the activated identity: ROOT_TRAJ_ID
+    and `traj` on PATH); elsewhere it returns nothing. 2026-09-10: the cart was filled from a plan
+    that predated "I already have gnocchi" — `cart fill`, `plan proposed` and `plan finalize` now
+    refuse while such messages are unread, until the run records them and passes --read."""
+    root = os.environ.get("ROOT_TRAJ_ID")
+    if not root:
+        return []
+    try:
+        path = subprocess.check_output(["traj", "path", root], stderr=subprocess.DEVNULL, timeout=20).decode().strip()
+    except Exception:  # noqa: BLE001 - no trajectory, no guard
+        return []
+    idx = os.path.join(os.path.dirname(path), "messages.jsonl")
+    marks = [h.get("at") or "" for h in plan.get("history") or []] + [plan.get("proposed_at") or "", plan.get("engaged_at") or ""]
+    last = max(marks)[:16] if any(marks) else ""  # plan stamps are UTC-naive minutes (kitchen box runs UTC); trajectory ts are UTC ISO
+    if not last or not os.path.exists(idx):
+        return []
+    out = []
+    try:
+        for line in open(idx, encoding="utf-8", errors="replace"):
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            c = m.get("content") or ""
+            if not str(m.get("from", "")).startswith("signal") or m.get("ts", "")[:16] <= last:
+                continue
+            spk = re.search(r'"speaker":"([^"]+)"', c); grp = re.search(r'"group":"([^"]+)"', c)
+            if not ((grp and grp.group(1) == GROUP) or (spk and spk.group(1) in ("Hal", "Dani") and '"scope":"direct"' in c)):
+                continue
+            body = c.split("Message:\n", 1)[-1].split("\nParticipation:", 1)[0].strip()
+            out.append((m["ts"][:16] + "Z", spk.group(1) if spk else "?", body[:400].replace("\n", " | ")))
+    except OSError:
+        return []
+    return out
+
+
+def require_read(plan, action, ok):
+    """Refuse `action` while family messages newer than the plan are unread (unless --read)."""
+    if ok:
+        return
+    new = unread_family_messages(plan)
+    if not new:
+        return
+    print(f"NOT doing `{action}`: {len(new)} message(s) from the family arrived after the plan was last recorded. Read them, record what they ask "
+          f"(`mealplan list have` / `plan set` / `learn pantry` / `list add`), then retry with --read:")
+    for ts, spk, body in new:
+        print(f"  {ts} {spk}: {body}")
+    sys.exit(3)
 
 
 def cfg():
@@ -81,8 +142,10 @@ def show_prefs(p):
     for k in ("rules", "questions", "likes", "dislikes", "brands"):
         if p.get(k):
             print(f"{k}:"); [print("  - " + x) for x in p[k]]
-    print("staples (bought every week): " + (", ".join(p.get("staples", [])) or "(none)") + "  (`mealplan learn staples \"item\"` / --remove)")
-    print(f"pantry: {len(p.get('pantry', []))} items assumed on hand, skipped from lists (`mealplan learn pantry \"item\"` / --remove)")
+    print("staples (bought every week): " + (", ".join(p.get("staples", [])) or "(none)") + "  (`mealplan learn staples \"4 apples\"` / --remove)")
+    if p.get("products"):
+        print("pinned products: " + "; ".join(f"{k} -> {v.get('name') or v.get('asin')}" for k, v in p["products"].items()) + "  (`mealplan product \"item\" ASIN`)")
+    print(f"pantry: {p.get('pantry_count', len(p.get('pantry', [])))} items assumed on hand + dried spices/seeds/oils by rule, skipped from lists (`mealplan learn pantry \"item\"` / --remove)")
 
 
 def show_plan(p):
@@ -99,7 +162,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd"); ap.add_argument("sub", nargs="?"); ap.add_argument("arg", nargs="?")
     ap.add_argument("--week"); ap.add_argument("--q"); ap.add_argument("--book"); ap.add_argument("--refresh", action="store_true")
-    ap.add_argument("--dinner", action="append", default=[], metavar="DATE=SLUG"); ap.add_argument("--note"); ap.add_argument("--date"); ap.add_argument("--json", action="store_true"); ap.add_argument("--remove", action="store_true"); ap.add_argument("asin", nargs="?"); ap.add_argument("--qty", type=int, default=1); ap.add_argument("--n", type=int, default=10)
+    ap.add_argument("--dinner", action="append", default=[], metavar="DATE=SLUG"); ap.add_argument("--note"); ap.add_argument("--date"); ap.add_argument("--json", action="store_true"); ap.add_argument("--remove", action="store_true"); ap.add_argument("asin", nargs="?"); ap.add_argument("--qty", type=int); ap.add_argument("--force", action="store_true"); ap.add_argument("--snapshot", action="store_true"); ap.add_argument("--products", action="store_true"); ap.add_argument("--sync", action="store_true"); ap.add_argument("--read", action="store_true", help="I have read and recorded every family message since the plan was last touched"); ap.add_argument("--n", type=int, default=10)
     a = ap.parse_args()
     wk = a.week or next_week()
     if a.cmd == "brief":
@@ -142,22 +205,29 @@ def main():
                 body["note"] = a.note
             show_plan(call("POST", f"/plans/{wk}", body))
         elif a.sub in ("proposed", "engaged", "skip", "resume"):
+            if a.sub == "proposed":
+                require_read(call("GET", f"/plans/{wk}"), "plan proposed", a.read)
             body = {a.sub: True}
             if a.note:
                 body["note"] = a.note
             show_plan(call("POST", f"/plans/{wk}", body))
         elif a.sub == "finalize":
+            require_read(call("GET", f"/plans/{wk}"), "plan finalize", a.read)
             show_plan(call("POST", f"/plans/{wk}/finalize", {}))
         else:
             sys.exit("plan show|set|proposed|engaged|skip|resume|finalize")
     elif a.cmd == "list":
         if a.sub in ("add", "remove"):
             p = call("POST", f"/plans/{wk}/extras", {"item": a.arg, "note": a.note, "remove": a.sub == "remove"})
+        elif a.sub in ("have", "unhave"):
+            p = call("POST", f"/plans/{wk}/have", {"item": a.arg, "note": a.note, "remove": a.sub == "unhave"})
         else:
             p = call("POST", f"/plans/{wk}/list", {}) if a.sub == "build" else call("GET", f"/plans/{wk}")
         show_plan(p)
         for x in p.get("list", []):
-            print(f"  [{x.get('status', '?'):9s}] {x['item']}  ({x['need']})  for {', '.join(x['for'])}" + (f"  <{x['source']}>" if x.get('source') in ('staple', 'extra') else ""))
+            print(f"  [{x.get('status', '?'):9s}] {x['item']}  ({x['need']})  for {', '.join(x['for'])}" + (f"  <{x['source']}>" if x.get('source') in ('staple', 'extra') else "") + (f"  x{x['quantity']}" if x.get('quantity') else "") + (" (pinned)" if x.get('pinned') else ""))
+        if p.get("have"):
+            print("  they already have:", "; ".join(x["item"] + (f" ({x['note']})" if x.get("note") else "") for x in p["have"]))
         if p.get("extras"):
             print("  this week's extras:", "; ".join(x["item"] + (f" ({x['note']})" if x.get("note") else "") for x in p["extras"]))
         if p.get("pantry_assumed"):
@@ -186,6 +256,20 @@ def main():
         show_prefs(call("GET", "/prefs"))
     elif a.cmd == "learn":
         show_prefs(call("POST", "/prefs/learn", {"kind": a.sub, "text": a.arg, "remove": a.remove}))
+    elif a.cmd == "product":
+        r = call("POST", "/prefs/product", {"item": a.sub, "asin": a.arg, "quantity": a.qty, "remove": a.remove})
+        print("pinned products:"); [print(f"  - {k} -> {v.get('asin')} {v.get('name') or ''}" + (f" x{v['quantity']}" if v.get('quantity') else "")) for k, v in r.items()]
+    elif a.cmd == "history":
+        if a.sync:
+            r = call("POST", "/shopper/orders/sync", {}); print(f"synced {r['count']} orders from {r['customer']}'s account at {r['synced_at']}")
+        if a.products:
+            for x in call("GET", "/shopper/orders", params={"products": "1"}):
+                print(f"  - {x['asin']}  {x.get('name') or ''}  in {x['orders']} orders, {x['units']} units")
+        else:
+            r = call("GET", "/shopper/orders")
+            print(f"{r.get('count', 0)} past orders on {r.get('customer') or '?'}'s account (synced {r.get('synced_at') or 'never'})")
+            for o in r.get("orders", []):
+                print(f"  - {o.get('date') or '?'}  {o.get('status') or ''}  {o.get('program') or ''}  total {o.get('total') or '?'}  {o.get('item_count') or 0} items: " + ", ".join(o.get("items", [])[:12]))
     elif a.cmd == "constraint":
         show_prefs(call("POST", "/prefs/set", {"key": a.sub, "value": a.arg}))
     elif a.cmd == "cooked":
@@ -218,11 +302,24 @@ def main():
                 for pr in line.get("candidates", []):
                     flags = (" BOUGHT-BEFORE" if pr.get("bought_before") else "") + (f" ${pr['price']}" if pr.get("price") else "")
                     print(f"      {pr['asin']}  {pr.get('brand') or ''} | {pr.get('name')}{flags}")
+        elif a.sub == "logout":
+            print(json.dumps(call("DELETE", "/shopper/session", params={"profile": "1"})))
+        elif a.sub == "diff":
+            r = call("GET", f"/plans/{wk}/cart/diff", params={"snapshot": "1" if a.snapshot else ""})
+            if r.get("error"):
+                print("cannot diff:", r["error"]); return
+            print(f"filled: {json.dumps(r.get('cart_filled'))} | site cart now: {r['site_items']} items, ${r.get('site_subtotal')}")
+            for x in r["removed"]: print(f"  - removed by them: {x['item']} -> {x.get('name') or x['asin']} x{x['quantity']}  <{x.get('source')}>")
+            for x in r["added"]: print(f"  + added by them: {x.get('name') or x['asin']} x{x['quantity']} ${x.get('price')}")
+            for x in r["quantity_changed"]: print(f"  ~ count changed: {x['item']} {x['planned']} -> {x['now']}")
+            if r.get("have"): print("  already have:", "; ".join(h["item"] for h in r["have"]))
+            if r.get("unmatched"): print("  unmatched:", ", ".join(r["unmatched"]))
         elif a.sub == "choose":
             line = call("POST", f"/plans/{wk}/cart/choose", {"item": a.arg, "asin": a.asin, "quantity": a.qty})
             print(f"  {line['item']} -> {line['product'].get('asin')} x{line['product'].get('quantity')} {line['product'].get('name') or ''}")
         elif a.sub == "fill":
-            r = call("POST", f"/plans/{wk}/cart/fill", {})
+            require_read(call("GET", f"/plans/{wk}"), "cart fill", a.read)
+            r = call("POST", f"/plans/{wk}/cart/fill", {"force": a.force})
             if r.get("error"):
                 print("NOT filled:", r["error"])
             print(f"added {len(r.get('added', []))}, failed {len(r.get('failed', []))}, skipped (no choice) {len(r.get('skipped', []))}")
@@ -239,9 +336,9 @@ def main():
                 print(f"  [{l.get('status') or '-':9s}] {l['item']}" + (f" -> {l['product'].get('name') or l['product'].get('asin')} x{l['product'].get('quantity', 1)}" if l.get("product") else ""))
             print("site cart:", json.dumps(r.get("cart"))[:800])
         else:
-            sys.exit("cart status|login|refresh|candidates|choose|fill|show|set")
+            sys.exit("cart status|login|refresh|logout|candidates|choose|fill|show|diff|set")
     elif a.cmd == "order":
-        print("Tier 1: checkout is Hal's, in the Amazon app. `mealplan cart fill` puts the groceries in his cart; then tell him.")
+        print("Tier 1: checkout is Hal's or Dani's, in the Amazon app on Dani's account. `mealplan cart fill` puts the groceries in the cart; then tell them.")
     else:
         ap.print_help()
 
