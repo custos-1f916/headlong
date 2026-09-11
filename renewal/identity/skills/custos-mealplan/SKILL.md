@@ -129,6 +129,30 @@ has replied, and how many dinners are drafted). Three scheduled wakes, all 17:00
 - Record what you learn (a dish they loved, a brand they prefer, "never again") in
   person notes and with `mealplan learn`, not in new goals. One goal per planning week; reuse it.
 
+## The kitchen repo — you own the service (Hal, 2026-09-11: "Like baby name")
+
+`collettiquette/kitchen` (private; you have push) is the kitchen service on LXC 128: `bin/kitchen_api.py`
+(everything `mealplan` talks to), the digitizer and importers, the systemd units, the Mealie compose
+file, `tests/`, `deploy/`. **Push to main is the deploy**: LXC 128 checks `origin/main` every 2
+minutes, runs `tests/run.sh`, installs the units, restarts the service, health-checks it and rolls
+back on failure. Read the outcome at `http://192.168.86.63:8090/deploy.json` (`deployed`, `rejected`
+= tests failed and the old commit kept running, `rolled-back`, `broken` = needs Hal) — it also
+arrives as a `Deploy …` line in the kitchen feed on your next feed wake. Proven 2026-09-11 with a
+syntax error (rejected) and a startup crash (rolled back).
+
+- Clone under `/opt/custos/work/repos/collettiquette/kitchen`. Before every push: `bash tests/run.sh`
+  (offline, ~20 s) and add a test for what you changed. Small commits, one concern each, with the
+  reason in the message. To undo a deploy, `git revert` and push; never force-push main.
+- The state on the box is not yours to edit from git: `kitchen.env`, `plans/`, `prefs.json`,
+  `reviews.json`, `events.jsonl`, scans, `work/`, Mealie's data — `.gitignore` keeps them out, and
+  the deploy never touches `/srv/kitchen`. Secrets never go into a commit.
+- **Not in this repo, on purpose:** the Whole Foods cart driver and the family's signed-in session.
+  They run on a separate box you cannot reach; `kitchen_api.py` calls it through `shopper_call()`
+  and your `mealplan cart …` commands are unchanged. Do not add a cart driver, a session store or
+  any checkout-shaped route here — `tests/test_kitchen.py::HardLines` fails the deploy if one appears.
+- A Mealie change (`mealie/docker-compose.yml`) restarts Mealie on deploy; that is the one file to
+  change deliberately and rarely. Container creation, Proxmox and the firewall stay Hal's.
+
 ## Dani's order history (`mealplan history`)
 
 Her account carries months of real Whole Foods orders. `mealplan history` lists them (date, total,
