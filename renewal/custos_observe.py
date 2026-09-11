@@ -688,7 +688,7 @@ class Observer:
         self.store.put(key, snapshot)
 
     def admission(self):
-        url = "http://192.168.86.44:18080/health"
+        url = os.environ.get("CUSTOS_INFERENCE_URL", "http://192.168.86.69:18080").rstrip("/") + "/health"
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
             with opener.open(url, timeout=5) as response:

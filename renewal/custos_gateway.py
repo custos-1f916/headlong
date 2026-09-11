@@ -21,6 +21,9 @@ from custos_images import inline_jpeg, MAX_IMAGES
 UPSTREAM = ("192.168.86.117", 8080)
 MODEL = "qwen3.8-27b"
 MODEL_PATHS = {"/v1/models", "/v1/models/" + MODEL}
+# Where this gateway may listen: on blink1 (historical) or in LXC 131 custos-brain (2026-09-11,
+# Hal: "Nothing should live on Blink1 directly"). The client is always LXC 122.
+BIND_HOSTS = ("192.168.86.44", "192.168.86.69")
 REASONS = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found",
            405: "Method Not Allowed", 408: "Request Timeout", 413: "Content Too Large",
            429: "Too Many Requests", 431: "Request Header Fields Too Large",
@@ -64,7 +67,7 @@ def strict_json(raw, depth_limit=64):
     return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
 
 
-def payload(raw, max_tokens):
+def payload(raw, max_tokens, models=None):
     try:
         value = strict_json(raw)
         allowed = {"model", "messages", "stream", "stream_options", "max_tokens",
@@ -73,7 +76,7 @@ def payload(raw, max_tokens):
                    "tool_choice", "parallel_tool_calls", "response_format", "reasoning_effort", "n"}
         if not isinstance(value, dict) or set(value) - allowed:
             raise ValueError("unsupported fields")
-        if value.get("model") != MODEL:
+        if value.get("model") not in (models or {MODEL}):
             raise Denied(400, "unsupported_model")
         if value.get("n", 1) != 1:
             raise ValueError("unsupported sample count")
@@ -188,10 +191,13 @@ async def close_writer(writer):
 
 
 class Gateway:
-    def __init__(self, policy, busy=None, clock=time.time, upstream=UPSTREAM):
+    def __init__(self, policy, busy=None, clock=time.time, upstream=UPSTREAM, brain=None):
         self.p = policy
         self.busy = busy or BusySignal(policy["busy_signal"], policy["busy_max_age_seconds"])
         self.clock, self.upstream = clock, upstream
+        # The brain policy (custos_brain.Brain) decides between johan and a cloud tier; without
+        # one this is the fixed-destination gateway it always was.
+        self.brain = brain
         self.inflight = False
         # asyncio.Lock is FIFO: a fresh monolith call cannot overtake a waiting
         # responder. Hold only during one completion, never across agent tools.
@@ -331,6 +337,33 @@ class Gateway:
             finally:
                 self.inflight = False
 
+    def cloud_mode(self):
+        return self.brain is not None and self.brain.mode(self.clock()) == "cloud"
+
+    async def cloud_completion(self, writer, chat, sent):
+        """One completion through the cloud tier (custos_brain). Output is written as a chunked
+        response in the same shapes johan would produce (SSE chunks or one JSON document)."""
+        stream = bool(chat.get("stream"))
+        content_type = "text/event-stream" if stream else "application/json"
+        pending = []
+
+        def emit(data):
+            if not sent[0]:
+                writer.write((f"HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\n"
+                              "Connection: close\r\nCache-Control: no-store\r\n\r\n").encode())
+                sent[0] = True
+            writer.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+            pending.append(len(data))
+        status, error = await self.brain.complete(chat, emit)
+        if status != 200:
+            code = "cloud_upstream_error"
+            if isinstance(error, dict):
+                inner = error.get("error") if isinstance(error.get("error"), dict) else error
+                code = str(inner.get("code") or inner.get("type") or code)[:60]
+            raise Denied(status if status in (400, 401, 403, 404, 408, 413, 429, 500, 502, 503) else 502, code, 30)
+        writer.write(b"0\r\n\r\n")
+        await asyncio.wait_for(writer.drain(), self.p["io_timeout_seconds"])
+
     def accept(self, reader, writer):
         # Synchronous admission bounds task creation as well as active handlers.
         peer = writer.get_extra_info("peername")
@@ -354,7 +387,7 @@ class Gateway:
             if len(parts) != 3 or parts[2] not in {"HTTP/1.0", "HTTP/1.1"}:
                 raise Denied(400, "invalid_request_line")
             method, path, _ = parts
-            if path not in MODEL_PATHS | {"/health", "/v1/chat/completions"}:
+            if path not in MODEL_PATHS | {"/health", "/brain", "/v1/chat/completions"}:
                 raise Denied(404, "path_not_allowed")
             if method != ("POST" if path == "/v1/chat/completions" else "GET"):
                 raise Denied(405, "method_not_allowed")
@@ -369,26 +402,57 @@ class Gateway:
             if method == "GET" and length:
                 raise Denied(400, "get_body_not_allowed")
             body = await asyncio.wait_for(reader.readexactly(length), self.p["body_timeout_seconds"])
+            cloud = self.cloud_mode()
             if method == "POST":
                 if headers.get("content-type", "").split(";", 1)[0].lower() != "application/json":
                     raise Denied(400, "json_content_type_required")
-                body = payload(body, self.p["max_tokens"])
+                models = self.brain.accepted_models() if self.brain else None
+                body = payload(body, self.p["max_tokens"], models)
                 if len(body) > self.p["max_body_bytes"]:
                     raise Denied(413, "normalized_request_body_too_large")
             now = self.clock()
             self.check_pause()
             duration = self.p["request_seconds"]
-            if path == "/health":
-                self.busy.check(now)
-                if self.inflight:
-                    raise Denied(429, "custos_request_in_flight", 30)
-                response = json.dumps({"status": "ok", "scope": "gateway_admission_snapshot",
-                                       "usage_quota": None}).encode()
+
+            async def reply_json(document):
+                response = json.dumps(document).encode()
                 writer.write((f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response)}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n").encode() + response)
                 sent[0] = True
                 await asyncio.wait_for(writer.drain(), self.p["io_timeout_seconds"])
+            if path == "/brain":
+                await reply_json(self.brain.status() if self.brain else {"mode": "local", "reason": "no brain policy"})
+                return
+            if path == "/health":
+                if cloud:
+                    await reply_json({"status": "ok", "scope": "brain_cloud_window",
+                                      "brain": self.brain.status(), "usage_quota": None})
+                    return
+                self.busy.check(now)
+                if self.inflight:
+                    raise Denied(429, "custos_request_in_flight", 30)
+                await reply_json({"status": "ok", "scope": "gateway_admission_snapshot", "usage_quota": None})
+                return
+            if cloud and path in MODEL_PATHS:
+                names = sorted(self.brain.accepted_models())
+                await reply_json({"object": "list", "data": [{"id": name, "object": "model", "owned_by": "custos-brain"} for name in names]})
                 return
             started = time.monotonic()
+            if cloud and method == "POST":
+                # The cloud tier needs no johan admission; the same wall-time bound and the
+                # disconnect/pause watcher still apply.
+                chat = json.loads(body)
+                jobs = [asyncio.create_task(self.cloud_completion(writer, chat, sent)),
+                        asyncio.create_task(self.watch(reader, started + duration))]
+                done, _ = await asyncio.wait(jobs, return_when=asyncio.FIRST_COMPLETED)
+                if jobs[1] in done:
+                    await jobs[1]
+                await jobs[0]
+                return
+            if self.brain is not None and method == "POST":
+                # Local mode: every name the brain accepts is served by johan as its one model.
+                chat = json.loads(body)
+                chat["model"] = MODEL
+                body = json.dumps(chat, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
             # Existing 600-second end-to-end bound includes admission waiting;
             # no change to client deadlines, output budget or backend concurrency.
             jobs = [asyncio.create_task(self.admitted_proxy(writer, method, path, body, sent)),
@@ -439,7 +503,7 @@ def load_policy(path):
     for key in ("max_tokens", "max_connections", "max_header_bytes", "max_body_bytes", "max_response_bytes"):
         if type(policy[key]) is not int:
             raise ValueError("integer policy limit required: " + key)
-    if policy["bind_host"] != "192.168.86.44" or policy["bind_port"] != 18080 or policy["allowed_clients"] != ["192.168.86.52"]:
+    if policy["bind_host"] not in BIND_HOSTS or policy["bind_port"] != 18080 or policy["allowed_clients"] != ["192.168.86.52"]:
         raise ValueError("production endpoint/client policy is fixed")
     for key in ("busy_signal", "pause_file"):
         if not isinstance(policy[key], str) or not os.path.isabs(policy[key]):
@@ -447,8 +511,8 @@ def load_policy(path):
     return policy
 
 
-async def serve(policy):
-    gateway = Gateway(policy)
+async def serve(policy, brain=None):
+    gateway = Gateway(policy, brain=brain)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -465,6 +529,13 @@ async def serve(policy):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy", required=True)
+    parser.add_argument("--brain", default=None, help="brain policy JSON (custos_brain); absent = fixed johan gateway")
+    parser.add_argument("--state-dir", default="/var/lib/custos-brain")
     args = parser.parse_args()
     os.umask(0o077)
-    asyncio.run(serve(load_policy(args.policy)))
+    brain = None
+    if args.brain and os.path.exists(args.brain):
+        from custos_brain import Brain, load_brain_policy
+        brain = Brain(load_brain_policy(args.brain), state_dir=args.state_dir)
+        print("custos-brain: " + json.dumps(brain.status()), flush=True)
+    asyncio.run(serve(load_policy(args.policy), brain))

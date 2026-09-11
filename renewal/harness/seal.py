@@ -41,12 +41,23 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             # One bounded call at a time from this disposable run, through the
             # existing host admission. Never accept an arbitrary destination.
             with self.server.model_lock:
-                connection=http.client.HTTPConnection('192.168.86.44',18080,timeout=630)
+                host,port=inference_endpoint()
+                connection=http.client.HTTPConnection(host,port,timeout=630)
                 connection.request('POST','/v1/chat/completions',body=json.dumps(p).encode(),headers={'Content-Type':'application/json'})
                 result=connection.getresponse();body=result.read(2*1024*1024+1);status=result.status;connection.close()
             if len(body)>2*1024*1024:raise ValueError('response size')
             self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
         except Exception:self.send_error(502)
+
+
+def inference_endpoint():
+    """The admission gateway the sealed model profile may call: CUSTOS_INFERENCE_URL (LXC 131
+    custos-brain since 2026-09-11, historically blink1:18080). Host and port only; the path is fixed."""
+    import os as _os
+    url=_os.environ.get('CUSTOS_INFERENCE_URL','http://192.168.86.69:18080')
+    rest=url.split('://',1)[-1].split('/',1)[0]
+    host,_,port=rest.partition(':')
+    return host,int(port or 80)
 
 def snapshot(source,dest,profile='offline'):
     source=source.resolve();allowed=[P('/opt/custos/work'),P('/opt/custos/repo'),P('/tmp'),P('/var/lib/custos-harness')]
