@@ -51,7 +51,25 @@ agent, in DMs or in the group:
   inference box (johan is your only backend) and the scheduled work that shares it.
 
 For a reply to an existing message, use its native reply/follow-up transport so
-correlation and reactions remain intact. For a new conversation/message:
+correlation and reactions remain intact:
+
+- `chat reply --follow-up --reply-to STEP ROUTE "text"` answers a message the bridge
+  delivered. STEP may be the eight-character id the stream shows (resolved to the one
+  message it names) or the full id; ROUTE is the `from` on their message (`signal-…`),
+  never a person's name. The bridge carries a reply only when STEP is one of their
+  delivered messages; `chat` now says so ("queued for the Signal bridge as a reply to
+  …") or, when the text answers nothing, sends it as a new message through
+  custos-actions when the route maps to a contact, and refuses otherwise. "Message
+  sent" without that note is not delivery. On 2026-09-10/11 three of the mind's
+  messages were lost this way while it recorded them as delivered.
+- The mind has a double-text window too: `mind_double_text_hours` in
+  `social-policy.json` (default 2; 0 disables). Inside it, `chat` and
+  `custos-actions signal-send` refuse a second unanswered message to the same
+  conversation, except a `--follow-up` that delivers what an earlier reply promised.
+  A scheduled message (the Friday confirmation) is fine after the window; a re-nudge
+  inside it is not.
+
+For a new conversation/message:
 
 1. Run `custos-actions signal-contacts` to read current labels and opaque targets.
    Use the returned exact target, or a unique contact label such as `Dani`.

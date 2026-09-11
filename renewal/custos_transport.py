@@ -146,6 +146,24 @@ def poll(args):
             'decision': decision, 'disposition': memory.get('status') if memory else 'unknown'}
 
 
+def receipt_lookup(receipts, reply_to):
+    """The inbound request a reply answers: its exact step id, else a unique prefix.
+
+    The mind reads eight-character step ids in its stream and hands them to
+    `chat reply --reply-to`; the bridge carries a reply only when this lookup
+    names a delivered request. Two deliveries were lost on 2026-09-10/11 (the
+    napa confirmation to Kim, the recall correction to Jack) because an exact
+    match on a prefix returned nothing and the row was never created."""
+    if not reply_to:
+        return None
+    if reply_to in receipts:
+        return receipts[reply_to]
+    if len(reply_to) < 4:
+        return None
+    matches = [request for step_id, request in receipts.items() if step_id.startswith(reply_to)]
+    return matches[0] if len(matches) == 1 else None
+
+
 def outbox(args):
     """Read complete outbound events incrementally from the current root."""
     state, _, trajectory, _ = paths('outbox')
@@ -181,7 +199,7 @@ def outbox(args):
                     record = json.loads(receipt.read_text())
                     receipts[record['step_id']] = record['original']['request_id']
             events.append({'step_id': event['step_id'], 'content': event.get('content', ''),
-                           'request_id': receipts.get(event.get('reply_to')), 'ts': event.get('ts'),
+                           'request_id': receipt_lookup(receipts, event.get('reply_to')), 'ts': event.get('ts'),
                            **({'reaction': event['reaction']} if 'reaction' in event else {})})
     return {'trajectory': str(trajectory), 'offset': cursor, 'events': events}
 

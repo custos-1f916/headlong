@@ -448,8 +448,17 @@ esac
 # design/monolith_run_health.md.
 prompt_file_tmp=$(mktemp "$state_dir/monolith_prompt.XXXXXX")
 printf '%s' "$route_prompt" > "$prompt_file_tmp"
+# The mind's double-text window (2026-09-11): `chat` and custos-actions refuse a
+# second unanswered message to the same conversation inside this window unless
+# it delivers promised work (`chat reply --follow-up`). Two re-nudges of Hal
+# went out bare on 09-10/11. Custos owns the number: social-policy.json
+# `mind_double_text_hours` (default 2; 0 disables).
+_mind_guard_hours=2
+_mgh=$(jq -r '.mind_double_text_hours // empty' "$IDENTITY_DIR/social-policy.json" 2>/dev/null) || _mgh=""
+[[ "$_mgh" =~ ^[0-9]+$ ]] && _mind_guard_hours="$_mgh"
 run_rc=0
 run_response=$(SHELLM_NO_BANNER=1 \
+    CHAT_DOUBLE_TEXT_GUARD_HOURS="$_mind_guard_hours" \
     SHELLM_TRIGGER_STEP_ID="$trigger_step_id" \
     SHELLM_WAKE="$wake_reason" \
     SHELLM_RUN_ID_OUT="$run_id_file" \

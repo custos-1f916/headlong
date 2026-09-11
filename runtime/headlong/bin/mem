@@ -57,12 +57,46 @@ slugify() {
 
 # Truncate characters, never UTF-8 bytes. Drain the input so a long body cannot
 # SIGPIPE its writer after we have read the first line.
+# The summary is the first NON-BLANK line. `mem show` prints a blank line after
+# the frontmatter, so a body extracted from it and passed back to `mem edit`
+# starts with a blank; deriving the summary from that blank left several
+# records headline-less and invisible to the search ranker (Custos, 2026-09-11).
 memory_summary() {
     python3 -c 'import sys
-first = sys.stdin.buffer.readline()
+first = b""
+for line in sys.stdin.buffer:
+    if line.strip():
+        first = line
+        break
 while sys.stdin.buffer.read(65536):
     pass
-sys.stdout.buffer.write(first.rstrip(b"\r\n").decode("utf-8")[:80].encode("utf-8"))'
+sys.stdout.buffer.write(first.rstrip(b"\r\n").strip().decode("utf-8")[:80].encode("utf-8"))'
+}
+
+# Leading blank lines carry nothing and stack up on every extract-and-re-edit.
+strip_leading_blanks() {
+    sed '/./,$!d'
+}
+
+# A record the Custos control plane manages carries a request envelope or a
+# person-note line. Refuse to leave a write its reader cannot parse: on
+# 2026-09-11 a bulk rewrite of 55 records passed the writer and failed the
+# ingress validator an hour later, as 55 junk notes. `custos-memory validate
+# FILE` is the reader's own check; when it is not installed the write stands.
+_validate_managed() {
+    local file="$1" previous="${2:-}"
+    grep -q 'Custos request record v1:\|Custos person note v1:' "$file" 2>/dev/null || return 0
+    command -v custos-memory >/dev/null 2>&1 || return 0
+    local verdict
+    if verdict=$(custos-memory validate "$file" 2>&1); then
+        return 0
+    fi
+    if [[ -n "$previous" && -f "$previous" ]]; then
+        cat "$previous" > "$file"
+    else
+        rm -f "$file"
+    fi
+    die "write refused, record restored: ${verdict}"
 }
 
 # Extract a field from YAML frontmatter.
@@ -133,6 +167,8 @@ action_add() {
     fi
 
     mkdir -p "$MEM_DIR"
+    text=$(printf '%s' "$text" | strip_leading_blanks)
+    [[ -z "$text" ]] && die "No text provided"
 
     local timestamp hex slug filename summary created
     timestamp=$(date +%Y-%m-%d-%H-%M-%S)
@@ -153,6 +189,8 @@ until: $MEM_UNTIL}
 
 $text
 EOF
+
+    _validate_managed "$MEM_DIR/${filename}.md"
 
     debug "Created: $MEM_DIR/${filename}.md"
     printf '%s\n' "$filename"
@@ -285,12 +323,30 @@ PYMEM
         ) >/dev/null &
         _hb_pid=$!
     fi
-    local rc=0
+    local rc=0 answer=""
     # shellcheck disable=SC2086
-    printf 'Search these memories for: %s\n\n%s' "$query" "$memories" | \
+    answer=$(printf 'Search these memories for: %s\n\n%s' "$query" "$memories" | \
         llm ${SHELLM_FAST_MODEL:+-m "$SHELLM_FAST_MODEL"} -t "${MEM_SEARCH_MAX_TOKENS:-16000}" \
-            -s "You are a semantic search engine for memory files. Each memory has a filename header (=== filename ===), YAML frontmatter (summary, type), and a body. Return ONLY the filenames and summaries of semantically matching memories, one per line. If nothing matches, say 'No matches found.'" || rc=$?
-    exit "$rc"
+            -s "You are a semantic search engine for memory files. Each memory has a filename header (=== filename ===), YAML frontmatter (summary, type), and a body. Return ONLY the filenames and summaries of semantically matching memories, one per line. If nothing matches, say 'No matches found.'") || rc=$?
+    [[ "$rc" -eq 0 ]] || exit "$rc"
+    # Stage 3: a result line that names a file must name a real one. The model
+    # is asked for filenames and can invent them: on 2026-09-11 it returned two
+    # goal-typed records that existed nowhere on disk, and a wake spent its
+    # iterations looking for them. Lines without a filename pass through.
+    printf '%s\n' "$answer" | MEM_DIR="$MEM_DIR" python3 - <<'PYFILTER'
+import os, re, sys
+names = set(os.listdir(os.environ["MEM_DIR"]))
+pattern = re.compile(r"\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_[0-9a-f]{8}_[A-Za-z0-9-]+")
+dropped = 0
+for line in sys.stdin:
+    match = pattern.search(line)
+    if match and match.group(0) + ".md" not in names and match.group(0) not in names:
+        dropped += 1
+        continue
+    sys.stdout.write(line)
+if dropped:
+    print("mem search: dropped %d result line%s naming memories that do not exist (the model invented them); trust only names that survive." % (dropped, "" if dropped == 1 else "s"), file=sys.stderr)
+PYFILTER
 )
 
 action_list() {
@@ -435,9 +491,14 @@ action_edit() {
         text=$(cat)
         [[ -z "$text" ]] && die "No text provided"
     fi
+    text=$(printf '%s' "$text" | strip_leading_blanks)
+    [[ -z "$text" ]] && die "No text provided"
 
     local now
     now=$(date +"%Y-%m-%d %H:%M:%S")
+    local previous
+    previous=$(mktemp) || die "mktemp failed"
+    cat "$file" > "$previous"
 
     # Extract frontmatter fields. `until:` (mem add --until) rides through an
     # edit: a todo shortlist that is appended to during the day must still
@@ -485,6 +546,9 @@ ${until_line}$updated_block
 
 $text
 EOF
+
+    _validate_managed "$file" "$previous"
+    rm -f "$previous"
 
     # Auto-update slug in filename. Always sanitize through slugify: sed is
     # line-oriented and lets embedded newlines through into the filename, and

@@ -153,6 +153,47 @@ def split_memory(raw):
     return header, body.strip(), fields
 
 
+def validate_record(record):
+    """Shape checks on a captured request record; raises MemoryError."""
+    if not isinstance(record, dict) or record.get("version") != 1:
+        raise MemoryError("corrupt directed request record")
+    if record.get("status") not in {"active", "completed", "declined", "abandoned"}:
+        raise MemoryError("invalid directed goal status; refusing to hide work")
+    keys(record.get("origin"), {"request_id", "sender", "source_url", "content", "authority"}, {"ambient", "allow_reaction", "images"})
+    if 'images' in record['origin']:
+        validate_refs(record['origin']['images'])
+    if "ambient" in record["origin"] and record["origin"]["ambient"] is not True:
+        raise MemoryError("invalid ambient provenance")
+    if "allow_reaction" in record["origin"] and record["origin"]["allow_reaction"] is not True:
+        raise MemoryError("invalid reaction provenance")
+    keys(record.get("goal"), {"outcome", "next_action", "completion"})
+    if record["status"] != "active":
+        resolution = record.get("resolution")
+        keys(resolution, {"disposition", "evidence"})
+        if resolution["disposition"] != record["status"]:
+            raise MemoryError("retired goal disposition mismatch")
+        text(resolution["evidence"], "retirement evidence", 8192)
+    elif "resolution" in record:
+        raise MemoryError("active goal contains conflicting resolution")
+    return record
+
+
+def parse_memory_file(path):
+    """One store file as (path, header, body, fields, record), checked the way the
+    store reads it. A person note must carry a parseable `Custos person note v1`
+    line with a person_key."""
+    raw = path.read_text(encoding="utf-8")
+    header, body, fields = split_memory(raw)
+    record = None
+    if MARKER in body:
+        record = validate_record(strict_json(body.split(MARKER, 1)[1]))
+    if fields.get("type") == "person" and PERSON_MARKER in body:
+        meta = strict_json(body.rsplit(PERSON_MARKER, 1)[1])
+        if not isinstance(meta, dict) or not isinstance(meta.get("person_key"), str) or not meta["person_key"]:
+            raise MemoryError("person note without a person_key")
+    return path, header, body, fields, record
+
+
 class Store:
     def __init__(self, directory=None, mem=None):
         directory = directory or os.environ.get("MEM_DIR")
@@ -172,32 +213,101 @@ class Store:
 
     def files(self):
         for path in sorted(self.directory.glob("*.md")):
-            raw = path.read_text(encoding="utf-8")
-            header, body, fields = split_memory(raw)
-            record = None
-            if MARKER in body:
-                record = strict_json(body.split(MARKER, 1)[1])
-                if not isinstance(record, dict) or record.get("version") != 1:
-                    raise MemoryError("corrupt directed request record")
-                if record.get("status") not in {"active", "completed", "declined", "abandoned"}:
-                    raise MemoryError("invalid directed goal status; refusing to hide work")
-                keys(record.get("origin"), {"request_id", "sender", "source_url", "content", "authority"}, {"ambient", "allow_reaction", "images"})
-                if 'images' in record['origin']:
-                    validate_refs(record['origin']['images'])
-                if "ambient" in record["origin"] and record["origin"]["ambient"] is not True:
-                    raise MemoryError("invalid ambient provenance")
-                if "allow_reaction" in record["origin"] and record["origin"]["allow_reaction"] is not True:
-                    raise MemoryError("invalid reaction provenance")
-                keys(record.get("goal"), {"outcome", "next_action", "completion"})
-                if record["status"] != "active":
-                    resolution = record.get("resolution")
-                    keys(resolution, {"disposition", "evidence"})
-                    if resolution["disposition"] != record["status"]:
-                        raise MemoryError("retired goal disposition mismatch")
-                    text(resolution["evidence"], "retirement evidence", 8192)
-                elif "resolution" in record:
-                    raise MemoryError("active goal contains conflicting resolution")
-            yield path, header, body, fields, record
+            yield parse_memory_file(path)
+
+    def state_dir(self):
+        return self.archive_dir().parent
+
+    def rejected_ingress(self):
+        """Ingress rejections already recorded (the state file, plus the notes the
+        pre-2026-09-11 reconcile wrote one per step)."""
+        rejected = set()
+        path = self.state_dir() / "ingress-rejected.json"
+        try:
+            for entry in json.loads(path.read_text(encoding="utf-8")):
+                if isinstance(entry, dict) and isinstance(entry.get("rejection"), str):
+                    rejected.add(entry["rejection"])
+        except (OSError, ValueError):
+            pass
+        return rejected
+
+    def record_rejections(self, rejections):
+        """Set aside incoming steps the reader could not reconcile: one state entry
+        each and ONE observation for the pass, never a memory record per step.
+
+        On 2026-09-11 a bulk rewrite of 55 ambient records changed their captured
+        provenance; the next reconcile wrote 55 `type: note` records saying
+        "Unusable incoming message requires review", which then competed with real
+        memories in every search and listing."""
+        path = self.state_dir() / "ingress-rejected.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            entries = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(entries, list):
+                entries = []
+        except (OSError, ValueError):
+            entries = []
+        stamp = now()
+        for rejection, step_id, reason in rejections:
+            entries.append({"rejection": rejection, "step_id": step_id, "reason": reason, "at": stamp})
+        del entries[:-4000]
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(encode(entries) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+        if os.environ.get("TRAJ_ID"):
+            reasons = sorted({reason for _, _, reason in rejections})
+            ids = [step_id for _, step_id, _ in rejections]
+            shown = ", ".join(str(i)[:8] for i in ids[:6]) + (" and %d more" % (len(ids) - 6) if len(ids) > 6 else "")
+            append_step({"type": "observation", "source": "custos-memory",
+                         "request_id": "custos-ingress-reject:" + hashlib.sha256("".join(r for r, _, _ in rejections).encode()).hexdigest(),
+                         "content": ("%d incoming message%s could not be matched to %s captured record%s and %s set aside "
+                                     "(reason: %s). Steps: %s. The messages stay in the trajectory and nothing else is blocked. "
+                                     "If you rewrote memory records yourself, restore them from your backup, or run "
+                                     "`custos-memory validate` to see exactly what the reader rejects.")
+                                    % (len(ids), "" if len(ids) == 1 else "s", "its" if len(ids) == 1 else "their",
+                                       "" if len(ids) == 1 else "s", "was" if len(ids) == 1 else "were", "; ".join(reasons)[:400], shown)})
+
+    def validate(self, paths=None):
+        """The reader's own checks, without writing anything.
+
+        With FILE arguments: parse each file the way the store does (frontmatter,
+        request envelope, person-note line). Without: every record in the store,
+        then the trajectory's incoming messages against their captured provenance,
+        exactly the comparison reconcile() makes before it sets a step aside."""
+        problems = []
+        if paths:
+            for raw in paths:
+                path = Path(raw)
+                try:
+                    parse_memory_file(path)
+                except (MemoryError, OSError, UnicodeError, ValueError) as error:
+                    problems.append({"file": path.name, "error": str(error)})
+            return {"checked": len(paths), "problems": problems, "conflicts": []}
+        items = []
+        with self.lock():
+            for path in sorted(self.directory.glob("*.md")):
+                try:
+                    items.append(parse_memory_file(path))
+                except (MemoryError, OSError, UnicodeError, ValueError) as error:
+                    problems.append({"file": path.name, "error": str(error)})
+        conflicts = []
+        if os.environ.get("TRAJ_ID"):
+            me = os.environ.get("IDENTITY_NAME", "custos")
+            known = {item[4]["origin"]["request_id"]: (item[3].get("id"), item[4]) for item in items if item[4]}
+            for step in trajectory(self):
+                if step.get("type") != "message" or step.get("to") != me or step.get("from") == me:
+                    continue
+                try:
+                    incoming, trigger = envelope_payload(step)
+                except MemoryError:
+                    continue
+                previous = known.get(incoming["request_id"])
+                if previous is not None and previous[1]["origin"] != incoming:
+                    differing = sorted(k for k in set(previous[1]["origin"]) | set(incoming)
+                                       if previous[1]["origin"].get(k) != incoming.get(k))
+                    conflicts.append({"goal_id": previous[0], "step_id": step.get("step_id"),
+                                      "request_id": incoming["request_id"][:120], "differs": differing})
+        return {"checked": len(items) + len(problems), "problems": problems, "conflicts": conflicts}
 
     def find(self, goal_id):
         text(goal_id, "goal_id", 8)
@@ -536,6 +646,8 @@ class Store:
             known = {item[4]["origin"]["request_id"]: item[4] for item in items if item[4]}
             rejected = {body.rsplit(NOTE_MARKER, 1)[1] for _, _, body, _, _ in items
                         if NOTE_MARKER + "invalid-ingress:" in body}
+        rejected |= self.rejected_ingress()
+        rejections = []
         for step in trajectory(self):
             if step.get("type") != "message" or step.get("to") != me or step.get("from") == me:
                 continue
@@ -558,11 +670,11 @@ class Store:
                 # The complete original remains in the append-only trajectory.
                 # Storage/command failures are NOT caught here: they must fail
                 # intake honestly rather than be mistaken for malformed input.
-                with self.lock():
-                    self.commit("Unusable incoming message requires review; other requests remain actionable. "
-                                + "Raw native step: " + str(step.get("step_id", "(missing)"))
-                                + ". Reason: " + str(error) + NOTE_MARKER + rejection, "note")
+                rejections.append((rejection, str(step.get("step_id", "(missing)")), str(error)))
                 rejected.add(rejection)
+        if rejections:
+            with self.lock():
+                self.record_rejections(rejections)
 
     def context(self, offset=0, limit=32, directed_only=False):
         if not 0 <= offset or not 1 <= limit <= 100:
@@ -831,20 +943,85 @@ class People:
     def __init__(self, store):
         self.store = store
 
-    def find(self, key):
+    @staticmethod
+    def parse(item):
+        path, header, body, fields, record = item
+        if fields.get("type") != "person" or PERSON_MARKER not in body:
+            return None
+        try:
+            meta = strict_json(body.rsplit(PERSON_MARKER, 1)[1])
+        except InvalidInput:
+            return None
+        if not isinstance(meta, dict):
+            return None
+        notes = body.split(PERSON_MARKER, 1)[0]
+        notes = notes.split("\n", 1)[1].strip() if "\n" in notes else ""
+        return item, meta, notes
+
+    def find_all(self, key):
+        found = []
         for item in self.store.files():
-            path, header, body, fields, record = item
-            if fields.get("type") != "person" or PERSON_MARKER not in body:
-                continue
-            try:
-                meta = strict_json(body.rsplit(PERSON_MARKER, 1)[1])
-            except InvalidInput:
-                continue
-            if isinstance(meta, dict) and meta.get("person_key") == key:
-                notes = body.split(PERSON_MARKER, 1)[0]
-                notes = notes.split("\n", 1)[1].strip() if "\n" in notes else ""
-                return item, meta, notes
-        return None
+            parsed = self.parse(item)
+            if parsed and parsed[1].get("person_key") == key:
+                found.append(parsed)
+        return found
+
+    def find(self, key):
+        """The note for a person key. When several share the key, the one most
+        recently updated wins: a second note re-forms whenever a thinker creates
+        instead of editing (Jack, 2026-09-11), and the responder was reading the
+        oldest file while the social thinker maintained the newest."""
+        found = self.find_all(key)
+        if not found:
+            return None
+        return max(found, key=lambda f: (str(f[1].get("updated") or ""), f[0][0].name))
+
+    def merge(self, source_id, target_id, notes=None):
+        """Fold person note SOURCE into TARGET (same person_key), keep TARGET's
+        display, union aliases and routes, archive SOURCE and both preimages under
+        the identity's dream/operator-cleanup/. Nothing is deleted."""
+        if source_id == target_id:
+            raise MemoryError("person-merge needs two different notes")
+        with self.store.lock():
+            source = self.parse(self.store.find(source_id))
+            target = self.parse(self.store.find(target_id))
+            if not source or not target:
+                raise MemoryError("person-merge takes two person notes (type: person with a person note line)")
+            (spath, _, sbody, _, _), smeta, snotes = source
+            (tpath, _, tbody, _, _), tmeta, tnotes = target
+            if smeta.get("person_key") != tmeta.get("person_key"):
+                raise MemoryError("person-merge refuses two different people (person_key differs)")
+            if notes is None:
+                notes = tnotes if snotes.strip() in tnotes else (tnotes.rstrip() + "\n\n" + snotes.strip()).strip()
+            notes = redact_secrets(text(notes, "person notes", PERSON_NOTE_MAX * 4)).strip()
+            if len(notes) > PERSON_NOTE_MAX:
+                raise MemoryError("merged note would be %d characters (max %d); pass a compressed note on stdin"
+                                  % (len(notes), PERSON_NOTE_MAX))
+            aliases = [text(a, "alias", 48) for a in dict.fromkeys((tmeta.get("aliases") or []) + (smeta.get("aliases") or []))][:12]
+            routes = list(dict.fromkeys((tmeta.get("routes") or []) + (smeta.get("routes") or [])))[-8:]
+            meta = {"person_key": tmeta["person_key"], "display": tmeta.get("display") or smeta.get("display") or "?",
+                    "aliases": aliases, "routes": routes, "updated": now()}
+            identity = os.environ.get("IDENTITY_DIR")
+            base = Path(identity) if identity else self.store.directory.parent
+            changes = base / "dream" / "operator-cleanup" / "changes"
+            merged_dir = base / "dream" / "operator-cleanup" / "merged"
+            changes.mkdir(parents=True, exist_ok=True)
+            merged_dir.mkdir(parents=True, exist_ok=True)
+            preimages = []
+            for path in (spath, tpath):
+                raw = path.read_text(encoding="utf-8")
+                name = path.stem.split("_")[1] if "_" in path.stem else path.stem
+                out = changes / (name + "-" + hashlib.sha256(raw.encode()).hexdigest()[:16] + ".before.md")
+                out.write_text(raw, encoding="utf-8")
+                preimages.append(str(out))
+            body = ("Person: " + meta["display"] + "\n\n" + notes + PERSON_MARKER
+                    + encode({k: meta[k] for k in ("person_key", "display", "aliases", "routes", "updated")}))
+            kept = self.store.commit(body, memory_type="person", existing=target[0])
+            os.replace(spath, merged_dir / spath.name)
+            self.store.sync(tpath) if tpath.exists() else None
+            return {"kept": kept, "merged": source_id, "display": meta["display"], "aliases": aliases,
+                    "routes": len(routes), "notes_chars": len(notes), "preimages": preimages,
+                    "archived": str(merged_dir / spath.name)}
 
     def prompt(self, key, display):
         found = self.find(key)
@@ -1852,9 +2029,13 @@ Examples (replace the sample ID and evidence with actual values):
   custos-memory check 0123abcd add Land custos/vd-rqz5 on main   |   custos-memory check 0123abcd done 1   |   custos-memory check 0123abcd list
   printf '%s\\n' '{"goal_id":"0123abcd","disposition":"completed","evidence":"Verified artifact and delivered result"}' | custos-memory complete
   custos-memory show 0123abcd
+  custos-memory validate                       # every record + the trajectory's captured provenance; exit 1 on a problem
+  custos-memory validate memories/FILE.md      # one file, the way the store reads it (mem add/edit run this on managed records)
+  custos-memory person-merge SOURCE_ID TARGET_ID   # fold a duplicate person note into the kept one; preimages archived
 An acknowledgment alone is not completion. Valid dispositions: completed, declined, abandoned.''')
     parser.add_argument("command", choices=["capture", "capture-envelope", "context", "pending", "show", "update", "complete", "respond",
-                                            "replay-unanswered", "archive-conversations", "expire-asks", "note", "check"])
+                                            "replay-unanswered", "archive-conversations", "expire-asks", "note", "check",
+                                            "validate", "person-merge"])
     parser.add_argument("goal_id", nargs="?", help="Goal ID for show, update and complete (writes also take JSON on stdin)")
     parser.add_argument("words", nargs="*", help="complete: [completed|declined|abandoned] evidence…; update: the next action")
     parser.add_argument("--json", action="store_true")
@@ -1864,8 +2045,8 @@ An acknowledgment alone is not completion. Valid dispositions: completed, declin
     parser.add_argument("--older-than", type=int, default=None,
                         help="replay-unanswered: seconds (default 900); archive-conversations: days (default 2); expire-asks: hours (default 24)")
     args = parser.parse_args()
-    if args.goal_id is not None and args.command not in {"show", "update", "complete", "note", "check"}:
-        parser.error("Only show, update, complete, note and check take a positional goal ID; see --help for examples.")
+    if args.goal_id is not None and args.command not in {"show", "update", "complete", "note", "check", "validate", "person-merge"}:
+        parser.error("Only show, update, complete, note, check, validate and person-merge take positional arguments; see --help for examples.")
     try:
         store = Store()
         if args.command in {"context", "pending"}:
@@ -1898,6 +2079,24 @@ An acknowledgment alone is not completion. Valid dispositions: completed, declin
                     for entry in record["scratchpad"]:
                         print("  " + str(entry.get("at", ""))[:16] + "  " + entry["text"])
             return
+        if args.command == "validate":
+            paths = ([args.goal_id] if args.goal_id else []) + list(args.words)
+            result = store.validate(paths or None)
+            print(encode(result))
+            return 1 if result["problems"] or result["conflicts"] else 0
+        if args.command == "person-merge":
+            if not args.goal_id or len(args.words) != 1:
+                raise InvalidInput("usage: custos-memory person-merge SOURCE_ID TARGET_ID  (compressed notes on stdin optional)")
+            notes = None
+            if not sys.stdin.isatty():
+                import select
+                try:
+                    if select.select([sys.stdin], [], [], 0.5)[0]:
+                        notes = sys.stdin.read(MAX_INPUT).strip() or None
+                except (OSError, ValueError):
+                    notes = None
+            print(encode(People(store).merge(args.goal_id, args.words[0], notes)))
+            return 0
         if args.command == "replay-unanswered":
             print(encode(replay_unanswered(store, args.older_than if args.older_than is not None else 900,
                                            min(args.limit, 10))))

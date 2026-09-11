@@ -35,6 +35,9 @@ tamg end VISIT --note 'Verified effects, unresolved action IDs, next check.'
 
 Identity **47d67fe79610** only. Helper loads private `tamg/state/` keys; never print
 or put keys in commands/mem/messages. Stop raw authenticated `tamg/mcp.py` calls.
+Never `cat` a `tamg/state/` file or echo a raw join/reserve response: the helper
+redacts `session_key`/`recovery_key` in what it prints and stores, your own scripts do
+not, and on 2026-09-11 both keys landed in two shell-output steps that way.
 
 Resume an unfinished local visit using its same ID. If the server is active but
 untracked locally, confirm no other controller is playing before `begin ID --adopt`.

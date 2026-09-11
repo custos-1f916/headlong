@@ -18,6 +18,10 @@ import xml.etree.ElementTree as ET
 
 from custos_square import APIError, ORIGIN, STATE, SECRET, Square, Store, allowance_summary, canonical, digest, note_allowance, public_request, square_queue, MAX_AGE_HOURS
 
+# Outbox drain bounds per pass (see Observer._drain_outbox).
+DRAIN_SECONDS = float(os.environ.get("CUSTOS_OUTBOX_DRAIN_SECONDS", "20"))
+DRAIN_MAX_BYTES = 64 * 1024 * 1024
+
 BUCKETS = ("replies", "comments_on_your_posts", "mentions_of_you", "in_threads_you_joined")
 CONFIG = Path("/var/lib/custos/config/observations.json")
 if not CONFIG.exists():
@@ -503,12 +507,20 @@ class Observer:
                                                       "items": pending[:200], "at": self.now})
 
     def _drain_outbox(self, path, cursor):
+        # One pass reads from the cursor to the end of the log, bounded by time and
+        # bytes rather than by a line count. The old 300-line cap meant a reset
+        # drain advanced a few replies per tick: on 2026-09-11 clearing 53 stale and
+        # withdrawn rows took from 00:00 to 02:18Z and two fresh replies aged past
+        # the freshness cap while they waited their turn.
+        deadline = time.monotonic() + DRAIN_SECONDS
+        scanned = 0
         with path.open("rb") as source:
             source.seek(cursor["offset"])
-            for _ in range(300):
+            while scanned < DRAIN_MAX_BYTES and time.monotonic() < deadline:
                 line = source.readline(128 * 1024)
                 if not line:
                     break
+                scanned += len(line)
                 if not line.endswith(b"\n"):
                     if len(line) == 128 * 1024:
                         raise APIError("outbox_native_line_too_large")

@@ -101,6 +101,121 @@ _double_text_guard() {
     return 0
 }
 
+
+# ---------------------------------------------------------------------------
+# Outbound checks (2026-09-11). In one day three of the mind's seventeen Signal
+# messages never left the box, and `chat` said "Reply sent." to all three: two
+# `chat reply --reply-to` calls named the eight-character step id the stream
+# shows, which the bridge's exact-match lookup did not know, and one named a
+# person ("Hal") instead of a routing name. Now a --reply-to prefix is resolved
+# to the full step id when it names one message; a recipient this log has never
+# exchanged a message with is refused; and a Signal route needs a delivered
+# inbound message to answer (that is all the bridge carries), or the message
+# goes out through custos-actions, the proactive path, which runs the same
+# guard and records the step itself.
+# ---------------------------------------------------------------------------
+_messages_index() {   # path of the up-to-date messages.jsonl index, or nothing
+    local tf idx
+    tf=$(traj path "${ROOT_TRAJ_ID:-$TRAJ_ID}" 2>/dev/null) || return 0
+    [[ -n "$tf" && -f "$tf" ]] || return 0
+    idx="$(dirname "$tf")/messages.jsonl"
+    _index_update "$tf" "$idx" 2>/dev/null || true
+    [[ -f "$idx" ]] && printf '%s' "$idx"
+    return 0
+}
+
+# <id or prefix>: the full step id on stdout when the prefix names exactly one
+# message step; 2 when it names several; 1 when it names none (the caller keeps
+# what it was given: bridges other than Signal have their own conventions).
+_resolve_step_id() {
+    local id="$1" idx matches count
+    [[ "$id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] && { printf '%s' "$id"; return 0; }
+    [[ "$id" =~ ^[0-9a-f]{4,}$ ]] || return 1
+    idx=$(_messages_index)
+    [[ -n "$idx" ]] || return 1
+    matches=$(jq -Rr --arg p "$id" 'fromjson? // empty | .step_id // "" | select(. != "" and startswith($p))' "$idx" 2>/dev/null | sort -u)
+    count=$(printf '%s' "$matches" | grep -c . 2>/dev/null) || count=0
+    [[ "$count" -eq 1 ]] && { printf '%s' "$matches"; return 0; }
+    [[ "$count" -gt 1 ]] && return 2
+    return 1
+}
+
+# <name>: 0 when this log has a message from or to <name>, or no log to check.
+_known_name() {
+    local name="$1" idx seen
+    idx=$(_messages_index)
+    [[ -n "$idx" && -s "$idx" ]] || return 0
+    seen=$(jq -Rrn --arg n "$name" 'first(inputs | fromjson? // empty | select(.from == $n or .to == $n) | "y") // "n"' "$idx" 2>/dev/null) || seen="y"
+    [[ "$seen" == "y" ]]
+}
+
+# <full step id>: the request id of the bridge-delivered inbound message it
+# names (the bridge keys its outbox on exactly this lookup), else nothing.
+_transport_receipt_request() {
+    local rt="$1" dir="${IDENTITY_DIR:-}/.state/transport" found=""
+    [[ -n "$rt" && -n "${IDENTITY_DIR:-}" && -d "$dir" ]] || return 0
+    found=$(jq -r --arg rt "$rt" 'select(.step_id == $rt) | .original.request_id // empty' "$dir"/*.json 2>/dev/null | head -1) || found=""
+    printf '%s' "$found"
+}
+
+# <route> <message>: the proactive path. 0 = sent and recorded by custos-actions
+# (do not append a second step); 1 = refused (reason printed); 2 = no contact
+# maps to this route, or custos-actions is not installed.
+_send_via_actions() {
+    local route="$1" message="$2" contacts target rid out
+    command -v custos-actions >/dev/null 2>&1 || return 2
+    contacts=$(custos-actions signal-contacts 2>/dev/null) || return 2
+    target=$(printf '%s' "$contacts" | ROUTE="$route" python3 -c '
+import hashlib, json, os, sys
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+want = os.environ["ROUTE"]
+items = data.get("contacts") or data.get("destinations") or [] if isinstance(data, dict) else data
+for c in items:
+    t = c.get("target") if isinstance(c, dict) else None
+    if t and "signal-" + hashlib.sha256(t.encode()).hexdigest()[:24] == want:
+        print(t)
+        break') || target=""
+    [[ -n "$target" ]] || return 2
+    rid=$(printf '%s\n%s' "$route" "$message" | python3 -c 'import hashlib,sys; print("chat-" + hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16])')
+    if ! out=$(jq -nc --arg r "$rid" --arg t "$target" --arg m "$message" '{request_id:$r,target:$t,message:$m}' | custos-actions signal-send 2>&1); then
+        printf 'chat: error: %s\n' "${out:-not sent: custos-actions refused or is unavailable}" >&2
+        return 1
+    fi
+    printf 'Sent through custos-actions as a new message (not a reply; recorded there): %s\n' "$out" >&2
+    return 0
+}
+
+# <to> <reply_to> <message>: run before appending an outbound message from the
+# identity. Reads the caller's `from`. 0 = append; 10 = already sent through
+# custos-actions; dies with the reason otherwise. Sets OUTBOUND_NOTE.
+_outbound_check() {
+    local to="$1" rt="$2" message="$3" me="${IDENTITY_NAME:-}" req="" rc=0
+    OUTBOUND_NOTE=""
+    [[ -n "$me" && "${from:-}" == "$me" ]] || return 0
+    if ! _known_name "$to"; then
+        die "not sent: '$to' is not a name this log has exchanged messages with (a person's display name is not a route). Use the routing name from chat history --with NAME (the from on their messages), or reach someone new with custos-actions signal-send."
+    fi
+    case "$to" in
+        signal-*)
+            [[ -n "$rt" ]] && req=$(_transport_receipt_request "$rt")
+            if [[ -n "$req" ]]; then
+                OUTBOUND_NOTE="queued for the Signal bridge as a reply to ${rt:0:8}"
+                return 0
+            fi
+            _send_via_actions "$to" "$message" || rc=$?
+            case "$rc" in
+                0) return 10 ;;
+                1) exit 1 ;;
+                *) die "not sent: this answers no message the Signal bridge delivered (the bridge only carries replies: --reply-to the step id of one of their messages), and '$to' is not a contact custos-actions can reach for a new message. Use custos-actions signal-send with a contact label from custos-actions signal-contacts." ;;
+            esac
+            ;;
+    esac
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -148,6 +263,10 @@ cmd_send() {
 To message someone else: chat reply <their-name> <message>
 To keep a note for yourself, append a thought step instead of a message."
 
+    local OUTBOUND_NOTE="" _oc=0
+    _outbound_check "$to" "" "$message" || _oc=$?
+    [[ "$_oc" -eq 10 ]] && return 0
+
     _double_text_guard "$to"
 
     # source_url records where a bridged message came from. It is optional
@@ -161,7 +280,7 @@ To keep a note for yourself, append a thought step instead of a message."
          + (if $source_url == "" then {} else {source_url:$source_url} end)' \
         | _chat_append
 
-    printf 'Message sent.\n' >&2
+    printf 'Message sent%s.\n' "${OUTBOUND_NOTE:+ ($OUTBOUND_NOTE)}" >&2
 }
 
 cmd_reply() {
@@ -204,6 +323,19 @@ Use the name of the person you mean to reach: chat reply <their-name> <message>"
     # message been answered" a fact in the log no matter which path (or model)
     # sent the reply. A reply that answers nothing (every inbound already
     # answered) stays unstamped.
+    # A prefix the stream printed (eight hex characters) is resolved to the one
+    # message step it names, or refused when it names several. What names no
+    # message step is kept as given: other bridges have their own conventions.
+    if [[ -n "$reply_to" ]]; then
+        local _resolved="" _rrc=0
+        _resolved=$(_resolve_step_id "$reply_to") || _rrc=$?
+        if [[ "$_rrc" -eq 0 && -n "$_resolved" ]]; then
+            reply_to="$_resolved"
+        elif [[ "$_rrc" -eq 2 ]]; then
+            die "not sent: --reply-to '$reply_to' matches more than one message step; use the full step id (chat history --with NAME --json)"
+        fi
+    fi
+
     if [[ -z "$reply_to" ]]; then
         reply_to=$(timeout 10 traj cat "${ROOT_TRAJ_ID:-$TRAJ_ID}" --raw 2>/dev/null \
             | timeout 10 jq -Rrn --arg me "$from" --arg them "$to_name" '
@@ -240,7 +372,18 @@ Use the name of the person you mean to reach: chat reply <their-name> <message>"
         fi
     fi
 
-    _double_text_guard "$to_name"
+    local OUTBOUND_NOTE="" _oc=0
+    _outbound_check "$to_name" "$reply_to" "$message" || _oc=$?
+    [[ "$_oc" -eq 10 ]] && return 0
+
+    # Delivering promised work (--follow-up to the message that asked for it)
+    # is the one second message a person is waiting for; the guard covers
+    # everything else the identity sends on its own initiative.
+    if [[ "$follow_up" -eq 1 && -n "$reply_to" ]]; then
+        [[ -n "${CHAT_SOCIAL_BLOCKED:-}" ]] && die "$CHAT_SOCIAL_BLOCKED"
+    else
+        _double_text_guard "$to_name"
+    fi
 
     # reply_to stamps which message step this reply answers, making "has this
     # message been answered" a fact in the log rather than an ordering
@@ -256,7 +399,7 @@ Use the name of the person you mean to reach: chat reply <their-name> <message>"
          + (if $follow_up == 1 then {follow_up:true} else {} end)' \
         | _chat_append
 
-    printf 'Reply sent.\n' >&2
+    printf 'Reply sent%s.\n' "${OUTBOUND_NOTE:+ ($OUTBOUND_NOTE)}" >&2
 }
 
 cmd_send_file() {
@@ -720,7 +863,14 @@ Usage:
                              Agent sends a reply (from is $IDENTITY_NAME).
                              Stamps reply_to with the step it answers —
                              inferred (latest unanswered message from
-                             <to_name>) unless --reply-to overrides.
+                             <to_name>) unless --reply-to overrides; an
+                             eight-character prefix is resolved to the one
+                             message it names. <to_name> is a routing name
+                             (the from on their messages), never a person's
+                             display name. A signal-* route is carried by the
+                             bridge only as a reply to a delivered message;
+                             anything else goes out through custos-actions
+                             when the route maps to a contact, or is refused.
                              --follow-up: a deliberate second reply to an
                              already answered message (delivering work the
                              first reply promised); skips the duplicate
