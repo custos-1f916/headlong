@@ -351,5 +351,75 @@ class PeopleTests(MemoryFixture):
         self.assertEqual(len(list((self.root / "memories").glob("*.md"))), 2)
 
 
+
+class OutboxDrainTests(unittest.TestCase):
+    """The square outbox drain reads to the end of the log in one pass (bounded by
+    time and bytes), so stale rows at the head clear at the reset instead of a
+    few per tick: on 2026-09-11 the old 300-line cap turned 53 free drops into a
+    2 h 18 min crawl and aged two fresh replies past the freshness cap."""
+
+    def setUp(self):
+        import tempfile
+        from custos_observe import Observer
+        from custos_square import Store
+        from test_observations import NativeFixture
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = Store(self.temp.name)
+        self.addCleanup(self.store.db.close)
+        self.native = NativeFixture()
+        self.path = Path(self.temp.name) / "traj.jsonl"
+        self.native.path = self.path
+        self.now = 1789171200.0  # 2026-09-12T00:00:00Z
+
+        class SquareStub:
+            written = []
+
+            def get(_, path, query=None, auth=False):
+                return {"comment": {"author": "peer"}, "post": {"author": "peer"}}
+
+            def write(_, identity, verb, payload):
+                SquareStub.written.append((identity, payload))
+                return {"request_id": identity, "status": "delivered", "readback": "https://1f916.ai/api/comment/1"}
+
+        self.square = SquareStub()
+        self.observer = Observer({}, self.store, self.square, self.native, now=self.now)
+
+    def stamp(self, seconds_ago):
+        return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(self.now - seconds_ago))
+
+    def write_log(self, filler=400):
+        lines = [cm.encode({"type": "trajectory", "step_id": "header"})]
+        lines += [cm.encode({"type": "reasoning", "step_id": "r%d" % n, "thought": "x" * 200}) for n in range(filler)]
+        lines.append(cm.encode({"type": "message", "step_id": "stale-1", "from": "custos", "to": "square:peer:10:99",
+                                "content": "a day-old take", "ts": self.stamp(20 * 3600)}))
+        lines += [cm.encode({"type": "reasoning", "step_id": "s%d" % n, "thought": "y" * 200}) for n in range(filler)]
+        lines.append(cm.encode({"type": "message", "step_id": "fresh-1", "from": "custos", "to": "square:peer:10:100",
+                                "content": "a fresh reply", "ts": self.stamp(3600)}))
+        self.path.write_text("\n".join(lines) + "\n")
+
+    def test_one_pass_drops_the_stale_head_and_delivers_the_fresh_reply(self):
+        self.write_log()
+        cursor = {"path": str(self.path), "offset": 0}
+        self.observer._drain_outbox(self.path, cursor)
+        self.assertIn("stale:stale-1", self.native.messages)
+        self.assertIn("dropped undelivered", self.native.messages["stale:stale-1"]["content"])
+        self.assertIn("delivery:fresh-1", self.native.messages)
+        self.assertEqual([p["parent_id"] for _, p in self.square.written], [100])
+        self.assertEqual(self.store.get("outbox:cursor")["offset"], self.path.stat().st_size)
+
+    def test_pass_is_bounded_by_bytes_and_resumes_from_the_cursor(self):
+        import custos_observe
+        self.write_log()
+        with mock.patch.object(custos_observe, "DRAIN_MAX_BYTES", 20000):
+            cursor = {"path": str(self.path), "offset": 0}
+            self.observer._drain_outbox(self.path, cursor)
+            self.assertNotIn("delivery:fresh-1", self.native.messages)
+            first = self.store.get("outbox:cursor")["offset"]
+            self.assertLess(first, self.path.stat().st_size)
+        self.observer._drain_outbox(self.path, dict(self.store.get("outbox:cursor")))
+        self.assertIn("delivery:fresh-1", self.native.messages)
+        self.assertEqual(self.store.get("outbox:cursor")["offset"], self.path.stat().st_size)
+
 if __name__ == "__main__":
     unittest.main()
