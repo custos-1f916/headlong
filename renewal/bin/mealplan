@@ -264,12 +264,13 @@ def main():
             r = call("POST", "/shopper/orders/sync", {}); print(f"synced {r['count']} orders from {r['customer']}'s account at {r['synced_at']}")
         if a.products:
             for x in call("GET", "/shopper/orders", params={"products": "1"}):
-                print(f"  - {x['asin']}  {x.get('name') or ''}  in {x['orders']} orders, {x['units']} units")
+                print(f"  - {x['asin']}  {x.get('brand') or ''} | {x.get('name') or ''}  in {x['orders']} orders, {x['units']} units, last {x.get('last') or '?'}")
         else:
-            r = call("GET", "/shopper/orders")
-            print(f"{r.get('count', 0)} past orders on {r.get('customer') or '?'}'s account (synced {r.get('synced_at') or 'never'})")
+            r = call("GET", "/shopper/orders", params={"limit": str(a.n if a.n != 10 else 100)})
+            sp = r.get("span") or {}
+            print(f"{r.get('count', 0)} past orders on {r.get('customer') or '?'}'s account, {sp.get('from')} → {sp.get('to')} (synced {r.get('synced_at') or 'never'})")
             for o in r.get("orders", []):
-                print(f"  - {o.get('date') or '?'}  {o.get('status') or ''}  {o.get('program') or ''}  total {o.get('total') or '?'}  {o.get('item_count') or 0} items: " + ", ".join(o.get("items", [])[:12]))
+                print(f"  - {o.get('date') or '?'}  {o.get('source') or ''}  ${o.get('total') or '?'}  {o.get('item_count') or 0} items: " + ", ".join(o.get("items", [])[:14]))
     elif a.cmd == "constraint":
         show_prefs(call("POST", "/prefs/set", {"key": a.sub, "value": a.arg}))
     elif a.cmd == "cooked":
