@@ -169,6 +169,155 @@ class MemoryTests(MemoryFixture):
         self.assertIn("updated:", item[1])
 
 
+class PersonAliasRemoveTests(MemoryFixture):
+    def create_person(self):
+        people = cm.People(self.store)
+        person_id = people.save("hal", "Hal", {"aliases": ["Ryan", "H"],
+                                                "notes": "Hal is my operator."}, "signal:hal")
+        return people, person_id
+
+    def test_person_alias_remove_is_exact_audited_and_preserves_person(self):
+        people, person_id = self.create_person()
+        before = people.find("hal")[0][0].read_bytes()
+        archive = self.root / "dream" / "operator-cleanup" / "changes"
+
+        no_op = people.remove_alias(person_id, "ryan")
+        self.assertEqual(no_op, {"person_id": person_id, "alias": "ryan", "removed": False,
+                                 "unchanged": True, "preimage": None})
+        self.assertEqual(people.find("hal")[0][0].read_bytes(), before)
+        self.assertFalse(archive.exists())
+
+        result = people.remove_alias(person_id, "Ryan")
+        self.assertTrue(result["removed"])
+        self.assertFalse(result["unchanged"])
+        self.assertEqual(result["person_id"], person_id)
+        preimage = Path(result["preimage"])
+        self.assertTrue(preimage.is_file())
+        self.assertEqual(preimage.read_bytes(), before)
+        _, meta, notes = people.find("hal")
+        self.assertEqual(meta["display"], "Hal")
+        self.assertEqual(meta["person_key"], "hal")
+        self.assertEqual(meta["aliases"], ["H"])
+        self.assertEqual(meta["routes"], ["signal:hal"])
+        self.assertEqual(notes, "Hal is my operator.")
+
+    def test_person_alias_remove_cli_and_invalid_targets(self):
+        people, person_id = self.create_person()
+        completed = subprocess.run(
+            [sys.executable, cm.__file__, "person-alias-remove", person_id, "Ryan"],
+            text=True, capture_output=True, timeout=10, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout)["removed"], True)
+        self.assertEqual(people.find("hal")[1]["aliases"], ["H"])
+
+        with self.assertRaisesRegex(cm.MemoryError, "full native eight-hex ID"):
+            people.remove_alias("not-an-id", "H")
+        with self.assertRaises(cm.InvalidInput):
+            people.remove_alias(person_id, "")
+        nonperson = self.store.commit("ordinary note", memory_type="note")
+        with self.assertRaisesRegex(cm.MemoryError, "not a person record"):
+            people.remove_alias(nonperson, "H")
+        item = self.store.find(person_id)
+        with mock.patch.object(self.store, "files", return_value=[item, item]):
+            with self.assertRaisesRegex(cm.MemoryError, "ambiguous"):
+                people.remove_alias(person_id, "H")
+
+    def test_repeated_removal_is_byte_for_byte_noop_without_new_preimage(self):
+        people, person_id = self.create_person()
+        first = people.remove_alias(person_id, "Ryan")
+        after_first = people.find("hal")[0][0].read_bytes()
+        archive = self.root / "dream" / "operator-cleanup" / "changes"
+        preimages = sorted(archive.glob("*.before.md"))
+
+        second = people.remove_alias(person_id, "Ryan")
+
+        self.assertEqual(second, {"person_id": person_id, "alias": "Ryan", "removed": False,
+                                  "unchanged": True, "preimage": None})
+        self.assertEqual(people.find("hal")[0][0].read_bytes(), after_first)
+        self.assertEqual(sorted(archive.glob("*.before.md")), preimages)
+        self.assertEqual(first["preimage"], str(preimages[0]))
+
+    def test_removal_by_exact_id_does_not_change_other_same_key_person(self):
+        people, selected_id = self.create_person()
+        other_id = self.store.commit(
+            "Person: Hal duplicate\n\nSeparate native note." + cm.PERSON_MARKER + cm.encode({
+                "person_key": "hal", "display": "Hal duplicate", "aliases": ["Ryan", "Other"],
+                "routes": ["signal:other"], "updated": "2020-01-01T00:00:00+00:00"}),
+            memory_type="person")
+        other_before = self.store.find(other_id)[0].read_bytes()
+
+        people.remove_alias(selected_id, "Ryan")
+
+        selected = self.store.find(selected_id)
+        other = self.store.find(other_id)
+        self.assertEqual(people.parse(selected)[1]["aliases"], ["H"])
+        self.assertEqual(other[0].read_bytes(), other_before)
+        self.assertEqual(people.parse(other)[1]["aliases"], ["Ryan", "Other"])
+
+    def test_removal_preserves_extra_metadata_and_multiline_prose(self):
+        people = cm.People(self.store)
+        metadata = {
+            "person_key": "hal", "display": "Hal", "aliases": ["Ryan", "H"],
+            "routes": ["signal:hal", "matrix:hal"], "updated": "2020-01-01T00:00:00+00:00",
+            "custom": {"source": "operator", "labels": ["trusted", "long-term"]},
+            "score": 7,
+        }
+        prose = "First paragraph survives.\n\nSecond paragraph has several lines.\nStill here."
+        person_id = self.store.commit(
+            "Person: Hal\n\n" + prose + cm.PERSON_MARKER + cm.encode(metadata),
+            memory_type="person")
+
+        self.assertEqual(people.parse(self.store.find(person_id))[2], prose)
+        people.remove_alias(person_id, "Ryan")
+
+        parsed = people.parse(self.store.find(person_id))
+        self.assertEqual(parsed[1]["display"], "Hal")
+        self.assertEqual(parsed[1]["person_key"], "hal")
+        self.assertEqual(parsed[1]["routes"], ["signal:hal", "matrix:hal"])
+        self.assertEqual(parsed[1]["aliases"], ["H"])
+        self.assertEqual(parsed[1]["custom"], metadata["custom"])
+        self.assertEqual(parsed[1]["score"], 7)
+        self.assertEqual(parsed[2], prose)
+
+    def test_nonexistent_and_corrupt_records_fail_closed_without_changes(self):
+        people, person_id = self.create_person()
+        person_path = self.store.find(person_id)[0]
+        archive = self.root / "dream" / "operator-cleanup" / "changes"
+        before = person_path.read_bytes()
+
+        with self.assertRaisesRegex(cm.MemoryError, "is missing"):
+            people.remove_alias("deadbeef", "Ryan")
+        self.assertEqual(person_path.read_bytes(), before)
+        self.assertFalse(archive.exists())
+
+        person_path.write_text(
+            person_path.read_text(encoding="utf-8").rsplit(cm.PERSON_MARKER, 1)[0]
+            + cm.PERSON_MARKER + "{not valid json",
+            encoding="utf-8")
+        corrupt_before = person_path.read_bytes()
+        with self.assertRaisesRegex(cm.MemoryError, "not a valid person note"):
+            people.remove_alias(person_id, "Ryan")
+        self.assertEqual(person_path.read_bytes(), corrupt_before)
+        self.assertFalse(archive.exists())
+
+    def test_person_alias_remove_propagates_archive_and_commit_failures(self):
+        people, person_id = self.create_person()
+        before = people.find("hal")[0][0].read_bytes()
+        with mock.patch.object(Path, "write_text", side_effect=OSError("injected archive failure")):
+            with self.assertRaisesRegex(OSError, "injected archive failure"):
+                people.remove_alias(person_id, "Ryan")
+        self.assertEqual(people.find("hal")[0][0].read_bytes(), before)
+
+        with mock.patch.object(self.store, "commit", side_effect=cm.MemoryError("injected commit failure")):
+            with self.assertRaisesRegex(cm.MemoryError, "injected commit failure"):
+                people.remove_alias(person_id, "Ryan")
+        self.assertEqual(people.find("hal")[0][0].read_bytes(), before)
+        archived = list((self.root / "dream" / "operator-cleanup" / "changes").glob("*.before.md"))
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(archived[0].read_bytes(), before)
+
+
 class ResponderTests(MemoryFixture):
     def setUp(self):
         super().setUp()
@@ -616,7 +765,15 @@ class ResponderTests(MemoryFixture):
             cm.response(self.store, self.request)
         found = cm.People(self.store).find("hal")
         self.assertEqual(found[1]["display"], "Hal")
-        self.assertIn("Ryan", found[1]["aliases"])  # the proposed name is kept, as an alias
+        self.assertNotIn("Ryan", found[1]["aliases"])
+        self.assertNotIn("(also: Ryan)", cm.People(self.store).prompt("hal", "Hal"))
+        # An alias remains supported when it is explicitly proposed as an alias,
+        # rather than inferred from a conflicting proposed display.
+        cm.People(self.store).save("hal", "Hal", {"display": "Ryan", "aliases": ["H"],
+                                                   "notes": "Hal is my operator."}, "hal")
+        prompt = cm.People(self.store).prompt("hal", "Hal")
+        self.assertEqual(cm.People(self.store).find("hal")[1]["aliases"], ["H"])
+        self.assertNotIn("Ryan", prompt)
         self.assertEqual(len([i for i in self.store.files() if i[3].get("type") == "person"]), 1)
 
     def test_at_most_two_memories_per_reply_and_malformed_ones_are_dropped(self):
