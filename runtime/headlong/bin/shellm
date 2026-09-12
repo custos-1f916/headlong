@@ -1771,38 +1771,74 @@ extract_code() {
     truncation_file=$(mktemp)
     local code
     code=$(printf '%s\n' "$response" | awk -v sq="'" '
-        # ── try_open_heredoc: inspect a line for <<[-]DELIM and push delimiter
-        function try_open_heredoc(line,    rest, delim) {
-            if (!match(line, /<<-?/)) return
-            rest = substr(line, RSTART + RLENGTH)
-            sub(/^[[:space:]]*/, "", rest)
-            if (substr(rest, 1, 1) == "\"") {
-                # <<"DELIM"
-                sub(/^"/, "", rest)
-                if (match(rest, /^[^"]+/)) {
-                    hd_stack[++hd_top] = substr(rest, 1, RLENGTH)
+        # ── try_open_heredocs: queue supported redirections in source order.
+        # This is deliberately not a Bash parser: it does not distinguish
+        # operators in shell strings/comments or parse every shell-word form.
+        # It does, however, never scans heredoc bodies as shell syntax.
+        function queue_heredoc(delim, strip_tabs) {
+            hd_delim[++hd_tail] = delim
+            hd_tabs[hd_tail] = strip_tabs
+        }
+
+        function try_open_heredocs(line,    pos, start, after, rest, ch, closing, delim, strip_tabs, found) {
+            pos = 1
+            while (pos <= length(line)) {
+                rest = substr(line, pos)
+                if (!match(rest, /<</)) return
+                start = pos + RSTART - 1
+                after = start + 2
+
+                # A here-string begins <<H and has no body delimiter.
+                if (substr(line, after, 1) == "<") {
+                    pos = after + 1
+                    continue
                 }
-            } else if (substr(rest, 1, 1) == sq) {
-                # <<'DELIM' — use string pattern since sq cant go in //
-                sub("^" sq, "", rest)
-                if (match(rest, "^[^" sq "]+")) {
-                    hd_stack[++hd_top] = substr(rest, 1, RLENGTH)
+
+                strip_tabs = 0
+                if (substr(line, after, 1) == "-") {
+                    strip_tabs = 1
+                    after++
                 }
-            } else if (substr(rest, 1, 1) == "\\") {
-                # <<\DELIM
-                sub(/^\\/, "", rest)
-                if (match(rest, /^[A-Za-z_][A-Za-z_0-9]*/)) {
-                    hd_stack[++hd_top] = substr(rest, 1, RLENGTH)
+                while (substr(line, after, 1) ~ /[[:space:]]/) after++
+
+                ch = substr(line, after, 1)
+                delim = ""
+                found = 0
+                if (ch == "\"") {
+                    rest = substr(line, after + 1)
+                    closing = index(rest, "\"")
+                    if (!closing) return
+                    delim = substr(rest, 1, closing - 1)
+                    found = 1
+                    pos = after + closing + 1
+                } else if (ch == sq) {
+                    rest = substr(line, after + 1)
+                    closing = index(rest, sq)
+                    if (!closing) return
+                    delim = substr(rest, 1, closing - 1)
+                    found = 1
+                    pos = after + closing + 1
+                } else if (ch == "\\") {
+                    rest = substr(line, after + 1)
+                    if (match(rest, /^[A-Za-z_][A-Za-z_0-9]*/)) {
+                        delim = substr(rest, 1, RLENGTH)
+                        found = 1
+                        pos = after + RLENGTH + 1
+                    } else {
+                        pos = after + 1
+                    }
+                } else if (match(substr(line, after), /^[A-Za-z_][A-Za-z_0-9]*/)) {
+                    delim = substr(line, after, RLENGTH)
+                    found = 1
+                    pos = after + RLENGTH
+                } else {
+                    pos = after + 1
                 }
-            } else {
-                # <<DELIM (unquoted)
-                if (match(rest, /^[A-Za-z_][A-Za-z_0-9]*/)) {
-                    hd_stack[++hd_top] = substr(rest, 1, RLENGTH)
-                }
+                if (found) queue_heredoc(delim, strip_tabs)
             }
         }
 
-        BEGIN { in_block = 0; hd_top = 0; first_block_closed = 0 }
+        BEGIN { in_block = 0; hd_head = 1; hd_tail = 0; tab = sprintf("\t"); first_block_closed = 0 }
 
         # After first block closed: look for another opening fence. A tagged
         # ```bash/```sh fence may be appended to the end of a prose line (see
@@ -1834,26 +1870,35 @@ extract_code() {
 
         # Inside the code block
         in_block {
-            # Check for heredoc close (delimiter alone on its own line)
-            if (hd_top > 0) {
-                stripped = $0
-                gsub(/^[[:space:]]+/, "", stripped)
-                gsub(/[[:space:]]+$/, "", stripped)
-                if (stripped == hd_stack[hd_top]) {
-                    hd_top--
+            # A body is data, including text that resembles a redirection or
+            # Markdown fence. Bash consumes multiple bodies FIFO, not LIFO.
+            if (hd_head <= hd_tail) {
+                candidate = $0
+                if (hd_tabs[hd_head]) {
+                    while (substr(candidate, 1, 1) == tab) candidate = substr(candidate, 2)
                 }
+                if (candidate == hd_delim[hd_head]) {
+                    delete hd_delim[hd_head]
+                    delete hd_tabs[hd_head]
+                    hd_head++
+                    if (hd_head > hd_tail) {
+                        hd_head = 1
+                        hd_tail = 0
+                    }
+                }
+                print
+                next
             }
 
-            # A bare ``` only closes the fence when no heredoc is open
-            if ($0 ~ /^```[[:space:]]*$/ && hd_top == 0) {
+            # A bare ``` only closes the fence when no heredoc is open.
+            if ($0 ~ /^```[[:space:]]*$/) {
                 in_block = 0
                 first_block_closed = 1
                 next
             }
 
-            # Track heredoc opens inside the code we are collecting
-            try_open_heredoc($0)
-
+            # Queue every supported opener on a command line in source order.
+            try_open_heredocs($0)
             print
         }
     ' 2>"$truncation_file")
