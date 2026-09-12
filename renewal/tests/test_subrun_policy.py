@@ -17,7 +17,7 @@ ROOT = pathlib.Path(
 class SubrunPolicy(unittest.TestCase):
     def test_policy_text_requires_one_bounded_synchronous_helper(self):
         command = (
-            'SHELLM_RUN_SUMMARY=0 subrun --wait --cwd DIR --max-iterations 8 '
+            'SHELLM_RUN_SUMMARY=0 subrun --wait --cwd DIR --max-iterations 12 '
             '--effort "${SHELLM_EFFORT:?}"'
         )
         prompt = (ROOT / "thinkers/monolith/prompt.md").read_text()

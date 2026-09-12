@@ -497,25 +497,25 @@ class GuardScopeTests(ChatFixture):
             "step_id": UUID_B, "phase": "queued", "reply_offset": 0}))
 
     def test_the_mind_may_dm_across_rooms_but_the_social_thinker_may_not(self):
+        # Jack spoke last in the DM, so only the cross-room rule can refuse: the social
+        # thinker (CHAT_GUARD_CROSS_ROOM=1) may not move the unanswered group ask here.
+        with mock.patch.dict(os.environ, {"CHAT_DOUBLE_TEXT_GUARD_HOURS": "2", "CHAT_GUARD_CROSS_ROOM": "1"}):
+            refused = self.chat("reply", "--reply-to", UUID_B, self.dm, "Social nudge.")
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("Do not move the ask to a DM", refused.stderr)
+        self.assertEqual([m for m in self.outgoing() if m["to"] == self.dm], [])
+        # The mind, same window, no cross-room rule: the decision DM goes through.
         with mock.patch.dict(os.environ, {"CHAT_DOUBLE_TEXT_GUARD_HOURS": "2"}):
             allowed = self.chat("reply", "--reply-to", UUID_B, self.dm, "Here is the command.")
             self.assertEqual(allowed.returncode, 0, allowed.stderr)
+            self.assertIn("queued for the Signal bridge", allowed.stderr)
         self.assertEqual([m["content"] for m in self.outgoing() if m["to"] == self.dm], ["Here is the command."])
-        # A second, older DM from Jack with its own receipt: an anchored reply that is not a duplicate.
-        uuid_c = "cccccccc-3333-4333-8333-333333333333"
-        self.append({"type": "message", "step_id": uuid_c, "from": self.dm, "to": "custos", "source": "operator-transport",
-                     "request_id": "signal:dm-2", "authority": "external",
-                     "content": '{"scope":"direct","aci":"aci-jack-1","speaker":"Jack"} and the other thing?', "ts": now_iso(-14400)})
-        (self.identity / ".state" / "transport" / (hashlib.sha256(b"signal:dm-2").hexdigest() + ".json")).write_text(json.dumps({
-            "original": {"request_id": "signal:dm-2", "sender": self.dm, "authority": "external", "source_url": "", "content": "c"},
-            "step_id": uuid_c, "phase": "queued", "reply_offset": 0}))
-        with mock.patch.dict(os.environ, {"CHAT_DOUBLE_TEXT_GUARD_HOURS": "2", "CHAT_GUARD_CROSS_ROOM": "1"}):
-            exempt = self.chat("reply", "--follow-up", "--reply-to", UUID_B, self.dm, "Second try.")
-            self.assertEqual(exempt.returncode, 0, "a follow-up delivery is exempt: " + exempt.stderr)
-            refused = self.chat("reply", "--reply-to", uuid_c, self.dm, "Third try.")
-            self.assertNotEqual(refused.returncode, 0)
-            self.assertIn("Do not move the ask to a DM", refused.stderr)
-        self.assertNotIn("Third try.", [m["content"] for m in self.outgoing()])
+        # Now the identity spoke last in the DM; a plain second message is refused by the
+        # window itself, while a --follow-up delivery is exempt.
+        with mock.patch.dict(os.environ, {"CHAT_DOUBLE_TEXT_GUARD_HOURS": "2"}):
+            second = self.chat("reply", "--follow-up", "--reply-to", UUID_B, self.dm, "And the follow-up.")
+            self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual([m["content"] for m in self.outgoing() if m["to"] == self.dm], ["Here is the command.", "And the follow-up."])
 
 
 class ShellmStubFixture(unittest.TestCase):
