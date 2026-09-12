@@ -16,7 +16,7 @@ import urllib.error
 import uuid
 import xml.etree.ElementTree as ET
 
-from custos_square import APIError, ORIGIN, STATE, SECRET, Square, Store, allowance_summary, canonical, digest, note_allowance, public_request, square_queue, MAX_AGE_HOURS
+from custos_square import APIError, ORIGIN, STATE, SECRET, Square, Store, allowance_summary, canonical, digest, note_allowance, public_request, square_queue, read_native_line, MAX_AGE_HOURS
 
 # Outbox drain bounds per pass (see Observer._drain_outbox).
 DRAIN_SECONDS = float(os.environ.get("CUSTOS_OUTBOX_DRAIN_SECONDS", "20"))
@@ -569,14 +569,21 @@ class Observer:
         with path.open("rb") as source:
             source.seek(cursor["offset"])
             while scanned < DRAIN_MAX_BYTES and time.monotonic() < deadline:
-                line = source.readline(128 * 1024)
-                if not line:
+                start = source.tell()
+                line, status = read_native_line(source)
+                if status in ("eof", "partial"):
                     break
-                scanned += len(line)
-                if not line.endswith(b"\n"):
-                    if len(line) == 128 * 1024:
-                        raise APIError("outbox_native_line_too_large")
-                    break
+                scanned += source.tell() - start
+                if status == "oversized":
+                    # A line longer than any square message (a reasoning or output
+                    # step) is stepped over, once, out loud; it used to stop the
+                    # source with outbox_native_line_too_large and freeze every reply
+                    # behind it (2026-09-12: 19 replies, eleven hours, counter at 0).
+                    self.native.append("oversized:%d" % start, {"type": "observation", "source": "square-outbox",
+                                       "content": "Square outbox stepped over a %d-byte trajectory line at offset %d (longer than any square message; a reasoning or output step). Delivery continues past it." % (source.tell() - start, start)})
+                    cursor["offset"] = source.tell()
+                    self.store.put("outbox:cursor", cursor)
+                    continue
                 row = json.loads(line)
                 if row.get("type") == "message" and row.get("from") == "custos" and str(row.get("to", "")).startswith("square:"):
                     match = re.fullmatch(r"square:([A-Za-z0-9_-]{2,32}):([1-9][0-9]*):(0|[1-9][0-9]*)", row["to"])

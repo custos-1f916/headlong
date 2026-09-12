@@ -111,7 +111,9 @@ fi
 
 trap 'rm -f "$prompt_file"' EXIT
 set +e
-shellm "${args[@]}" | tee -a "$report"
+# Synchronous: the parent reads the report in this very step, so the child's
+# merge step is stamped sync:true and does not wake the parent thinker again.
+SHELLM_SYNC_CHILD=1 shellm "${args[@]}" | tee -a "$report"
 rc=${PIPESTATUS[0]}
 set -e
 printf '\n# state: exited rc=%s at %s\n' "$rc" "$(date -u +%FT%TZ)" >> "$report"

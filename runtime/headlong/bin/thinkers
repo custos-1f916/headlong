@@ -779,6 +779,17 @@ _start_dispatcher() {
 
             if [[ -z "$_step_type" ]]; then continue; fi
 
+            # A merge from a synchronous child (`subrun --wait`, sync:true) was
+            # consumed by the parent's own block; waking the thinker for it again
+            # only re-reads the report (2026-09-12: 53 merges, 41 extra wakes).
+            if [[ "$_step_type" == "merge" ]]; then
+                _step_sync=$(printf '%s' "$_step_json" | jq -r 'if .sync == true or .sync == "true" then "1" else "" end' 2>/dev/null) || _step_sync=""
+                if [[ "$_step_sync" == "1" ]]; then
+                    printf '%s [dispatcher]   skip merge (synchronous child, consumed by its parent)\n' "$(date -u +%FT%TZ)" >&2
+                    continue
+                fi
+            fi
+
             printf '%s [dispatcher] step: type=%s source=%s\n' "$(date -u +%FT%TZ)" "$_step_type" "$_step_source" >&2
 
             # Find matching thinkers by scanning sub_map

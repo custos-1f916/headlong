@@ -66,6 +66,9 @@ correlation and reactions remain intact:
   `social-policy.json` (default 2; 0 disables). Inside it, `chat` and
   `custos-actions signal-send` refuse a second unanswered message to the same
   conversation, except a `--follow-up` that delivers what an earlier reply promised.
+  The window is per conversation: an unanswered line of yours in the group does not
+  block a DM to Hal (he asked to be DM'd for decisions). Only the social thinker also
+  refuses moving an unanswered group ask into a DM with someone from that room.
   A scheduled message (the Friday confirmation) is fine after the window; a re-nudge
   inside it is not.
 

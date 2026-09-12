@@ -319,6 +319,39 @@ def allowance_summary(store, now=None):
             "queued": queued, "queued_oldest": oldest}
 
 
+NATIVE_LINE_CAP = 128 * 1024
+
+
+def read_native_line(source, cap=NATIVE_LINE_CAP):
+    """One trajectory line from a binary file positioned at a line start.
+
+    Returns (line, status): "line" with the bytes; "eof" at the end of the file;
+    "partial" when the last line is still being written (the position is put back
+    to its start so the caller resumes there); "oversized" when a line longer than
+    `cap` was stepped over whole (line is b"" and the position is past its newline).
+    A square message can never exceed the cap (MAX_TEXT is 12 KB), so an oversized
+    line is a reasoning or output step and only needs stepping over. On 2026-09-12 a
+    216 KB Qwen reasoning step froze the outbox cursor for eleven hours: every reply
+    composed behind it was undelivered while the queue counter, which broke on the
+    same line, said zero."""
+    start = source.tell()
+    line = source.readline(cap)
+    if not line:
+        return b"", "eof"
+    if line.endswith(b"\n"):
+        return line, "line"
+    if len(line) < cap:
+        source.seek(start)
+        return b"", "partial"
+    while True:
+        chunk = source.readline(cap)
+        if not chunk:
+            source.seek(start)
+            return b"", "partial"
+        if chunk.endswith(b"\n"):
+            return b"", "oversized"
+
+
 def square_queue(store, path=None):
     """Custos's square replies recorded in the trajectory past the outbox cursor:
     composed, not yet delivered, not withdrawn. Oldest first; [] when unknown."""
@@ -335,9 +368,11 @@ def square_queue(store, path=None):
             while True:
                 # Bounded by the file, not a line count: the cursor can sit tens of
                 # megabytes behind the head while replies wait for the allowance.
-                line = probe.readline(128 * 1024)
-                if not line or not line.endswith(b"\n"):
+                line, status = read_native_line(probe)
+                if status in ("eof", "partial"):
                     break
+                if status == "oversized":
+                    continue
                 try:
                     row = json.loads(line)
                 except ValueError:

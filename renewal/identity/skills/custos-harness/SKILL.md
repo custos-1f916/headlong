@@ -100,11 +100,14 @@ mid-task dies with it, and the parent's next wake starts the task over (the PDF-
 - When the maintenance flag appears, the monolith run gets **one more block** and a feedback
   step telling it to write a scratchpad note (`custos-memory note GOAL_ID "…"`) with its files,
   next command and any sub-run id. Use that block for exactly that.
+- A helper is told when it is on its last iteration and asked for its FINAL then; a helper
+  that still ends without one is not evidence. Its FINAL that names the tests it ran and
+  quotes the result is: spot-check one thing, do not re-run the suite every wake.
 - Generic `subrun` behavior remains: `--max-iterations` above 12 automatically **detaches**
   and prints a report path. That behavior is not permitted for Custos's inference: do not use
   automatic detachment, `--detach`, background model workers, or a fallback route. Run exactly
   one bounded synchronous helper at a time, suppressing its competing summary worker:
-  `SHELLM_RUN_SUMMARY=0 subrun --wait --cwd DIR --max-iterations 8 --effort "${SHELLM_EFFORT:?}" "precise task: files, behaviour, how to test" > /tmp/subrun-NAME.txt 2>&1`.
+  `SHELLM_RUN_SUMMARY=0 subrun --wait --cwd DIR --max-iterations 12 --effort "${SHELLM_EFFORT:?}" "precise task: files, behaviour, how to test" > /tmp/subrun-NAME.txt 2>&1`.
   Retain the helper output in this action and hand off unfinished work precisely; do not make
   reading a detached model-worker report later Custos's normal workflow. Sub-runs see command
   output whole up to 24 KB, so read a file once, then write.

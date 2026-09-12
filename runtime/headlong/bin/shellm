@@ -75,6 +75,14 @@ if [[ -z "${SHELLM_MODEL:-}" ]]; then
     fi
 fi
 SHELLM_MAX_ITERATIONS="${SHELLM_MAX_ITERATIONS:-}"
+
+# A child run started by `subrun --wait` finishes inside its parent's block: the
+# parent reads the report in the same step. Its merge step is stamped sync:true
+# so the dispatcher does not wake the parent thinker again for it (2026-09-12:
+# 53 synchronous merges → 41 extra monolith wakes, 43 % of the day's inference).
+_shellm_sync_child_flag() {
+    if [[ "${SHELLM_SYNC_CHILD:-}" == "1" ]]; then printf 'true'; else printf 'false'; fi
+}
 # Spin/stall guard: abort a run that is failing without making progress instead
 # of looping forever (a malformed model whose output cannot be turned into a
 # working command burns tokens and inflates context until something else kills
@@ -2705,6 +2713,15 @@ run_loop() {
         else
             iter_label="$iteration"
         fi
+        # The last iteration is announced, so a bounded run ends with a report
+        # instead of "(max iterations reached)": 24 of 55 helper runs on
+        # 2026-09-12 hit their bound silently and the parent re-verified everything.
+        if [[ -n "$SHELLM_MAX_ITERATIONS" && "$SHELLM_MAX_ITERATIONS" -gt 1 && "$iteration" -eq "$SHELLM_MAX_ITERATIONS" ]]; then
+            printf '%s' "$(jq -nc --arg run_id "$_run_step_id" \
+                --arg content "[shellm: this is your LAST iteration ($iter_label). End this block with FINAL=\"…\": what you changed, what you ran and its exact result, what is left. Without it the run ends with no report.]" \
+                '{type:"feedback",content:$content,run_id:$run_id}')" \
+                | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null 2>/dev/null || true
+        fi
         debug "=== Iteration $iter_label ==="
         [[ "$QUIET" -eq 0 ]] && echo >&2
         progress "Iteration $iter_label — calling $SHELLM_MODEL..."
@@ -3188,7 +3205,8 @@ exit \$__shellm_rc
                     --arg from_traj "$_run_traj_id" \
                     --arg from_step "${_last_step_id:-}" \
                     --arg from_traj_ref "$_from_traj_ref" \
-                    '{type:"merge", content:$content, from_traj:$from_traj, from_step:$from_step, from_traj_ref:$from_traj_ref}' \
+                    --argjson sync "$(_shellm_sync_child_flag)" \
+                    '{type:"merge", content:$content, from_traj:$from_traj, from_step:$from_step, from_traj_ref:$from_traj_ref} + (if $sync then {sync:true} else {} end)' \
                     | traj append --traj_dir "$_run_traj_dir" "$_SHELLM_PARENT_TRAJ_ID" >/dev/null 2>/dev/null || true
             fi
             return 0
@@ -3232,7 +3250,8 @@ exit \$__shellm_rc
                     jq -nc \
                         --arg content "(stalled: $_stall)" \
                         --arg from_traj "$_run_traj_id" \
-                        '{type:"merge", content:$content, from_traj:$from_traj}' \
+                        --argjson sync "$(_shellm_sync_child_flag)" \
+                        '{type:"merge", content:$content, from_traj:$from_traj} + (if $sync then {sync:true} else {} end)' \
                         | traj append --traj_dir "$_run_traj_dir" "$_SHELLM_PARENT_TRAJ_ID" >/dev/null 2>/dev/null || true
                 fi
                 return 1
@@ -3254,7 +3273,8 @@ exit \$__shellm_rc
             --arg from_traj "$_run_traj_id" \
             --arg from_step "${_last_step_id:-}" \
             --arg from_traj_ref "$_from_traj_ref" \
-            '{type:"merge", content:$content, from_traj:$from_traj, from_step:$from_step, from_traj_ref:$from_traj_ref}' \
+            --argjson sync "$(_shellm_sync_child_flag)" \
+            '{type:"merge", content:$content, from_traj:$from_traj, from_step:$from_step, from_traj_ref:$from_traj_ref} + (if $sync then {sync:true} else {} end)' \
             | traj append --traj_dir "$_run_traj_dir" "$_SHELLM_PARENT_TRAJ_ID" >/dev/null 2>/dev/null || true
     fi
     return 1

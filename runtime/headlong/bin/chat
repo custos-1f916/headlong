@@ -69,6 +69,7 @@ _DOUBLE_TEXT_JQ='
   | ($conv | last) as $last
   | if $last != null and $last.from == $me and ($now - ($last | secs)) < ($h * 3600) then
       "you spoke last in this conversation (\(ago($last | secs; $now)) ago) and nobody has answered. Do not add a second message and do not move the ask to another channel; wait for a reply or \($h)h, or leave it."
+    elif $cross != 1 then empty
     else
       ([$m[] | select(.from == $to and .to == $me) | aci | select(. != "")] | last // "") as $to_aci
       | if $to_aci == "" then empty else
@@ -84,8 +85,15 @@ _DOUBLE_TEXT_JQ='
         end
     end'
 
+# The second rule (an unanswered group ask must not be moved into a DM with
+# someone from that room) is the social thinker's: it exports
+# CHAT_GUARD_CROSS_ROOM=1. The mind's window (CHAT_DOUBLE_TEXT_GUARD_HOURS set by
+# the monolith step) covers the same conversation only: on 2026-09-12 it refused
+# a decision DM to Hal because a 72-minute-old ambient line to Jack in the group
+# was unanswered, and Hal had asked to be DM'd for decisions.
 _double_text_guard() {
-    local to="$1" me="${IDENTITY_NAME:-}" hours="${CHAT_DOUBLE_TEXT_GUARD_HOURS:-}"
+    local to="$1" me="${IDENTITY_NAME:-}" hours="${CHAT_DOUBLE_TEXT_GUARD_HOURS:-}" cross=0
+    [[ "${CHAT_GUARD_CROSS_ROOM:-}" == "1" ]] && cross=1
     if [[ -n "${CHAT_SOCIAL_BLOCKED:-}" ]]; then
         die "$CHAT_SOCIAL_BLOCKED"
     fi
@@ -96,7 +104,7 @@ _double_text_guard() {
     idx="$(dirname "$tf")/messages.jsonl"
     _index_update "$tf" "$idx" 2>/dev/null || true
     [[ -f "$idx" ]] || return 0
-    verdict=$(tail -n 4000 -- "$idx" | jq -Rrn --arg me "$me" --arg to "$to" --argjson h "$hours" "$_DOUBLE_TEXT_JQ" 2>/dev/null) || return 0
+    verdict=$(tail -n 4000 -- "$idx" | jq -Rrn --arg me "$me" --arg to "$to" --argjson h "$hours" --argjson cross "$cross" "$_DOUBLE_TEXT_JQ" 2>/dev/null) || return 0
     [[ -n "$verdict" ]] && die "not sent: $verdict"
     return 0
 }

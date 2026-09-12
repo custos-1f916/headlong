@@ -423,5 +423,185 @@ class OutboxDrainTests(unittest.TestCase):
         self.assertIn("delivery:fresh-1", self.native.messages)
         self.assertEqual(self.store.get("outbox:cursor")["offset"], self.path.stat().st_size)
 
+class OutboxOversizedLineTests(OutboxDrainTests):
+    """A trajectory line longer than the reader's cap is a reasoning or output
+    step, never a square message. It is stepped over, once, out loud; a line still
+    being written (no newline yet) is left for the next pass. On 2026-09-12 a
+    216 KB Qwen thought froze the cursor for eleven hours with 19 replies behind it
+    while square_queue, breaking on the same line, reported zero."""
+
+    def write_log_with_big_line(self):
+        lines = [cm.encode({"type": "trajectory", "step_id": "header"})]
+        lines.append(cm.encode({"type": "reasoning", "step_id": "big-1", "thought": "L" * (200 * 1024)}))
+        lines.append(cm.encode({"type": "message", "step_id": "fresh-1", "from": "custos", "to": "square:peer:10:100",
+                                "content": "a fresh reply", "ts": self.stamp(3600)}))
+        self.path.write_text("\n".join(lines) + "\n")
+
+    def test_drain_steps_over_an_oversized_line_and_square_queue_sees_past_it(self):
+        from custos_square import square_queue, read_native_line
+        self.write_log_with_big_line()
+        self.store.put("outbox:cursor", {"path": str(self.path), "offset": 0})
+        self.assertEqual([q["step_id"] for q in square_queue(self.store, self.path)], ["fresh-1"])
+        cursor = {"path": str(self.path), "offset": 0}
+        self.observer._drain_outbox(self.path, cursor)
+        self.assertIn("delivery:fresh-1", self.native.messages)
+        header_len = len(cm.encode({"type": "trajectory", "step_id": "header"})) + 1
+        self.assertIn("oversized:%d" % header_len, self.native.messages)
+        self.assertIn("stepped over a", self.native.messages["oversized:%d" % header_len]["content"])
+        self.assertEqual(self.store.get("outbox:cursor")["offset"], self.path.stat().st_size)
+        with self.path.open("rb") as source:
+            self.assertEqual(read_native_line(source)[1], "line")
+            self.assertEqual(read_native_line(source), (b"", "oversized"))
+            self.assertEqual(read_native_line(source)[1], "line")
+            self.assertEqual(read_native_line(source), (b"", "eof"))
+
+    def test_an_oversized_line_still_being_written_is_left_for_the_next_pass(self):
+        from custos_square import read_native_line
+        self.write_log_with_big_line()
+        end = self.path.stat().st_size
+        with self.path.open("ab") as handle:
+            handle.write(cm.encode({"type": "reasoning", "step_id": "big-2", "thought": "M" * (300 * 1024)})[:-1])  # no newline yet
+        cursor = {"path": str(self.path), "offset": 0}
+        self.observer._drain_outbox(self.path, cursor)
+        self.assertEqual(self.store.get("outbox:cursor")["offset"], end, "the cursor waits at the start of the unfinished line")
+        self.assertEqual([k for k in self.native.messages if k.startswith("oversized:")], ["oversized:%d" % (len(cm.encode({"type": "trajectory", "step_id": "header"})) + 1)])
+        with self.path.open("rb") as source:
+            source.seek(end)
+            self.assertEqual(read_native_line(source), (b"", "partial"))
+            self.assertEqual(source.tell(), end)
+
+
+class GuardScopeTests(ChatFixture):
+    """The cross-room rule (an unanswered group ask must not be moved into a DM
+    with someone from that room) belongs to the social thinker, which exports
+    CHAT_GUARD_CROSS_ROOM=1. The mind's window covers one conversation only."""
+
+    def setUp(self):
+        super().setUp()
+        self.group = "signal-ggggggggggggggggggggggg1"
+        self.dm = "signal-dddddddddddddddddddddddd1"
+        aci = '"aci":"aci-jack-1"'
+        # Jack in the group two hours ago, then our unanswered line to the group ten minutes ago.
+        self.append({"type": "message", "step_id": "g-in-1", "from": self.group, "to": "custos", "source": "operator-transport",
+                     "content": '{"scope":"group",' + aci + ',"speaker":"Jack"} what do you think?', "ts": now_iso(-7200)})
+        self.append({"type": "message", "step_id": "g-out-1", "from": "custos", "to": self.group, "source": "chat",
+                     "content": "I think it depends", "ts": now_iso(-600)})
+        # Jack's DM to us, three hours ago, with a transport receipt so the reply is bridge-deliverable.
+        self.append({"type": "message", "step_id": UUID_B, "from": self.dm, "to": "custos", "source": "operator-transport",
+                     "request_id": "signal:dm-1", "authority": "external",
+                     "content": '{"scope":"direct",' + aci + ',"speaker":"Jack"} can you send me the command?', "ts": now_iso(-10800)})
+        state = self.identity / ".state" / "transport"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / (hashlib.sha256(b"signal:dm-1").hexdigest() + ".json")).write_text(json.dumps({
+            "original": {"request_id": "signal:dm-1", "sender": self.dm, "authority": "external", "source_url": "", "content": "c"},
+            "step_id": UUID_B, "phase": "queued", "reply_offset": 0}))
+
+    def test_the_mind_may_dm_across_rooms_but_the_social_thinker_may_not(self):
+        with mock.patch.dict(os.environ, {"CHAT_DOUBLE_TEXT_GUARD_HOURS": "2"}):
+            allowed = self.chat("reply", "--reply-to", UUID_B, self.dm, "Here is the command.")
+            self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertEqual([m["content"] for m in self.outgoing() if m["to"] == self.dm], ["Here is the command."])
+        with mock.patch.dict(os.environ, {"CHAT_DOUBLE_TEXT_GUARD_HOURS": "2", "CHAT_GUARD_CROSS_ROOM": "1"}):
+            refused = self.chat("reply", "--follow-up", "--reply-to", UUID_B, self.dm, "Second try.")
+            self.assertEqual(refused.returncode, 0, "a follow-up delivery is exempt")
+            refused = self.chat("send", "--from", "custos", "--to", self.dm, "Third try.")
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("Do not move the ask to a DM", refused.stderr)
+
+
+class ShellmStubFixture(unittest.TestCase):
+    """The upstream llm stub (tests/test_inactivity_beacon.sh): shellm and every
+    nested shellm run out of a copy of bin/ whose llm answers from numbered
+    script files, so the stub stays in force at every level of nesting."""
+
+    def setUp(self):
+        import shutil, tempfile
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.work = Path(self.tempdir.name)
+        self.toolbin = self.work / "toolbin"
+        shutil.copytree(HEADLONG / "bin", self.toolbin)
+        (self.work / "script").mkdir(); (self.work / "home").mkdir(); (self.work / "wd").mkdir()
+        executable(self.toolbin / "llm", "#!/usr/bin/env bash\n"
+                   "for a in \"$@\"; do [[ \"$a\" == \"--thinking\" ]] && main_loop=1; done\n"
+                   "if [[ \"${main_loop:-0}\" -ne 1 ]]; then printf '{}\\n'; exit 0; fi\n"
+                   "n=$(( $(cat \"$LLM_COUNT\" 2>/dev/null || echo 0) + 1 ))\n"
+                   "printf '%s' \"$n\" > \"$LLM_COUNT\"\n"
+                   "if [[ -f \"$LLM_SCRIPT/$n\" ]]; then cat \"$LLM_SCRIPT/$n\"; else cat \"$LLM_SCRIPT/last\"; fi\n")
+        (self.work / "count").write_text("")
+        self.env = dict(os.environ, PATH=str(self.toolbin) + ":" + str(HEADLONG / "tools") + ":" + os.environ["PATH"],
+                        LLM_COUNT=str(self.work / "count"), LLM_SCRIPT=str(self.work / "script"), HOME=str(self.work / "home"),
+                        HEADLONG_HOME=str(self.work / "home" / ".headlong"), ANTHROPIC_API_KEY="test-key", SHELLM_MODEL="test-model",
+                        SHELLM_ENV="local", SHELLM_RUN_SUMMARY="0", TRAJ_DIR=str(self.work / "traj"))
+        for key in ("IDENTITY_DIR", "IDENTITY_NAME", "MEM_DIR", "TRAJ_ID", "ROOT_TRAJ_ID", "SHELLM_MAX_ITERATIONS", "SHELLM_SYNC_CHILD"):
+            self.env.pop(key, None)
+        (self.work / "traj").mkdir()
+
+    def fence(self, name, body):
+        (self.work / "script" / name).write_text("```bash\n" + body + "\n```\n")
+
+    def run_shellm(self, *args, timeout=240):
+        return subprocess.run([str(self.toolbin / "shellm"), "--workdir", str(self.work / "wd"), *args],
+                              cwd=str(self.work / "wd"), env=self.env, text=True, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+
+    def steps(self):
+        found = []
+        for tj in self.work.rglob("trajectory.jsonl"):
+            with tj.open() as handle:
+                for line in handle:
+                    try:
+                        found.append((tj, json.loads(line)))
+                    except ValueError:
+                        continue
+        return found
+
+
+class SynchronousHelperTests(ShellmStubFixture):
+    def test_wait_child_merge_is_stamped_sync_and_the_parent_reads_the_report(self):
+        self.fence("1", 'subrun --wait --max-iterations 2 "sub task" > sub.txt 2>&1; echo "sub done"; cat sub.txt')
+        self.fence("2", "FINAL=sub-answer")
+        self.fence("last", "FINAL=done")
+        result = self.run_shellm("--max-iterations", "3", "parent task")
+        merges = [s for _, s in self.steps() if s.get("type") == "merge"]
+        self.assertEqual(len(merges), 1, result.stderr[-2000:])
+        self.assertIs(merges[0].get("sync"), True, merges[0])
+        self.assertIn("sub-answer", merges[0].get("content", ""))
+        self.assertIn("sub done", result.stderr + result.stdout + "".join(s.get("stdout", "") for _, s in self.steps() if s.get("type") == "shell-output"))
+
+    def test_last_iteration_is_announced_as_feedback_before_the_final_call(self):
+        self.fence("1", "echo first")
+        self.fence("last", "FINAL=done")
+        result = self.run_shellm("--max-iterations", "2", "bounded task")
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        kinds = [(s.get("type"), s.get("content", "")[:40]) for _, s in self.steps()]
+        feedback = [s for _, s in self.steps() if s.get("type") == "feedback"]
+        self.assertEqual(len(feedback), 1, kinds)
+        self.assertIn("LAST iteration (2/2)", feedback[0]["content"])
+        types = [s.get("type") for _, s in self.steps()]
+        self.assertLess(types.index("feedback"), len(types) - types[::-1].index("reasoning") - 1, "the notice lands before the final reasoning step")
+
+
+class SubrunModeEnvTests(unittest.TestCase):
+    def test_wait_mode_marks_the_child_synchronous_and_detach_mode_does_not(self):
+        import tempfile, time as _time
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp); fake_bin = base / "bin"; fake_bin.mkdir()
+            executable(fake_bin / "shellm", "#!/usr/bin/env bash\nprintf 'sync=%s\\n' \"${SHELLM_SYNC_CHILD:-unset}\"\nprintf 'FINAL: fake child complete\\n'\n")
+            env = dict(os.environ, PATH=str(fake_bin) + ":" + str(HEADLONG / "bin") + ":" + os.environ["PATH"], TMPDIR=str(base))
+            env.pop("IDENTITY_DIR", None)
+            waited = subprocess.run(["subrun", "--wait", "--cwd", str(base), "--max-iterations", "2", "--report", str(base / "wait.report"), "task"],
+                                    env=env, text=True, capture_output=True, timeout=60)
+            self.assertEqual(waited.returncode, 0, waited.stderr)
+            self.assertIn("sync=1", (base / "wait.report").read_text())
+            detached = subprocess.run(["subrun", "--detach", "--cwd", str(base), "--max-iterations", "2", "--report", str(base / "detach.report"), "task"],
+                                      env=env, text=True, capture_output=True, timeout=60)
+            self.assertEqual(detached.returncode, 0, detached.stderr)
+            for _ in range(50):
+                if "state: exited" in (base / "detach.report").read_text():
+                    break
+                _time.sleep(0.2)
+            self.assertIn("sync=unset", (base / "detach.report").read_text())
+
+
 if __name__ == "__main__":
     unittest.main()
