@@ -168,7 +168,7 @@ class TrajectoryAuditTests(MemoryFixture):
         out=dr.audit(hours=24,path=traj)
         self.assertEqual(out["runs"]["monolith"]["runs"],2);self.assertEqual(out["runs"]["monolith"]["rc_nonzero"],1);self.assertEqual(out["runs"]["monolith"]["no_durable"],1)
         kinds={p["kind"] for p in out["problems"]}
-        self.assertEqual(kinds,{"untouched-ask","promise-in-reply","failed-send","helper-failure"})
+        self.assertEqual(kinds,{"wasted-wakes","untouched-ask","promise-in-reply","failed-send","helper-failure"})  # 1 of 2 runs had no durable step
         ua=[p for p in out["problems"] if p["kind"]=="untouched-ask"][0];self.assertEqual(ua["goal_id"],gid);self.assertTrue(ua["quick"])
         self.assertEqual(out["counts"]["responder_replies"],1)
         self.assertTrue((dr.root/dr.day()/'audit.json').exists())
