@@ -611,12 +611,13 @@ class ResponderTests(MemoryFixture):
         self.envelope = {**self.envelope, "step_id": "trigger-3", "request_id": "operator:44", "content": "Ryan says hi."}
         self.log.write_text(self.log.read_text() + cm.encode(self.envelope) + "\n")
         self.request = {**self.request, "envelope": self.envelope, "messages": [{"role": "user", "content": "Ryan says hi."}]}
-        self.plan["person"] = {"display": "Ryan", "aliases": [], "notes": "Ryan is Hal's friend who says hi."}
+        self.plan["person"] = {"display": "Ryan", "aliases": ["H"], "notes": "Ryan is Hal's friend who says hi."}
         with mock.patch.object(cm, "run", side_effect=lambda argv, *a, **kw: cm.encode(self.plan) if argv[0] == "llm" else self.real_run(argv, *a, **kw)):
             cm.response(self.store, self.request)
         found = cm.People(self.store).find("hal")
         self.assertEqual(found[1]["display"], "Hal")
-        self.assertIn("Ryan", found[1]["aliases"])  # the proposed name is kept, as an alias
+        self.assertNotIn("Ryan", found[1]["aliases"])  # rejected display is not inferred as an alias
+        self.assertIn("H", found[1]["aliases"])  # explicit aliases remain supported
         self.assertEqual(len([i for i in self.store.files() if i[3].get("type") == "person"]), 1)
 
     def test_at_most_two_memories_per_reply_and_malformed_ones_are_dropped(self):
