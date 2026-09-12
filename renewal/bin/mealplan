@@ -5,12 +5,14 @@
   mealplan sales [--refresh]             this week's Whole Foods deals for the family's store
   mealplan recipes [--q text] [--book B] one line per recipe
   mealplan recipe SLUG                   ingredients + steps
+  mealplan recipe import URL [--note why] a recipe link from Hal or Dani -> the catalog (Mealie's scraper, tag "Requested"); returns the slug + link
   mealplan plan show [--week YYYY-Www]   the week's plan (default: the week of the next Saturday pickup)
   mealplan plan set --week W --dinner DATE=SLUG ... [--note text]
   mealplan plan proposed                 record that the week's first message went out
   mealplan plan engaged                  record that Hal or Dani replied about the plan
   mealplan plan skip [--note text]       they declined this week: no reminder, no cart (plan resume undoes it)
   mealplan plan finalize [--week W]      writes dinners into the catalog's meal planner
+  mealplan plan request SLUG [--note why] a dinner they asked for ahead of the draft ("add this to next week's menu"): the draft must include it
   mealplan list build [--week W]         ingredients -> grocery lines (pantry set aside) + standing staples + this week's extras
   mealplan list preview [--week W]       print the current list
   mealplan list add "item" [--note why]  one-off for this week ("grab butter") — survives rebuilds; "2 lemons" sets a count
@@ -35,6 +37,9 @@
   mealplan cart logout                   operator-only (Hal, from the Mac: kitchen-logout); this CLI refuses
   mealplan cart candidates [--week W]    top products per unmatched list line
   mealplan cart choose "item" ASIN [--qty N]
+  mealplan cart add "item" [ASIN] [--qty N] [--note why]  ONE item, NOW (Hal, 2026-09-12): recorded on the planning week's plan AND put in the
+                                         Whole Foods cart in the same call (ASIN given, else the best match from search: bought-before > pins > 365).
+                                         Not signed in? still recorded; Friday's fill adds it. Confirm with the price it prints.
   mealplan cart fill [--week W] [--force]  add every chosen line to the Whole Foods cart — never checks out; refuses a second fill unless --force
                                          (fill / plan proposed / plan finalize also refuse while family messages newer than the plan are unread: record them, then --read)
   mealplan cart show [--week W]          the plan's lines + what the site says is in the cart
@@ -154,6 +159,10 @@ def show_plan(p):
         print(f"  {d.get('date') or '????-??-??'}  {d['title']}  [{d['slug']}]  {d.get('url') or ''}" + (f"  — {d['note']}" if d.get("note") else ""))
     for n in p.get("notes", [])[-3:]:
         print(f"  note {n['at']}: {n['text']}")
+    for r in p.get("requested", []):
+        print(f"  REQUESTED dinner: {r.get('title') or r.get('slug')}  [{r.get('slug') or '-'}]  {r.get('url') or ''}" + (f"  — {r['note']}" if r.get("note") else "") + (f"  ({r['error']})" if r.get("error") else ""))
+    if p.get("extras"):
+        print("  extras this week:", "; ".join(x["item"] + (f" ({x['note']})" if x.get("note") else "") for x in p["extras"]))
     if p.get("list"):
         print(f"  list: {len(p['list'])} lines, {sum(1 for x in p['list'] if x.get('status') == 'unmatched')} unmatched, pantry assumed: {len(p.get('pantry_assumed', []))}")
 
@@ -188,6 +197,11 @@ def main():
     elif a.cmd == "recipes":
         for r in call("GET", "/recipes", params={"q": a.q, "book": a.book}):
             print(f"  - {r['title']} [{r['slug']}] {r['book'] or ''} {r['yield'] or ''} {r['total_time'] or ''} rating={r['rating'] or '-'} last={r['last_made'] or '-'}")
+    elif a.cmd == "recipe" and a.sub == "import":
+        r = call("POST", "/recipes/import", {"url": a.arg, "note": a.note})
+        print(("already in the catalog: " if r.get("existing") else "imported: ") + f"{r['title']} [{r['slug']}] {r.get('book') or ''} {r.get('yield') or ''} {r.get('total_time') or ''}\n  {r.get('url')}"
+              + (f"\n  tag: {r['tagged']}" if r.get("tagged") else ""))
+        print("  next: `mealplan plan request " + r["slug"] + " --note \"…\"` if it is for next week's menu")
     elif a.cmd == "recipe":
         r = call("GET", "/recipes/" + urllib.parse.quote(a.sub or ""))
         print(f"{r['title']} — {r['book'] or ''} {r['yield'] or ''} {r['total_time'] or ''}\n{r.get('description') or ''}\ningredients:")
@@ -214,8 +228,12 @@ def main():
         elif a.sub == "finalize":
             require_read(call("GET", f"/plans/{wk}"), "plan finalize", a.read)
             show_plan(call("POST", f"/plans/{wk}/finalize", {}))
+        elif a.sub == "request":
+            body = {"note": a.note, "remove": a.remove}
+            body["slug" if not (a.arg or "").startswith("title:") else "title"] = (a.arg or "").removeprefix("title:")
+            show_plan(call("POST", f"/plans/{wk}/request", body))
         else:
-            sys.exit("plan show|set|proposed|engaged|skip|resume|finalize")
+            sys.exit("plan show|set|proposed|engaged|skip|resume|finalize|request")
     elif a.cmd == "list":
         if a.sub in ("add", "remove"):
             p = call("POST", f"/plans/{wk}/extras", {"item": a.arg, "note": a.note, "remove": a.sub == "remove"})
@@ -316,6 +334,15 @@ def main():
             for x in r["quantity_changed"]: print(f"  ~ count changed: {x['item']} {x['planned']} -> {x['now']}")
             if r.get("have"): print("  already have:", "; ".join(h["item"] for h in r["have"]))
             if r.get("unmatched"): print("  unmatched:", ", ".join(r["unmatched"]))
+        elif a.sub == "add":
+            r = call("POST", f"/plans/{wk}/cart/add", {"item": a.arg, "asin": a.asin, "quantity": a.qty, "note": a.note})
+            pr = r.get("product") or {}
+            if r.get("in_cart"):
+                print(f"IN THE CART ({r.get('customer') or 'signed-in account'}): {pr.get('name') or pr.get('asin')} x{pr.get('quantity', 1)}" + (f" ${pr['price']}" if pr.get("price") else "") + f"  — recorded on {r['week']}'s list as an extra")
+                c = next((c for c in (r.get("cart") or {}).get("carts", []) if c.get("program") == "GROCERY"), {})
+                print(f"  site cart now: {c.get('count')} items, ${c.get('subtotal')}")
+            else:
+                print(f"RECORDED on {r['week']}'s list, NOT in the cart: {r.get('error')}" + (f" (product {pr.get('name') or pr.get('asin')})" if pr else ""))
         elif a.sub == "choose":
             line = call("POST", f"/plans/{wk}/cart/choose", {"item": a.arg, "asin": a.asin, "quantity": a.qty})
             print(f"  {line['item']} -> {line['product'].get('asin')} x{line['product'].get('quantity')} {line['product'].get('name') or ''}")
@@ -327,6 +354,7 @@ def main():
             print(f"added {len(r.get('added', []))}, failed {len(r.get('failed', []))}, skipped (no choice) {len(r.get('skipped', []))}")
             for x in r.get("added", []): print(f"  + {x['item']} -> {x.get('name') or x['asin']} x{x['quantity']}")
             for x in r.get("failed", []): print(f"  ! {x['item']}: {x['why']}")
+            for x in r.get("already_present", []): print(f"  = already in the cart: {x['item']} -> {x.get('name') or x['asin']} had x{x['had']}, now x{x['quantity']}")
             for x in r.get("skipped", []): print(f"  - skipped: {x}")
             print("cart:", json.dumps(r.get("cart"))[:600])
         elif a.sub == "set":
@@ -338,7 +366,7 @@ def main():
                 print(f"  [{l.get('status') or '-':9s}] {l['item']}" + (f" -> {l['product'].get('name') or l['product'].get('asin')} x{l['product'].get('quantity', 1)}" if l.get("product") else ""))
             print("site cart:", json.dumps(r.get("cart"))[:800])
         else:
-            sys.exit("cart status|login|refresh|logout|candidates|choose|fill|show|diff|set")
+            sys.exit("cart status|login|refresh|logout|candidates|choose|add|fill|show|diff|set")
     elif a.cmd == "order":
         print("Tier 1: checkout is Hal's or Dani's, in the Amazon app on Dani's account. `mealplan cart fill` puts the groceries in the cart; then tell them.")
     else:

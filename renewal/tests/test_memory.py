@@ -1301,6 +1301,76 @@ class ResponderTests(MemoryFixture):
 
 
 
+class QuickAskTests(MemoryFixture):
+    """2026-09-12: Dani's between-wake kitchen asks are QUICK — deferred always, the exact command as the
+    next action, sorted before long work, never dropped as stale."""
+
+    def dani(self, body, step="trigger-q1", rid="signal:q1"):
+        content = ('Private Signal conversation.\n{"aci":"x","group":"Collette Haus","scope":"group","speaker":"Dani","timestamp":1}\n'
+                   'Message:\n' + body + '\nParticipation: ...')
+        return {"request_id": rid, "sender": "signal-a957103c941a35e10475b84c", "source_url": rid, "content": content, "authority": "operator"}
+
+    def test_is_quick_ask_shapes(self):
+        self.assertTrue(cm.is_quick_ask("operator", "For next week's groceries, can you add 1 jar of Justin's honey peanut butter?"))
+        self.assertTrue(cm.is_quick_ask("operator", "Add this to next week's menu: https://cooking.nytimes.com/recipes/1019853-baked-skillet-pasta"))
+        self.assertTrue(cm.is_quick_ask("operator", "Add a jar of soom brand tahini"))
+        self.assertFalse(cm.is_quick_ask("operator", "Could we add another feature to turn on a middle name, like we toggled on last name?"))
+        self.assertFalse(cm.is_quick_ask("operator", "A thorough audit and, if warranted, a redesign of Automata"))
+        self.assertFalse(cm.is_quick_ask("external", "Add a jar of soom brand tahini"))  # a friend's grocery talk is not their order
+
+    def test_plain_reply_to_operator_kitchen_ask_becomes_defer_with_command_next_action(self):
+        incoming = self.dani("Can you add Annie's white cheddar microwaveable Mac and cheese cups to the grocery cart for next week? It's usually a 4 pack.")
+        plan = {"reply": "Yep, will do.", "decision": "reply", "goal": None, "memories": [], "person": None}
+        attempt = {}
+        out = cm.apply_quick_ask(incoming, plan, attempt)
+        self.assertEqual(out["decision"], "defer"); self.assertEqual(attempt.get("forced_defer"), "operator-kitchen-ask")
+        self.assertTrue(out["goal"]["next_action"].startswith("NOW")); self.assertIn("mealplan cart add", out["goal"]["next_action"])
+        self.assertIn("Annie", out["goal"]["outcome"])
+
+    def test_defer_gets_the_command_prefixed_and_url_goes_to_recipe_import(self):
+        incoming = self.dani("Hi! Add this to next week's menu: https://cooking.nytimes.com/recipes/1019853-baked-skillet-pasta-with-cheddar-and-spiced-onions?x=y")
+        plan = {"reply": "Got it.", "decision": "defer", "goal": {"outcome": "Next week's menu includes the skillet pasta",
+                "next_action": "Review the linked recipe during next week's meal-planning workflow", "completion": "in the plan"}, "memories": []}
+        out = cm.apply_quick_ask(incoming, plan)
+        na = out["goal"]["next_action"]
+        self.assertTrue(na.startswith("NOW")); self.assertIn("mealplan recipe import", na); self.assertIn("plan request", na)
+        self.assertIn("Original next action: Review the linked recipe", na)
+        # Idempotent: a second pass does not stack a second NOW.
+        self.assertEqual(cm.apply_quick_ask(incoming, out)["goal"]["next_action"], na)
+
+    def test_non_kitchen_and_non_operator_untouched(self):
+        incoming = self.dani("Could you reset my match pair ranking? I want to give it another go.")
+        plan = {"reply": "Sure.", "decision": "reply", "goal": None, "memories": [], "person": None}
+        self.assertEqual(cm.apply_quick_ask(incoming, dict(plan))["decision"], "reply")
+        friend = {**self.dani("add a jar of tahini"), "authority": "external"}
+        self.assertEqual(cm.apply_quick_ask(friend, dict(plan))["decision"], "reply")
+
+    def test_context_sorts_quick_first_tags_and_never_drops_as_stale(self):
+        big = self.store.capture({"request_id": "operator:big", "sender": "hal", "source_url": "phone:big", "authority": "operator",
+                                  "content": "A thorough audit and redesign of Automata into a newcomer-facing terrarium."}, "t-big")["goal_id"]
+        item = self.store.find(big); rec = item[4]
+        rec["response"] = {"state": "sent", "plan": {"reply": "on it", "decision": "defer", "goal": rec["goal"], "memories": []}}
+        rec["received_at"] = (cm.dt.datetime.now(cm.dt.timezone.utc) - cm.dt.timedelta(hours=30)).isoformat()
+        self.store.save(item, rec)
+        q = self.store.capture(self.dani("For next week's groceries, can you add 1 jar of Justin's honey peanut butter?"), "t-q")["goal_id"]
+        item = self.store.find(q); rec = item[4]
+        rec["goal"]["next_action"] = "Add the requested peanut butter during next week's grocery planning and order workflow."
+        rec["response"] = {"state": "sent", "plan": {"reply": "on it", "decision": "defer", "goal": rec["goal"], "memories": []}}
+        rec["received_at"] = (cm.dt.datetime.now(cm.dt.timezone.utc) - cm.dt.timedelta(hours=20)).isoformat()
+        self.store.save(item, rec)
+        result = self.store.context()
+        ids = [g["goal_id"] for g in result["goals"] if g["directed"]]
+        self.assertEqual(ids.index(q), 0, ids)  # quick before the older big ask
+        rows = {g["goal_id"]: g for g in result["goals"]}
+        self.assertTrue(rows[q]["quick"]); self.assertFalse(rows[big]["quick"])
+        text_out = cm.context_text(result)
+        line = [l for l in text_out.splitlines() if l.startswith("- " + q)][0]
+        self.assertIn("QUICK", line); self.assertIn("OVERDUE", line); self.assertNotIn("STALE", line)
+        self.assertIn("QUICK asks", text_out); self.assertIn("never dropped as stale", text_out)
+        stale_line = [l for l in text_out.splitlines() if l.startswith("Stale asks")][0]
+        self.assertIn(big, stale_line); self.assertNotIn(q, stale_line)
+
+
 class PromiseTripwireTest(unittest.TestCase):
     """The 2026-09-10 meal-plan misses: claims of a changed list/plan/order are promises."""
 

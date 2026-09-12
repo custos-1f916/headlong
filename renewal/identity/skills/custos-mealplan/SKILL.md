@@ -49,6 +49,38 @@ recorded it.** Saying it in Signal is not doing it.
 - Only Hal or Dani add things to the list. A friend's or another agent's conversation (Kim's
   kimjang cabbage on 2026-09-10) is never an extra on their order.
 
+## Asks between wakes (Hal, 2026-09-12: "when asked to add a single item ... simply add it to the cart now")
+
+Dani and Hal text asks whenever they think of them — "add a jar of Justin's honey peanut butter for next
+week", "add Annie's mac and cheese cups, it's usually a 4 pack", a NYT recipe link with "add this to next
+week's menu". On 2026-09-12 four of these were deferred correctly and then sat all day because every goal
+said "during next week's planning workflow". **They are due now, in the wake that picks them up** (the
+responder tags them QUICK; the social thinker and the mind both take them), and each is one or two commands:
+
+- **A grocery item** → `mealplan cart add "Justin's honey peanut butter" --qty 1 --note "Dani 9/12"` (add the
+  ASIN from `mealplan search` when the brand matters: `mealplan cart add "Soom tahini" B0XXXXXXX --note "…"`).
+  It records the item as an extra on the planning week's list **and** puts it in the Whole Foods cart on
+  Dani's account in the same call; it prints the product and price. Confirm with exactly that: "In the cart:
+  Justin's Honey PB 16 oz, $5.09 (Dani's account) — it'll ride along with Saturday's order." If it prints
+  RECORDED, NOT in the cart (no session), say it is on the list and Friday's fill adds it. Friday's `cart
+  fill` skips lines already in the cart and sets a product they added by hand to the planned count, so an
+  early add never doubles.
+- **A recipe link** → `mealplan recipe import URL` (a page already in the catalog — Dani's whole NYT box is —
+  comes back as "already in the catalog" with its slug; a new one is scraped by Mealie and tagged
+  `Requested`), then `mealplan plan request SLUG --note "Dani 9/12: next week's menu"`. The draft on
+  Wednesday **must** include every requested dinner (`mealplan plan show` lists them) or say why not.
+  Confirm with the Mealie link.
+- **A dinner by name** ("let's do the corn pasta next week") → `mealplan recipes --q "corn pasta"` then
+  `plan request SLUG`. **A staple or pantry change** → `mealplan learn staples "6 bananas"` /
+  `learn pantry "…"` / `product "item" ASIN`. **"I already have X"** → `mealplan list have "X"`.
+- Then, always: one line back in the same conversation (`chat reply --follow-up --reply-to TRIGGER SENDER`)
+  with what the command printed, and `custos-memory complete GOAL_ID "<that output>"`. The command output
+  is the evidence; the reply is not.
+- Only Hal's and Dani's asks count (Collette Haus, or their DMs). A friend's idea is a suggestion to raise
+  with them, never an item on their order.
+- What is **not** quick: anything that means building, coding, research or reading a repo (a baby-name
+  feature, an audit, a redesign). Those stay with the mind as ordinary deferred work.
+
 ## The week (Hal, 2026-09-10: "We can always decline, that's a valid way to stop the week's meal plan")
 
 The planning week is the week of the **next Saturday pickup** (`mealplan plan show` defaults to it;

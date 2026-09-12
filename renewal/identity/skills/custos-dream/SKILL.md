@@ -68,6 +68,29 @@ Use the returned after_sha256 following an edit. If time runs out, stop editing;
 unreviewed entries carry forward. Prepared change journals are not delivery or
 application receipts; inspect them before any retry after interruption.
 
+## The day's trajectory (Hal, 2026-09-12)
+
+Memory is half the job. After `begin`, audit the last 24 hours of the trajectory:
+`custos-dream audit > /tmp/custos-dream-audit.json` (deterministic, no inference; it writes
+`dream/YYYY-MM-DD/audit.json` and the report picks it up). Read `jq '.runs, .counts'` and then
+`jq '.problems'`. It flags wasted wakes (runs with no durable step), failed runs, monolith runs at
+the iteration cap, **asks nobody touched** for six hours (quick ones first), responder replies that
+promised work in words, sends that failed, and helpers that died without a FINAL. Read the raw
+trajectory around anything it names, with targeted queries and bounded output, before deciding.
+
+For each real problem, one of three outcomes, recorded, never silent:
+1. **Fix it now** when one bounded command does (an untouched QUICK ask → do it as the mealplan
+   skill says and complete it; a stale goal that is done → `custos-memory complete` with evidence).
+2. **File your own goal** for anything that needs a wake of work (`mem add --type goal
+   "dream-audit YYYY-MM-DD: <problem> → <the fix, one wake>"`); the mind picks it up.
+3. **Raise it** when it is Hal's to decide (a harness bug, the bridge, a policy, a cost) or Kim's
+   (the DM loop, a bridge on Kim's side): file your own goal whose next action is to tell them in
+   the Signal chat — Hal in Collette Haus or his DM, Kim in the AI chat group — on the next ordinary
+   wake via the deferred-ask delivery path, with the evidence from `audit.json`. The dream itself
+   still sends nothing.
+
+Put the problems and what you did with them in the `finish --note`.
+
 ## Finish
 
 Run `custos-dream finish --note 'What changed; specific unresolved questions'`.

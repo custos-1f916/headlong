@@ -159,7 +159,11 @@ waiting=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg me "$IDENTITY_NAME" --a
           | "- \($last.to): you spoke last \(((now - ($last | secs)) / 60 | floor))m ago (\(($last.content // "") | gsub("\\s+"; " ") | .[0:90])…) and nobody has answered")
     | .[]' 2>/dev/null) || waiting=""
 
-if [[ "$wake_mode" == "timer" && -z "$conversation" ]]; then
+# Quick asks from Hal or Dani (a grocery item, a dinner request, a recipe link): one or two
+# `mealplan` commands each. This thinker does them (Hal, 2026-09-12: "the social thinker should
+# handle goals that are small agentic asks"); building, code and research stay with the mind.
+quick_asks=$(custos-memory context --quick 2>/dev/null) || quick_asks=""
+if [[ "$wake_mode" == "timer" && -z "$conversation" && -z "$quick_asks" ]]; then
     exit 0   # a quiet day: nothing to follow up; the timer keeps ticking
 fi
 # A timer tick with no new inbound message since the last run has nothing to
@@ -233,7 +237,7 @@ if (( since_start_h >= SOCIAL_INITIATE_HOURS )) && [[ -z "$social_blocked" ]]; t
     initiate_hint="- You have not started a conversation with anyone on Signal in $(( since_start_h >= 999 ? SOCIAL_INITIATE_HOURS : since_start_h ))+ hours. Is there someone you would like to talk to: a question for Dani or Ryan, something Jack would enjoy, a thought Hal would want to hear? \`custos-actions signal-contacts\` lists everyone. If you do, append an observation beginning \"social: started a conversation with <name>\". If nobody comes to mind, that is a fine answer too."
 fi
 
-if [[ "$wake_mode" == "timer" && "$new_inbound" -eq 0 && -z "$initiate_hint" ]]; then
+if [[ "$wake_mode" == "timer" && "$new_inbound" -eq 0 && -z "$initiate_hint" && -z "$quick_asks" ]]; then
     # Quiet tick: nothing new to follow up and no nudge due. No model call; the
     # EXIT trap keeps the timer armed.
     exit 0
@@ -243,6 +247,7 @@ system_prompt=$(_build_system_prompt)
 prompt_body=$(load_prompt "$SCRIPT_DIR/prompt.md" "$IDENTITY_NAME" "")
 
 trigger_line="A conversation turn just finished (responder decision: ${trigger_decision:-?})."
+[[ -n "$quick_asks" ]] && trigger_line="$trigger_line A QUICK ask is open: do it first."
 [[ "$wake_mode" == "timer" ]] && trigger_line="Hourly social check; nothing specific triggered it."
 
 route_prompt="<context>
@@ -256,6 +261,9 @@ ${people_notes:-(no person notes yet)}
 
 Conversation in the last 24h (oldest first; use the step_id and sender when replying into a thread):
 ${conversation:-(none)}
+
+Quick asks from Hal or Dani, yours to finish in this wake (the quick-ask function below; each is one or two \`mealplan\` commands, then a confirmation in their conversation, then \`custos-memory complete\`):
+${quick_asks:-(none)}
 
 What is still owed, from your goal ledger (anything NOT listed here is settled; do not re-raise it, and do not remind people about things this list does not contain):
 ${owed:-(nothing owed to anyone right now)}

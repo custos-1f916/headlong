@@ -144,3 +144,34 @@ class LifecycleTests(MemoryFixture):
         self.assertEqual(self.store.find(key)[4],item[4])
 
 if __name__=='__main__':unittest.main()
+
+class TrajectoryAuditTests(MemoryFixture):
+    def test_audit_reads_a_day_and_names_problems(self):
+        root=self.root;store=self.store
+        env=mock.patch.dict(os.environ,{'IDENTITY_DIR':str(root),'IDENTITY_NAME':'custos'});env.start();self.addCleanup(env.stop)
+        now=dt.datetime(2026,9,12,9,0,tzinfo=dt.timezone.utc);dr=d.Dream(store,root=root/'dream',clock=lambda:now)
+        t='2026-09-12T0'
+        rows=[{"type":"shellm-run","step_id":"r1","launched_by":"monolith","ts":t+"1:00:00Z"},
+              {"type":"reasoning","run_id":"r1","ts":t+"1:00:10Z"},{"type":"reasoning","run_id":"r1","ts":t+"1:00:20Z"},{"type":"run-end","run_id":"r1","rc":1,"ts":t+"1:01:00Z"},
+              {"type":"shellm-run","step_id":"r2","launched_by":"monolith","ts":t+"2:00:00Z"},
+              {"type":"reasoning","run_id":"r2","ts":t+"2:00:10Z"},{"type":"observation","run_id":"r2","source":"monolith","content":"did a thing","ts":t+"2:00:20Z"},{"type":"run-end","run_id":"r2","rc":0,"ts":t+"2:01:00Z"},
+              {"type":"message","from":"custos","to":"signal-a9","source":"responder","reply_to":"x","content":"I'll add it to the list.","ts":t+"3:00:00Z"},
+              {"type":"observation","source":"social","content":"not sent: the guard refused a second message","ts":t+"4:00:00Z"},
+              {"type":"shell-output","run_id":"r2","stdout":"Helper returned nonzero; inspect retained report","ts":t+"5:00:00Z"},
+              {"type":"reasoning","run_id":"old","ts":"2026-09-10T01:00:00Z"}]
+        traj=root/'trajectory.jsonl';traj.write_text("\n".join(json.dumps(r) for r in rows)+"\n")
+        gid=store.capture({"request_id":"signal:1","sender":"signal-a9","source_url":"signal:1","authority":"operator",
+                           "content":'x\n{"speaker":"Dani","group":"Collette Haus","scope":"group"}\nMessage:\nAdd a jar of tahini\nParticipation: y'},"tr")["goal_id"]
+        item=store.find(gid);rec=item[4]
+        rec["response"]={"state":"sent","plan":{"reply":"ok","decision":"defer","goal":rec["goal"],"memories":[]}}
+        rec["received_at"]=(now-dt.timedelta(hours=8)).isoformat();store.save(item,rec)
+        out=dr.audit(hours=24,path=traj)
+        self.assertEqual(out["runs"]["monolith"]["runs"],2);self.assertEqual(out["runs"]["monolith"]["rc_nonzero"],1);self.assertEqual(out["runs"]["monolith"]["no_durable"],1)
+        kinds={p["kind"] for p in out["problems"]}
+        self.assertEqual(kinds,{"untouched-ask","promise-in-reply","failed-send","helper-failure"})
+        ua=[p for p in out["problems"] if p["kind"]=="untouched-ask"][0];self.assertEqual(ua["goal_id"],gid);self.assertTrue(ua["quick"])
+        self.assertEqual(out["counts"]["responder_replies"],1)
+        self.assertTrue((dr.root/dr.day()/'audit.json').exists())
+        # finish folds the audit into the report
+        dr.begin();r=dr.finish('done');self.assertIn('Trajectory audit',(dr.root/dr.day()/'report.md').read_text())
+        self.assertIn('untouched-ask',(dr.root/dr.day()/'report.md').read_text())

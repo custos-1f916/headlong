@@ -723,6 +723,8 @@ class Store:
                     checklist = record.get("checklist") or []
                     goals.append({"goal_id": fields["id"], "summary": record["goal"]["outcome"][:240],
                                   "directed": True, "kind": "task" if is_task(record) else "unanswered",
+                                  "quick": bool(is_task(record) and is_quick_ask(origin["authority"], message_body(origin.get("content") or ""),
+                                                                                  record["goal"]["outcome"], next_action)),
                                   "who": speaker_of(origin["sender"], origin.get("content", "")),
                                   "scratch": (pad[-1]["text"][:200] if pad else None), "notes": len(pad),
                                   "checklist_done": sum(1 for i in checklist if i.get("done_at")), "checklist_total": len(checklist),
@@ -769,8 +771,10 @@ class Store:
                     row["possible_duplicate_of"] = cid
                     break
         authority_order = {"operator": 0, "agent": 1, "external": 2}
+        # Quick asks (one or two commands) come before long work from the same person: 2026-09-12, four
+        # of Dani's grocery asks waited all day behind Hal's research goals.
         goals.sort(key=lambda row: (not row["directed"], authority_order.get(row.get("authority"), 3),
-                                    row["received_at"], row["goal_id"]))
+                                    not row.get("quick"), row["received_at"], row["goal_id"]))
         page = goals[offset:offset + limit]
         return {"total": len(goals), "active_directed": sum(row["directed"] for row in goals),
                 "offset": offset, "next_offset": offset + limit if offset + limit < len(goals) else None,
@@ -1188,6 +1192,9 @@ Return one strict JSON object with exactly these fields:
   a promise with no goal behind it is broken by the next wake, because nothing
   else remembers it. And promise only that you will look into it; the mind
   decides the approach, the deliverable and the timing, not this reply.
+  A grocery item, a dinner request or a recipe link from Hal or Dani is ALWAYS
+  defer (never a plain reply), and it is done within the hour, not at the next
+  planning wake: say it will be in the cart / on the plan shortly.
 - react (only when the transport offers it): reply is exactly one emoji,
   attached to their message; goal stays null.
 You have NO Bash or tools here and never claim you did work you did not do; if
@@ -1282,6 +1289,61 @@ def protocol_text(raw):
     return bool(re.search(r"[\{,]\s*[\"'](?:reply|decision|goal|memories|person)(?:[\"']|$)|"
                           r"^\s*[\"'](?:reply|decision|goal|memories|person)[\"']\s*:", raw)
                 or re.match(r"^\s*(?:NO_REPLY\b|DEFER:|chat\s+reply\b|<tool_call>|<function=)", raw))
+
+
+QUICK_ASK = re.compile(r"\b(grocer(?:y|ies)|cart|menu|meal ?plan|dinners?|recipes?|staples?|pantry|shopping list|whole foods|mealplan|"
+                       r"peanut butter|tahini|milk|bananas?|apples?)\b", re.I)
+QUICK_ASK_BUILD = re.compile(r"\b(build|implement|code|coding|deploy|repo|repository|refactor|redesign|research|audit|investigate|"
+                             r"write[- ]?up|paper|arxiv|simulation|feature|toggle|rename|reset|dashboard|harness)\b", re.I)
+ASK_SHAPE = re.compile(r"\b(add|can you|could you|would you|please|put|order|get|grab|swap|remove|take\b.{0,30}\boff|change|make|"
+                       r"include|we need|i need|i['’]d like|i want|don['’]t need|skip|instead)\b", re.I)
+
+
+def is_quick_ask(authority, *texts):
+    """A small agentic ask from Hal or Dani about the kitchen: one or two `mealplan` commands finish it
+    (a grocery item, a dinner request, a recipe link, a staple/pantry change). Anything that means
+    building, coding, research or reading a repo is not quick — the mind takes those (Hal, 2026-09-12)."""
+    if authority != "operator":
+        return False
+    blob = " ".join(t for t in texts if t)
+    return bool(QUICK_ASK.search(blob)) and not QUICK_ASK_BUILD.search(blob)
+
+
+def quick_hint(body):
+    """The exact command a quick kitchen ask needs, as the goal's next action. 2026-09-12: four of Dani's asks
+    carried "add it during next week's planning workflow" and sat all day; the command is the plan."""
+    if re.search(r"https?://", body):
+        return ("NOW (this wake, one or two commands): `mealplan recipe import URL` (a page already in the catalog is returned, "
+                "not duplicated), then `mealplan plan request SLUG --note \"who asked, when\"` so the next draft includes it; "
+                "confirm in the same conversation with the Mealie link.")
+    if re.search(r"\b(menu|dinners?|meals?|recipes?|cook)\b", body, re.I) and not re.search(r"\b(cart|grocer(?:y|ies)|jar|pack|order)\b", body, re.I):
+        return ("NOW (this wake, one or two commands): `mealplan recipes --q \"…\"` to find it, then `mealplan plan request SLUG "
+                "--note \"who asked, when\"`; confirm in the same conversation with the Mealie link.")
+    return ("NOW (this wake, one command): `mealplan cart add \"item\" [ASIN] [--qty N] --note \"who asked, when\"` — it records "
+            "the item on next week's list AND puts it in the Whole Foods cart (Dani's account); confirm in the same conversation "
+            "with the product and price it prints. Not signed in? it is still recorded for Friday's fill: say that instead.")
+
+
+def apply_quick_ask(incoming, plan, attempt=None):
+    """Hal, 2026-09-12: "Any asks from Dani or I should *always* create a deferred goal from the responder."
+    A kitchen-shaped ask from an operator that the model answered as a plain reply becomes a defer with a
+    generated goal (no second inference; the reply text stands), and every quick deferral carries the exact
+    command as its next action, due now."""
+    body = message_body(incoming.get("content") or "")
+    if not is_quick_ask(incoming.get("authority"), body):
+        return plan
+    if plan.get("decision") == "reply" and ASK_SHAPE.search(body):
+        plan["decision"] = "defer"
+        plan["goal"] = {"outcome": message_summary(incoming.get("sender", ""), incoming.get("content", ""), 240), "next_action": "",
+                        "completion": "The `mealplan` output shows it recorded (in the cart / on the plan), they were told in this "
+                                      "conversation, and the goal is completed with that output as evidence"}
+        if attempt is not None:
+            attempt["forced_defer"] = "operator-kitchen-ask"
+    if plan.get("decision") == "defer" and plan.get("goal"):
+        current = (plan["goal"].get("next_action") or "").strip()
+        if not current.startswith("NOW"):
+            plan["goal"]["next_action"] = text(quick_hint(body) + (" Original next action: " + current if current else ""), "next_action", 4096)
+    return plan
 
 
 def promises_work(reply):
@@ -1622,6 +1684,7 @@ def compose_plan(raw, argv, incoming, attempt, started):
         attempt["person_update_warning"] = metadata["person_update_warning"]
     if 'reply_to_items' in metadata:
         plan['reply_to_items'] = metadata['reply_to_items']
+    plan = apply_quick_ask(incoming, plan, attempt)
     attempt["format"] = metadata.get("format", "envelope")
     attempt["repaired"] = metadata.get("repaired", False)
     return plan
@@ -1998,8 +2061,10 @@ def goal_line(goal):
             tags.append("from " + clip(goal["who"], 32))
         if age is not None:
             tags.append(("%.0fh" % age) if age >= 1 else "new")
+        if goal.get("quick"):
+            tags.append("QUICK")
         if goal.get("stale"):
-            tags.append("STALE")
+            tags.append("OVERDUE" if goal.get("quick") else "STALE")
         if goal.get("possible_duplicate_of"):
             tags.append("dup? " + goal["possible_duplicate_of"])
         if goal.get("response_state") not in (None, "sent"):
@@ -2034,8 +2099,14 @@ def context_text(result):
         lines.append(goal_line(goal))
     if result["next_offset"] is not None:
         lines.append("More goals: custos-memory context --offset " + str(result["next_offset"]) + " (use --json for IDs).")
-    stale = [g["goal_id"] for g in result["goals"] if g.get("stale")]
+    quick = [g["goal_id"] for g in result["goals"] if g.get("quick")]
+    stale = [g["goal_id"] for g in result["goals"] if g.get("stale") and not g.get("quick")]
+    overdue = [g["goal_id"] for g in result["goals"] if g.get("stale") and g.get("quick")]
     dupes = [(g["goal_id"], g["possible_duplicate_of"]) for g in result["goals"] if g.get("possible_duplicate_of")]
+    if quick:
+        lines.append("QUICK asks (%s): one or two `mealplan` commands each (skills show custos-mealplan, \"Asks between wakes\"). "
+                     "Do them in this wake before anything long, confirm in the same conversation, complete with the command output "
+                     "as evidence. A quick ask is never dropped as stale%s." % (", ".join(quick), "; OVERDUE: " + ", ".join(overdue) + " — now" if overdue else ""))
     if stale:
         lines.append("Stale asks (untouched for over %s h): %s. Each is a decision now: do it, decline it with a reason, "
                      "or drop it via custos-memory complete; do not let it sit another day." % (os.environ.get("CUSTOS_STALE_HOURS", "12"), ", ".join(stale)))
@@ -2134,6 +2205,7 @@ An acknowledgment alone is not completion. Valid dispositions: completed, declin
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--brief", action="store_true", help="pending: one summary line instead of the records")
     parser.add_argument("--offset", type=int, default=0)
+    parser.add_argument("--quick", action="store_true", help="context: only the QUICK asks (one or two commands each)")
     parser.add_argument("--limit", type=int, default=32)
     parser.add_argument("--older-than", type=int, default=None,
                         help="replay-unanswered: seconds (default 900); archive-conversations: days (default 2); expire-asks: hours (default 24)")
@@ -2144,6 +2216,11 @@ An acknowledgment alone is not completion. Valid dispositions: completed, declin
         store = Store()
         if args.command in {"context", "pending"}:
             result = store.context(args.offset, args.limit, directed_only=args.command == "pending")
+            if args.quick:
+                result["goals"] = [g for g in result["goals"] if g.get("quick")]
+                result["total"] = result["active_directed"] = len(result["goals"]); result["next_offset"] = None
+                if not result["goals"]:
+                    return 0
             if args.command == "pending" and not args.json and args.brief:
                 # One line for the routing hints; the goals section carries the list.
                 if result["total"]:

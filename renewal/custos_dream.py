@@ -236,6 +236,103 @@ class Dream:
             seen = read_json(self.root / "reviewed.json", {}); seen[key] = {"sha256": actual, "at": self.stamp()}; write_json(self.root / "reviewed.json", seen)
         return s["reviews"][key]
 
+    # ---- the day's trajectory, audited (Hal, 2026-09-12: "the dream skill should not just go through
+    # memories. It should go through the entire day's trajectory, audit problems, and set its own
+    # deferred goals for fixing them or raising them to me or Kim in the Signal chat") ----
+    def trajectory_path(self):
+        root = os.environ.get("ROOT_TRAJ_ID")
+        if not root: return None
+        try:
+            import subprocess
+            return Path(subprocess.check_output(["traj", "path", root], stderr=subprocess.DEVNULL, timeout=20).decode().strip())
+        except Exception: return None  # noqa: BLE001 - no trajectory, no audit
+
+    def audit(self, hours=24, path=None):
+        """Deterministic read of the last `hours` of the root trajectory: wasted wakes, failed runs, asks nobody
+        touched, promises the responder made without a goal, sends that failed, helpers that died. No inference.
+        Writes dream/<day>/audit.json and returns it; the skill turns each problem into a fix, an own goal, or
+        a goal to raise it with Hal or Kim."""
+        path = Path(path) if path else self.trajectory_path()
+        since = (self.clock().astimezone(UTC) - dt.timedelta(hours=hours)).isoformat().replace("+00:00", "Z")
+        out = {"day": self.day(), "since": since, "hours": hours, "trajectory": str(path) if path else None,
+               "runs": {}, "problems": [], "counts": {}}
+        if not path or not path.exists():
+            out["problems"].append({"kind": "no-trajectory", "detail": "ROOT_TRAJ_ID/traj path unavailable; audit skipped"})
+            return self._save_audit(out)
+        runs, steps_by_run, run_end = {}, {}, {}
+        me = os.environ.get("IDENTITY_NAME", "custos")
+        replies, failed_sends, helper_failures, capped = [], [], [], []
+        with path.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"ts":"' not in line: continue
+                try: st = json.loads(line)
+                except ValueError: continue
+                ts = st.get("ts") or ""
+                if st.get("type") == "shellm-run":
+                    runs[st.get("step_id")] = {"thinker": st.get("launched_by") or "?", "ts": ts, "wake": st.get("wake") or ""}
+                    continue
+                if ts < since: continue
+                rid = st.get("run_id"); kind = st.get("type")
+                if rid:
+                    b = steps_by_run.setdefault(rid, {"reasoning": 0, "durable": 0, "first_durable": None})
+                    if kind == "reasoning": b["reasoning"] += 1
+                    elif kind in {"observation", "message", "action", "thought", "final"}:
+                        b["durable"] += 1
+                        if b["first_durable"] is None: b["first_durable"] = b["reasoning"]
+                if kind == "run-end": run_end[rid] = {"rc": st.get("rc"), "ts": ts}
+                if kind == "message" and st.get("from") == me and st.get("source") == "responder" and st.get("content"):
+                    replies.append({"ts": ts, "to": st.get("to"), "reply_to": st.get("reply_to"), "text": st["content"][:200],
+                                    "promise": cm.promises_work(st["content"])})
+                if kind == "observation":
+                    c = (st.get("content") or "")
+                    if re.search(r"\b(reply-failed|not sent|failed to send|could not deliver|delivery failed)\b", c, re.I):
+                        failed_sends.append({"ts": ts, "source": st.get("source"), "text": c[:200]})
+                if kind == "shell-output":
+                    o = (st.get("stdout") or "") + (st.get("stderr") or "")
+                    if re.search(r"Helper returned nonzero|hit iteration limit|timed out 900|without FINAL|killed by watchdog", o):
+                        helper_failures.append({"ts": ts, "run": (rid or "")[:8], "text": o[:160].replace("\n", " ")})
+        per = {}
+        for rid, b in steps_by_run.items():
+            t = runs.get(rid, {}).get("thinker", "?")
+            row = per.setdefault(t, {"runs": 0, "rc_nonzero": 0, "no_durable": 0, "reasoning_steps": 0, "at_cap": 0})
+            row["runs"] += 1; row["reasoning_steps"] += b["reasoning"]
+            if run_end.get(rid, {}).get("rc") not in (0, None): row["rc_nonzero"] += 1
+            if b["durable"] == 0 and b["reasoning"] > 0: row["no_durable"] += 1
+            if b["reasoning"] >= int(os.environ.get("MONOLITH_MAX_ITERATIONS", "40")) and t == "monolith": row["at_cap"] += 1; capped.append(rid[:8])
+        out["runs"] = per
+        # Asks nobody touched: active directed tasks older than 6 h with no event after capture and no scratchpad.
+        untouched = []
+        try:
+            for row in self.store.context(limit=100, directed_only=True)["goals"]:
+                if row.get("kind") != "task": continue
+                rec = self.store.find(row["goal_id"])[4]
+                events = [e for e in rec.get("events", []) if "update" in e or "note" in e or "checklist" in e]
+                if row.get("age_hours", 0) >= 6 and not events and not rec.get("scratchpad"):
+                    untouched.append({"goal_id": row["goal_id"], "who": row.get("who"), "age_hours": row.get("age_hours"),
+                                      "quick": row.get("quick", False), "summary": row.get("summary", "")[:120]})
+        except Exception as e: out["problems"].append({"kind": "goal-read-failed", "detail": repr(e)[:120]})  # noqa: BLE001
+        promised = [r for r in replies if r["promise"]]
+        out["counts"] = {"responder_replies": len(replies), "replies_with_promise_wording": len(promised), "failed_sends": len(failed_sends),
+                         "helper_failures": len(helper_failures), "untouched_asks": len(untouched)}
+        for t, row in per.items():
+            if row["no_durable"] >= 3 or (row["runs"] and row["no_durable"] / row["runs"] > 0.25):
+                out["problems"].append({"kind": "wasted-wakes", "thinker": t, "detail": f"{row['no_durable']} of {row['runs']} runs produced no durable step"})
+            if row["rc_nonzero"] >= 3:
+                out["problems"].append({"kind": "failed-runs", "thinker": t, "detail": f"{row['rc_nonzero']} of {row['runs']} runs ended rc!=0"})
+        if capped: out["problems"].append({"kind": "iteration-cap", "detail": "monolith runs at the cap: " + ", ".join(capped[:8])})
+        for u in untouched:
+            out["problems"].append({"kind": "untouched-ask", "goal_id": u["goal_id"], "who": u["who"], "quick": u["quick"],
+                                    "detail": f"{u['who']}'s ask untouched for {u['age_hours']} h: {u['summary']}"})
+        for r in promised:
+            out["problems"].append({"kind": "promise-in-reply", "detail": f"{r['ts'][11:19]} to {r['to']}: {r['text'][:120]}"})
+        for r in failed_sends[:10]: out["problems"].append({"kind": "failed-send", "detail": f"{r['ts'][11:19]} {r['source']}: {r['text'][:120]}"})
+        for r in helper_failures[:10]: out["problems"].append({"kind": "helper-failure", "detail": f"{r['ts'][11:19]} run {r['run']}: {r['text']}"})
+        return self._save_audit(out)
+
+    def _save_audit(self, out):
+        write_json(self.root / out["day"] / "audit.json", out)
+        return out
+
     def _finish(self, s, status, note):
         self.journals(s)
         report_dir = self.root / s["day"]
@@ -247,6 +344,12 @@ class Dream:
                  "Change journals (prepared is not proof of application): " + ", ".join(s["edits"]), "",
                  "Unreviewed (carry forward): " + (", ".join(missing) or "none"), ""]
         for key, r in s["reviews"].items(): lines.append(f"- {key}: {r['verdict']} — {r['evidence']}")
+        audit = read_json(report_dir / "audit.json")
+        if audit:
+            lines += ["", f"## Trajectory audit (last {audit.get('hours')} h)", "",
+                      "Runs: " + "; ".join(f"{t}: {r['runs']} runs, {r['no_durable']} no-durable, {r['rc_nonzero']} rc!=0" for t, r in (audit.get("runs") or {}).items()),
+                      "Counts: " + json.dumps(audit.get("counts") or {}), ""]
+            lines += [f"- {p_['kind']}: {p_.get('detail', '')}" for p_ in audit.get("problems") or []] or ["- no problems found"]
         atomic(report_dir / "report.md", ("\n".join(lines) + "\n").encode())
         return {"day": s["day"], "status": status, "reviewed": len(s["reviews"]), "remaining": len(missing), "report": str(report_dir / "report.md")}
 
@@ -262,13 +365,15 @@ class Dream:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command', choices=['due','begin','inventory','status','show','revise','archive','review','finish'])
+    p.add_argument('command', choices=['due','begin','inventory','status','show','revise','archive','review','finish','audit'])
     p.add_argument('id', nargs='?'); p.add_argument('--expected'); p.add_argument('--body-file'); p.add_argument('--evidence', default='')
     p.add_argument('--replacement'); p.add_argument('--verdict'); p.add_argument('--note', default='')
+    p.add_argument('--hours', type=int, default=24); p.add_argument('--trajectory')
     a = p.parse_args(); d = Dream()
     try:
         if a.command == 'due': print(d.due()); return 0
         if a.command == 'begin': result=d.begin()
+        elif a.command == 'audit': result=d.audit(hours=max(1, min(a.hours, 72)), path=a.trajectory)
         elif a.command == 'inventory': result=d.inventory()
         elif a.command == 'show':
             if not re.fullmatch(r'[0-9a-f]{8}', a.id or ''): raise ValueError('full eight-hex ID required')
