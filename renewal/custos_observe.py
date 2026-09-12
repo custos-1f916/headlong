@@ -902,9 +902,11 @@ def resolve_outbox_step_ids(store, prefix):
         with path.open("rb") as probe:
             probe.seek(int(cursor.get("offset", 0)))
             while True:
-                line = probe.readline(128 * 1024)
-                if not line or not line.endswith(b"\n"):
+                line, status = read_native_line(probe)
+                if status in ("eof", "partial"):
                     break
+                if status == "oversized":
+                    continue
                 try:
                     row = json.loads(line)
                 except ValueError:
