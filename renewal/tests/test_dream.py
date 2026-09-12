@@ -149,7 +149,7 @@ class TrajectoryAuditTests(MemoryFixture):
     def test_audit_reads_a_day_and_names_problems(self):
         root=self.root;store=self.store
         env=mock.patch.dict(os.environ,{'IDENTITY_DIR':str(root),'IDENTITY_NAME':'custos'});env.start();self.addCleanup(env.stop)
-        now=dt.datetime(2026,9,12,9,0,tzinfo=dt.timezone.utc);dr=d.Dream(store,root=root/'dream',clock=lambda:now)
+        now=dt.datetime(2026,9,12,9,45,tzinfo=dt.timezone.utc);dr=d.Dream(store,root=root/'dream',clock=lambda:now)  # 03:45 Denver: inside the dream window for begin/finish
         t='2026-09-12T0'
         rows=[{"type":"shellm-run","step_id":"r1","launched_by":"monolith","ts":t+"1:00:00Z"},
               {"type":"reasoning","run_id":"r1","ts":t+"1:00:10Z"},{"type":"reasoning","run_id":"r1","ts":t+"1:00:20Z"},{"type":"run-end","run_id":"r1","rc":1,"ts":t+"1:01:00Z"},
