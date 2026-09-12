@@ -460,7 +460,7 @@ class OutboxOversizedLineTests(OutboxDrainTests):
         self.write_log_with_big_line()
         end = self.path.stat().st_size
         with self.path.open("ab") as handle:
-            handle.write(cm.encode({"type": "reasoning", "step_id": "big-2", "thought": "M" * (300 * 1024)})[:-1])  # no newline yet
+            handle.write(cm.encode({"type": "reasoning", "step_id": "big-2", "thought": "M" * (300 * 1024)}).encode("utf-8"))  # no newline yet
         cursor = {"path": str(self.path), "offset": 0}
         self.observer._drain_outbox(self.path, cursor)
         self.assertEqual(self.store.get("outbox:cursor")["offset"], end, "the cursor waits at the start of the unfinished line")
@@ -501,12 +501,21 @@ class GuardScopeTests(ChatFixture):
             allowed = self.chat("reply", "--reply-to", UUID_B, self.dm, "Here is the command.")
             self.assertEqual(allowed.returncode, 0, allowed.stderr)
         self.assertEqual([m["content"] for m in self.outgoing() if m["to"] == self.dm], ["Here is the command."])
+        # A second, older DM from Jack with its own receipt: an anchored reply that is not a duplicate.
+        uuid_c = "cccccccc-3333-4333-8333-333333333333"
+        self.append({"type": "message", "step_id": uuid_c, "from": self.dm, "to": "custos", "source": "operator-transport",
+                     "request_id": "signal:dm-2", "authority": "external",
+                     "content": '{"scope":"direct","aci":"aci-jack-1","speaker":"Jack"} and the other thing?', "ts": now_iso(-14400)})
+        (self.identity / ".state" / "transport" / (hashlib.sha256(b"signal:dm-2").hexdigest() + ".json")).write_text(json.dumps({
+            "original": {"request_id": "signal:dm-2", "sender": self.dm, "authority": "external", "source_url": "", "content": "c"},
+            "step_id": uuid_c, "phase": "queued", "reply_offset": 0}))
         with mock.patch.dict(os.environ, {"CHAT_DOUBLE_TEXT_GUARD_HOURS": "2", "CHAT_GUARD_CROSS_ROOM": "1"}):
-            refused = self.chat("reply", "--follow-up", "--reply-to", UUID_B, self.dm, "Second try.")
-            self.assertEqual(refused.returncode, 0, "a follow-up delivery is exempt")
-            refused = self.chat("send", "--from", "custos", "--to", self.dm, "Third try.")
+            exempt = self.chat("reply", "--follow-up", "--reply-to", UUID_B, self.dm, "Second try.")
+            self.assertEqual(exempt.returncode, 0, "a follow-up delivery is exempt: " + exempt.stderr)
+            refused = self.chat("reply", "--reply-to", uuid_c, self.dm, "Third try.")
             self.assertNotEqual(refused.returncode, 0)
             self.assertIn("Do not move the ask to a DM", refused.stderr)
+        self.assertNotIn("Third try.", [m["content"] for m in self.outgoing()])
 
 
 class ShellmStubFixture(unittest.TestCase):
