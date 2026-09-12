@@ -264,7 +264,7 @@ class Dream:
         replies, failed_sends, helper_failures, capped = [], [], [], []
         with path.open(encoding="utf-8", errors="replace") as f:
             for line in f:
-                if '"ts":"' not in line: continue
+                if '"ts"' not in line: continue
                 try: st = json.loads(line)
                 except ValueError: continue
                 ts = st.get("ts") or ""

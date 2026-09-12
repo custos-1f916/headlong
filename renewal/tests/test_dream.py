@@ -159,7 +159,7 @@ class TrajectoryAuditTests(MemoryFixture):
               {"type":"observation","source":"social","content":"not sent: the guard refused a second message","ts":t+"4:00:00Z"},
               {"type":"shell-output","run_id":"r2","stdout":"Helper returned nonzero; inspect retained report","ts":t+"5:00:00Z"},
               {"type":"reasoning","run_id":"old","ts":"2026-09-10T01:00:00Z"}]
-        traj=root/'trajectory.jsonl';traj.write_text("\n".join(json.dumps(r) for r in rows)+"\n")
+        traj=root/'trajectory.jsonl';traj.write_text("\n".join(json.dumps(r,separators=(",",":")) for r in rows)+"\n")  # compact, like traj append writes
         gid=store.capture({"request_id":"signal:1","sender":"signal-a9","source_url":"signal:1","authority":"operator",
                            "content":'x\n{"speaker":"Dani","group":"Collette Haus","scope":"group"}\nMessage:\nAdd a jar of tahini\nParticipation: y'},"tr")["goal_id"]
         item=store.find(gid);rec=item[4]
