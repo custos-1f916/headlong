@@ -68,11 +68,19 @@ _require_env() {
 # `--model` is what the trajectory, the dashboard and the run log record — so ask the router
 # once per wake and carry the honest name (Hal, 2026-09-13). Unreachable router: names unchanged.
 _resolve_brain_models() {
-    command -v brain-model >/dev/null 2>&1 || return 0
+    # Renewal helpers reach PATH through /usr/local/bin symlinks installed at bootstrap, not through the
+    # release (2026-09-13: the first honest-label release shipped brain-model and no wake could find it).
+    # Fall back to the selected release's copy so a new helper works without a hand on the guest.
+    local _bm
+    _bm=$(command -v brain-model 2>/dev/null) || _bm=""
+    [[ -n "$_bm" ]] || for _bm in /opt/custos/current/renewal/bin/brain-model "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/../../../../renewal/bin/brain-model"; do
+        [[ -x "$_bm" ]] && break; _bm=""
+    done
+    [[ -n "$_bm" ]] || return 0
     local _v _r
     for _v in THINK_MODEL MONOLITH_REPLY_MODEL SHELLM_MODEL RECAP_MODEL; do
         [[ -n "${!_v:-}" ]] || continue
-        _r=$(brain-model "${!_v}" 2>/dev/null) || continue
+        _r=$("$_bm" "${!_v}" 2>/dev/null) || continue
         [[ -n "$_r" ]] && printf -v "$_v" '%s' "$_r" && export "$_v"
     done
 }
