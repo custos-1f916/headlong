@@ -25,6 +25,7 @@ import shlex
 import time
 import signal
 from custos_reactions import valid_emoji
+import custos_brain_client as brain_client
 from custos_images import validate_refs, attach_images
 
 MARKER = "\n\nCustos request record v1:\n"
@@ -1801,7 +1802,7 @@ def response(store, payload):
                 log_path.write_text("# system\n" + system + "\n\n# messages\n" + encode(messages) + "\n")
                 for old in sorted(logs.glob("*.txt"), reverse=True)[50:]:
                     old.unlink()
-            argv=["llm", "-m", os.environ.get("MONOLITH_REPLY_MODEL", os.environ.get("THINK_MODEL", "qwen3.8-27b")),
+            argv=["llm", "-m", brain_client.resolve_model(os.environ.get("MONOLITH_REPLY_MODEL", os.environ.get("THINK_MODEL", "qwen3.8-27b"))),
                   "--effort", RESPONSE_EFFORT, "--max-tokens", str(RESPONSE_MAX_TOKENS), "--no-stream"]
             attempt["stage"] = "inference"
             if incoming.get('images'):

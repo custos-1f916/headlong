@@ -60,6 +60,21 @@ _require_env() {
     _load_env_defaults "$HOME/.shellm/.env" || true
 
     mkdir -p "$MEM_DIR" "$SKILLS_DIR" "$SKILLS_KERNEL_DIR" "$TRAJ_DIR"
+    _resolve_brain_models
+}
+
+# The model names in the environment are the cloud names (THINK_MODEL=gpt-6-astra …). When the
+# brain router is in local mode every one of them is answered by johan's Qwen, and the step's
+# `--model` is what the trajectory, the dashboard and the run log record — so ask the router
+# once per wake and carry the honest name (Hal, 2026-09-13). Unreachable router: names unchanged.
+_resolve_brain_models() {
+    command -v brain-model >/dev/null 2>&1 || return 0
+    local _v _r
+    for _v in THINK_MODEL MONOLITH_REPLY_MODEL SHELLM_MODEL RECAP_MODEL; do
+        [[ -n "${!_v:-}" ]] || continue
+        _r=$(brain-model "${!_v}" 2>/dev/null) || continue
+        [[ -n "$_r" ]] && printf -v "$_v" '%s' "$_r" && export "$_v"
+    done
 }
 
 # ---------------------------------------------------------------------------
