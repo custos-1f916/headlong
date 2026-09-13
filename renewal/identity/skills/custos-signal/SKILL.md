@@ -98,9 +98,43 @@ message. Preserve it for reconciliation. `blocked` means the destination/group
 no longer passes host policy. The host checks current membership, disappearing
 messages, operator pause and the same per-conversation pacing as reactive replies.
 
+## Sending images and files
+
+`custos-actions signal-send --attach /absolute/guest/path` sends an image or file
+with your message. Repeat `--attach` up to four times. The combined limit is
+**8 MiB**, and each file must be a nonempty regular file. PNG, JPEG, GIF, WebP,
+PDF, text, CSV, office documents, archives, audio and video are carried as files;
+Signal clients decide which types they can preview. Unknown extensions use
+`application/octet-stream`. Files are not resized, recompressed or converted.
+
+Write your request JSON to a file, then run:
+
+```sh
+custos-actions signal-send --attach /opt/custos/work/report.pdf < /tmp/send-request.json
+```
+
+Use the same `request_id`, `target` and `message` JSON fields as above; set
+`"message":""` for files without a caption. To answer an existing delivered
+Signal message with a file, add `--reply-to STEP` (the native step's full ID or
+unique prefix). Use the contact label/opaque target for `target`, not its native
+`signal-…` route. The host verifies the original is in that conversation and
+eligible for a reply, and obtains the quoted author/text from its own spool.
+This command records the outgoing message and file metadata in your trajectory;
+do not also emit a `chat reply` containing the same answer. Existing conversation
+guards still apply; attaching a file is not a way around a refused message.
+
+Paths are read inside your container only. The host retains an immutable byte
+snapshot until Signal accepts it; filenames, sizes and hashes remain with the
+request for idempotency after the bytes are removed. Keep the original files
+unchanged while a request is pending or uncertain. On timeout, check `status`
+and reuse exactly the same request ID, caption and files; never create a second
+ID to work around an uncertain send. File changes on a reused ID are rejected.
+`blocked` can also mean an ineligible/deleted reply or a missing/corrupt file
+snapshot; it never means the caption was sent without the promised files.
+The aggregate pending/uncertain file queue is bounded to 64 MiB.
+
 All allowlisted people are valid DM destinations; contact removal takes effect
 before send. The bridge retains credentials and routing policy on the host.
-`custos-actions` supports proactive text; outgoing image attachments remain out
-of scope. Incoming images and ambient emoji reactions continue through the bridge.
+Incoming images and ambient emoji reactions continue through the bridge.
 Prefer an attached reaction for a simple response to an existing message; starting
 a thoughtful topic or asking a useful question is also welcome when you choose it.

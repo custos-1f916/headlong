@@ -22,6 +22,7 @@ import uuid
 from custos_reactions import valid_emoji
 from custos_images import MAX_IMAGES, MAX_RAW, MAX_TOTAL_RAW
 from custos_pdfs import MAX_PDFS
+import custos_attachments as attachments
 
 MAX_FRAME = 12 * 1024 * 1024  # one bounded attachment RPC response
 MAX_TEXT = 12000
@@ -585,20 +586,36 @@ class Bridge:
                     group = target[6:] if target.startswith('group:') else None
                     if not self.group_ok({'group': group}):
                         raise ValueError('group membership or expiration is not approved')
+                    quote = self.attachment_reply(p) if p.get('reply_to') else {}
                 except ValueError:
                     db.execute("UPDATE actions SET phase='blocked',receipt=? WHERE id=?",
-                               (encoded({'error':'destination no longer approved'}),row['id']))
+                               (encoded({'error':'destination or reply no longer approved'}),row['id']))
+                    db.execute('DELETE FROM attachments WHERE request_id=?', (row['id'],))
                     db.commit(); continue
                 route = 'signal-' + hashlib.sha256(target.encode()).hexdigest()[:24]
                 if time.monotonic()-self.last_send.get(route,-60)<30:
                     continue
                 if paused(): return
                 params={'message':p['message']}
+                params.update(quote)
+                if p.get('attachments'):
+                    try:
+                        stored = db.execute('SELECT files FROM attachments WHERE request_id=?', (row['id'],)).fetchone()
+                        files = json.loads(stored['files']) if stored else []
+                        checked = attachments.validate([{k: f[k] for k in ('filename', 'content_type', 'data')} for f in files])
+                        if attachments.metadata(checked) != p['attachments']:
+                            raise ValueError('attachment integrity mismatch')
+                        params['attachments'] = attachments.data_uris(checked)
+                    except (ValueError, KeyError, TypeError):
+                        db.execute("UPDATE actions SET phase='blocked',receipt=? WHERE id=?",
+                                   (encoded({'error':'attachment snapshot unavailable or corrupt'}), row['id']))
+                        db.commit(); continue
                 params.update({'groupId':group} if group else {'recipient':[target[3:]]})
                 db.execute("UPDATE actions SET phase='sending' WHERE id=? AND phase='queued'",(row['id'],))
                 db.commit()
                 try:
-                    result=self.rpc.call('send',params)
+                    result=(self.rpc.call('send',params,timeout=120) if p.get('attachments')
+                            else self.rpc.call('send',params))
                     if (not isinstance(result,dict) or not result.get('timestamp') or not result.get('results') or
                             any(r.get('type')!='SUCCESS' for r in result['results'])):
                         raise RuntimeError('Signal has no acceptance receipt')
@@ -606,7 +623,20 @@ class Bridge:
                     db.execute("UPDATE actions SET phase='uncertain' WHERE id=?",(row['id'],));db.commit()
                     raise
                 db.execute("UPDATE actions SET phase='submitted',receipt=? WHERE id=?",(encoded(result),row['id']))
+                db.execute('DELETE FROM attachments WHERE request_id=?', (row['id'],))
                 db.commit(); self.last_send[route]=time.monotonic()
+
+    def attachment_reply(self, payload):
+        """Resolve the quote from our spool, never caller-supplied author/text."""
+        row = self.spool.db.execute('SELECT payload,phase,mode FROM inbox WHERE id=?',
+                                    (payload['reply_to'],)).fetchone()
+        if not row or row['phase'] != 'queued' or row['mode'] in {'context_only', 'digest', 'emoji_only'}:
+            raise ValueError('reply is not eligible for a file/text response')
+        item = json.loads(row['payload'])
+        if item['conversation'] != payload['target'] or not allowed(item, self.policy) or item.get('reaction'):
+            raise ValueError('reply must answer an allowed message in this conversation')
+        return {'quoteTimestamp': item['timestamp'], 'quoteAuthor': item['sender_aci'],
+                'quoteMessage': quote_text(item['body'])}
 
     def held(self, conversation):
         """An inline ask (custos-actions signal-ask) owns this DM until it is released or expires."""

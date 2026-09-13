@@ -22,8 +22,10 @@ import hashlib
 import http.client
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
+import custos_attachments as attachments
 
 HOST, PORT = '192.168.86.44', 18082
 
@@ -68,21 +70,43 @@ def guard(route):
             raise ValueError((result.stderr or result.stdout).strip().replace('chat: error: ', '') or 'refused by the conversation guard')
 
 
-def record(route, message, request_id, phase):
+def record(route, message, request_id, phase, files=None, reply_to=None):
     """Append the accepted send to the root trajectory as a message step."""
     root = os.environ.get('ROOT_TRAJ_ID') or os.environ.get('TRAJ_ID')
     if not root:
         return
     step = {'type': 'message', 'from': os.environ.get('IDENTITY_NAME', 'custos'), 'to': route, 'content': message,
             'source': 'custos-actions', 'delivered_by': 'custos-actions', 'request_id': request_id, 'phase': phase}
+    if files:
+        step['attachments'] = attachments.metadata(attachments.validate(files))
+    if reply_to:
+        step['reply_to'] = reply_to
     subprocess.run(['traj', 'append', root], input=json.dumps(step, ensure_ascii=False), text=True, capture_output=True, timeout=30)
+
+
+def resolve_reply(step, route):
+    if len(step) < 4:
+        raise ValueError('reply-to needs a unique native step ID or prefix')
+    matches = []
+    for path in (Path(os.environ['IDENTITY_DIR']) / '.state' / 'transport').glob('*.json'):
+        record = json.loads(path.read_text())
+        if record['step_id'].startswith(step):
+            matches.append(record)
+    if len(matches) != 1 or matches[0]['phase'] != 'queued' or matches[0]['original']['sender'] != route:
+        raise ValueError('reply-to must uniquely name a delivered message in this conversation')
+    return matches[0]['original']['request_id'], matches[0]['step_id']
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('action', choices=['signal-contacts', 'signal-send', 'signal-ask', 'signal-await', 'signal-release', 'automata-status', 'automata-deploy', 'automata-rollback', 'status'])
-    p.add_argument('request_id', nargs='?'); args = p.parse_args()
+    p.add_argument('request_id', nargs='?')
+    p.add_argument('--attach', action='append', default=[], metavar='FILE', help='attach a guest file (repeat up to four; 8 MiB total)')
+    p.add_argument('--reply-to', metavar='STEP', help='quote a delivered native Signal message (unique step ID/prefix)')
+    args = p.parse_args()
     try:
+        if (args.attach or args.reply_to) and args.action != 'signal-send':
+            raise ValueError('--attach and --reply-to are for signal-send')
         if args.action in ('signal-send', 'signal-ask', 'automata-deploy', 'automata-rollback'):
             raw = sys.stdin.buffer.read(32769)
             if len(raw) > 32768: raise ValueError('request too large')
@@ -96,6 +120,7 @@ def main():
         elif args.request_id:
             raise ValueError('unexpected request ID argument')
         route = None
+        reply_step = None
         if args.action == 'signal-send':
             if not isinstance(payload.get('message'), str) or not isinstance(payload.get('request_id'), str):
                 raise ValueError('signal-send needs request_id, target and message')
@@ -109,14 +134,31 @@ def main():
             except ValueError as refusal:
                 print(json.dumps({'ok': False, 'error': 'not sent: ' + str(refusal), 'request_id': payload['request_id']}))
                 return 1
+            if args.attach:
+                if 'attachments' in payload:
+                    raise ValueError('use --attach or JSON attachments, not both')
+                payload['attachments'] = attachments.read_files(args.attach)
+            if 'attachments' in payload:
+                attachments.validate(payload['attachments'])
+            if args.reply_to:
+                if 'reply_to' in payload:
+                    raise ValueError('use --reply-to or JSON reply_to, not both')
+                payload['reply_to'], reply_step = resolve_reply(args.reply_to, route)
         payload['action'] = args.action
         status, result = call(payload)
         print(json.dumps(result, ensure_ascii=False))
         ok = status == 200 and result.get('ok')
         if ok and route is not None:
-            record(route, payload['message'], payload['request_id'], result.get('phase', 'queued'))
+            if payload.get('attachments') or reply_step:
+                record(route, payload['message'], payload['request_id'], result.get('phase', 'queued'),
+                       payload.get('attachments'), reply_step)
+            else:
+                record(route, payload['message'], payload['request_id'], result.get('phase', 'queued'))
         return 0 if ok else 1
-    except (ValueError, OSError, http.client.HTTPException, RecursionError, subprocess.SubprocessError):
+    except ValueError as error:
+        print(json.dumps({'ok': False, 'error': str(error)[:200]}))
+        return 2
+    except (OSError, http.client.HTTPException, RecursionError, subprocess.SubprocessError):
         print(json.dumps({'ok': False, 'error': 'Unavailable or invalid request; a write may be queued. Check status and reuse its exact request ID.'}))
         return 2
 

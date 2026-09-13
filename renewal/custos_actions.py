@@ -19,6 +19,7 @@ import threading
 import time
 import selectors
 from custos_signal import load_policy, encoded, MAX_TEXT
+import custos_attachments as attachments
 
 STATE = '/var/lib/custos-actions/actions.sqlite'
 POLICY = '/etc/custos-signal/policy.json'
@@ -26,6 +27,7 @@ SPOOL = '/var/lib/custos-signal-bridge/spool.sqlite'  # the bridge's inbox, read
 ASK_DAILY, ASK_SPACING, ASK_WAIT_MAX, ASK_ANNOTATE = 8, 60, 900, 1800  # Jack and Kim approved ~8/day (2026-09-10)
 CHECKOUT = '/opt/custos/work/repos/collettiquette/automata'
 MAX_BODY = 32768
+UPLOAD_SLOT = threading.BoundedSemaphore(1)  # keep 8 MiB uploads inside the 256 MiB service budget
 
 
 class Connection(sqlite3.Connection):
@@ -47,6 +49,7 @@ def connect(path=STATE):
     # while the hold is live; the asking step reads them through signal-await instead.
     db.execute('CREATE TABLE IF NOT EXISTS holds (conversation TEXT PRIMARY KEY, request_id TEXT NOT NULL, '
                'created REAL NOT NULL, expires REAL NOT NULL, released REAL)')
+    db.execute('CREATE TABLE IF NOT EXISTS attachments (request_id TEXT PRIMARY KEY, files TEXT NOT NULL, size INTEGER NOT NULL)')
     return db
 
 
@@ -89,15 +92,23 @@ def validate(payload, policy):
     action = payload.get('action')
     fields = {'signal-send': {'target', 'message'}, 'signal-ask': {'target', 'message', 'wait_seconds'},
               'automata-deploy': {'commit', 'goal_id'}, 'automata-rollback': {'goal_id'}}
-    if action not in fields or set(payload) != fields[action] | {'action', 'request_id'}:
+    optional = {'attachments', 'reply_to'} if action == 'signal-send' else set()
+    if (action not in fields or not fields[action] | {'action', 'request_id'} <= set(payload) or
+            set(payload) - (fields[action] | {'action', 'request_id'} | optional)):
         raise ValueError('invalid action fields')
     if not isinstance(payload['request_id'], str) or not re.fullmatch(r'[A-Za-z0-9:._-]{1,128}', payload['request_id']):
         raise ValueError('stable request_id required')
     p = dict(payload)
     if action in ('signal-send', 'signal-ask'):
         p['target'] = resolve(p['target'], policy)
-        if not isinstance(p['message'], str) or not p['message'].strip() or len(p['message'].encode()) > MAX_TEXT:
-            raise ValueError('message must contain 1..12000 UTF-8 bytes')
+        if 'attachments' in p:
+            p['attachments'] = attachments.validate(p['attachments'])
+        if (not isinstance(p['message'], str) or len(p['message'].encode()) > MAX_TEXT or
+                (not p['message'].strip() and not p.get('attachments'))):
+            raise ValueError('message needs text or attachments; caption max 12000 UTF-8 bytes')
+        if 'reply_to' in p and (not isinstance(p['reply_to'], str) or
+                                not re.fullmatch(r'[A-Za-z0-9:._-]{1,128}', p['reply_to'])):
+            raise ValueError('reply_to must be an inbound Signal request ID')
         if action == 'signal-ask':
             if not p['target'].startswith('dm:'):
                 raise ValueError('an inline ask goes to one person or bot by DM, never a group')
@@ -182,12 +193,21 @@ class Channel:
                  '/usr/local/libexec/custos-automata-deploy.py','status'], timeout=25).decode())}
         # Resolve labels once; store the fixed routing target, not a mutable alias.
         p = validate(payload, load_policy(self.policy))
+        files = p.get('attachments')
+        if files:
+            p['attachments'] = attachments.metadata(files)
         with connect(self.state) as db:
             db.execute('BEGIN IMMEDIATE')
             old = db.execute('SELECT * FROM actions WHERE id=?', (p['request_id'],)).fetchone()
             if old:
                 if old['payload'] != encoded(p): raise ValueError('request_id belongs to different content')
                 return receipt(old)
+            if files:
+                size = sum(f['size'] for f in files)
+                pending = db.execute('SELECT COALESCE(SUM(size),0) FROM attachments').fetchone()[0]
+                if pending + size > attachments.MAX_QUEUED_BYTES:
+                    raise ValueError('attachment queue full; reconcile pending/uncertain sends first')
+                db.execute('INSERT INTO attachments VALUES(?,?,?)', (p['request_id'], encoded(files), size))
             now = time.time()
             if p['action'] == 'signal-ask':
                 open_hold = active_hold(db, p['target'], now)
@@ -290,16 +310,22 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def do_POST(self):
         code = 200
+        upload_slot = False
         try:
             if self.client_address[0] != '192.168.86.52':
                 code=403; raise ValueError('client not allowed')
             if self.path not in {'/v1/actions','/v1/harness'}:
                 code=404; raise ValueError('unknown path')
             lengths=self.headers.get_all('Content-Length', [])
+            maximum = attachments.MAX_WIRE if self.path == '/v1/actions' else MAX_BODY
             if (self.headers.get('Transfer-Encoding') or len(lengths)!=1 or
-                not re.fullmatch(r'[0-9]{1,6}',lengths[0]) or not 0<int(lengths[0])<=MAX_BODY or
+                not re.fullmatch(r'[0-9]{1,8}',lengths[0]) or not 0<int(lengths[0])<=maximum or
                 self.headers.get_content_type()!='application/json'):
                 raise ValueError('bounded JSON body required')
+            if int(lengths[0]) > MAX_BODY:
+                upload_slot = UPLOAD_SLOT.acquire(blocking=False)
+                if not upload_slot:
+                    code=503; raise ValueError('attachment upload busy; retry the exact request ID and files')
             raw=self.rfile.read(int(lengths[0]))
             if len(raw)!=int(lengths[0]): raise ValueError('incomplete body')
             if self.path=='/v1/harness':
@@ -312,11 +338,17 @@ class Handler(BaseHTTPRequestHandler):
                     if len(line)>1024*1024 or not line.endswith(b'\n'):raise ValueError('invalid supervisor response')
                     result=json.loads(line)
             else:
-                result=self.server.channel.handle(json.loads(raw))
+                payload = json.loads(raw)
+                if len(raw) > MAX_BODY and (not isinstance(payload, dict) or payload.get('action') != 'signal-send'):
+                    raise ValueError('large bodies are only allowed for signal-send attachments')
+                result=self.server.channel.handle(payload)
         except (ValueError, UnicodeError, RecursionError) as error:
             code=400 if code==200 else code; result={'ok':False,'error':str(error)[:200]}
         except Exception:
             code=503; result={'ok':False,'error':'unavailable; reuse original request_id'}
+        finally:
+            if upload_slot:
+                UPLOAD_SLOT.release()
         body=encoded(result).encode()
         try:
             self.send_response(code); self.send_header('Content-Type','application/json')
