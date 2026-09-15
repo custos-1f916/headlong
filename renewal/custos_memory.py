@@ -1361,6 +1361,7 @@ QUICK_ASK = re.compile(r"\b(grocer(?:y|ies)|cart|menu|meal ?plan|dinners?|recipe
                        r"peanut butter|tahini|milk|bananas?|apples?)\b", re.I)
 QUICK_ASK_BUILD = re.compile(r"\b(build|implement|code|coding|deploy|repo|repository|refactor|redesign|research|audit|investigate|"
                              r"write[- ]?up|paper|arxiv|simulation|feature|toggle|rename|reset|dashboard|harness)\b", re.I)
+REMINDER_ASK = re.compile(r"\b(remind(?:er|ers|ing)?|nudge|alarm|ping\s+(?:me|us|him|her|them))\b", re.I)
 ASK_SHAPE = re.compile(r"\b(add|can you|could you|would you|please|put|order|get|grab|swap|remove|take\b.{0,30}\boff|change|make|"
                        r"include|we need|i need|i['’]d like|i want|don['’]t need|skip|instead)\b", re.I)
 
@@ -1372,12 +1373,19 @@ def is_quick_ask(authority, *texts):
     if authority != "operator":
         return False
     blob = " ".join(t for t in texts if t)
+    if REMINDER_ASK.search(blob):
+        return False
     return bool(QUICK_ASK.search(blob)) and not QUICK_ASK_BUILD.search(blob)
 
 
 def quick_hint(body):
     """The exact command a quick kitchen ask needs, as the goal's next action. 2026-09-12: four of Dani's asks
     carried "add it during next week's planning workflow" and sat all day; the command is the plan."""
+    if (re.search(r"\b(what(?:['’]s| is)|which)\b.{0,40}\b(meal|dinner|recipe)\b", body, re.I)
+            and re.search(r"\b(today|tonight|tomorrow|yesterday|this week|last week|\d{4}-\d{2}-\d{2})\b", body, re.I)):
+        return ("NOW (this wake, one read-only command): run `mealplan meals today|tomorrow|YYYY-MM-DD|--week YYYY-Www` "
+                "for the requested date, then reply with the recorded title and recipes.ha1.io link; if none is recorded, say so. "
+                "Do not change the plan or substitute a different week's draft.")
     if re.search(r"https?://", body):
         return ("NOW (this wake, one or two commands): `mealplan recipe import URL` (a page already in the catalog is returned, "
                 "not duplicated), then `mealplan plan request SLUG --note \"who asked, when\"` so the next draft includes it; "

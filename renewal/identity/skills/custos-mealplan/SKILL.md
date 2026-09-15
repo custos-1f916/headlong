@@ -81,6 +81,20 @@ responder tags them QUICK; the social thinker and the mind both take them), and 
 - What is **not** quick: anything that means building, coding, research or reading a repo (a baby-name
   feature, an audit, a redesign). Those stay with the mind as ordinary deferred work.
 
+## Looking up this week's and historical meals
+
+Questions such as “what's for dinner?”, “what's the meal tomorrow?”, “what did we
+make last Tuesday?”, or “show me this week's meals” are read-only lookups, not
+planning work. Run `mealplan meals today`, `mealplan meals tomorrow`,
+`mealplan meals YYYY-MM-DD`, or `mealplan meals --week YYYY-Www`. With no selector,
+`mealplan meals` shows the current Mountain-time ISO week; it deliberately does not
+use the next-pickup planning week. Each recorded dinner includes its canonical
+`https://recipes.ha1.io/g/home/r/SLUG` link. Reply with the title and that link.
+If the command says no meal is recorded for the date, say exactly that; do not
+substitute a draft from another week or invent a link. `--json` is available when
+you need the exact dates/status. Historical queries read the retained weekly plan
+files through the kitchen API and do not modify the plan, catalog, or cart.
+
 ## The week (Hal, 2026-09-10: "We can always decline, that's a valid way to stop the week's meal plan")
 
 The planning week is the week of the **next Saturday pickup** (`mealplan plan show` defaults to it;

@@ -1374,6 +1374,9 @@ class QuickAskTests(MemoryFixture):
         self.assertFalse(cm.is_quick_ask("operator", "Could we add another feature to turn on a middle name, like we toggled on last name?"))
         self.assertFalse(cm.is_quick_ask("operator", "A thorough audit and, if warranted, a redesign of Automata"))
         self.assertFalse(cm.is_quick_ask("external", "Add a jar of soom brand tahini"))  # a friend's grocery talk is not their order
+        self.assertFalse(cm.is_quick_ask("operator", "Could you remind me tomorrow at 6:15 to put rice in the rice cooker?"))
+        self.assertTrue(cm.is_quick_ask("operator", "What's the meal tomorrow? Please send the recipe link."))
+        self.assertIn("mealplan meals", cm.quick_hint("What's the meal tomorrow?"))
 
     def test_plain_reply_to_operator_kitchen_ask_becomes_defer_with_command_next_action(self):
         incoming = self.dani("Can you add Annie's white cheddar microwaveable Mac and cheese cups to the grocery cart for next week? It's usually a 4 pack.")

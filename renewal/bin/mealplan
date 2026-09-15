@@ -6,6 +6,8 @@
   mealplan recipes [--q text] [--book B] one line per recipe
   mealplan recipe SLUG                   ingredients + steps
   mealplan recipe import URL [--note why] a recipe link from Hal or Dani -> the catalog (Mealie's scraper, tag "Requested"); returns the slug + link
+  mealplan meals [today|tomorrow|YYYY-MM-DD|YYYY-Www]  current or historical planned meals, with recipes.ha1.io links
+  mealplan meals --week YYYY-Www         every recorded dinner in a specific week
   mealplan plan show [--week YYYY-Www]   the week's plan (default: the week of the next Saturday pickup)
   mealplan plan set --week W --dinner DATE=SLUG ... [--note text]
   mealplan plan proposed                 record that the week's first message went out
@@ -51,7 +53,8 @@
 Config: /etc/kitchen.env with KITCHEN_URL and KITCHEN_TOKEN (Hal installs it).
 """
 import argparse, json, os, re, subprocess, sys, urllib.parse, urllib.request
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 GROUP = os.environ.get("MEALPLAN_GROUP", "Collette Haus")
 
@@ -142,6 +145,30 @@ def next_week():
     d = date.today(); d = d + timedelta(days=((5 - d.weekday()) % 7) or 7); y, w, _ = d.isocalendar(); return f"{y}-W{w:02d}"
 
 
+def meals_scope(selector=None, week=None, date_option=None, today=None):
+    """Resolve a family-facing meal lookup in Mountain time, never the host's UTC date."""
+    chosen = [value for value in (selector, week, date_option) if value]
+    if len(chosen) > 1:
+        raise ValueError("meals takes one of today, tomorrow, YYYY-MM-DD, YYYY-Www, --date or --week")
+    base = today or datetime.now(ZoneInfo(os.environ.get("MEALPLAN_TIMEZONE", "America/Denver"))).date()
+    value = chosen[0] if chosen else None
+    if value in ("today", "tomorrow"):
+        target = base + timedelta(days=value == "tomorrow")
+        y, w, _ = target.isocalendar()
+        return f"{y}-W{w:02d}", target.isoformat()
+    if value and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        target = date.fromisoformat(value)
+        y, w, _ = target.isocalendar()
+        return f"{y}-W{w:02d}", target.isoformat()
+    if value and re.fullmatch(r"\d{4}-W\d{2}", value):
+        date.fromisocalendar(int(value[:4]), int(value[-2:]), 1)
+        return value, None
+    if value:
+        raise ValueError("meals selector must be today, tomorrow, YYYY-MM-DD or YYYY-Www")
+    y, w, _ = base.isocalendar()
+    return f"{y}-W{w:02d}", None
+
+
 def show_prefs(p):
     print("constraints:", ", ".join(f"{k}={v}" for k, v in p.get("constraints", {}).items()))
     for k in ("rules", "questions", "likes", "dislikes", "brands"):
@@ -207,6 +234,22 @@ def main():
         print(f"{r['title']} — {r['book'] or ''} {r['yield'] or ''} {r['total_time'] or ''}\n{r.get('description') or ''}\ningredients:")
         [print("  - " + i) for i in r["ingredients"]]
         print("steps:"); [print(f"  {n}. {s}") for n, s in enumerate(r["steps"], 1)]
+    elif a.cmd == "meals":
+        try:
+            meals_week, target_date = meals_scope(a.sub, a.week, a.date)
+        except ValueError as error:
+            sys.exit(str(error))
+        plan = call("GET", f"/plans/{meals_week}")
+        dinners = [d for d in plan.get("dinners", []) if not target_date or d.get("date") == target_date]
+        result = {"week": meals_week, "date": target_date, "status": plan.get("status"), "dinners": dinners}
+        if a.json:
+            print(json.dumps(result, indent=1, ensure_ascii=False)); return
+        print((target_date or meals_week) + f" planned meals (status={plan.get('status') or 'unknown'}):")
+        if not dinners:
+            print("  No planned meal is recorded" + (f" for {target_date}." if target_date else " for this week."))
+        for dinner in dinners:
+            print(f"  {dinner.get('date') or '????-??-??'}  {dinner.get('title') or dinner.get('slug') or '(untitled)'}")
+            print("    " + (dinner.get("url") or "No recipes.ha1.io link is recorded."))
     elif a.cmd == "plan":
         if a.sub == "show":
             show_plan(call("GET", f"/plans/{wk}"))

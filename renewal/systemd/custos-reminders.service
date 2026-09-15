@@ -1,0 +1,15 @@
+[Unit]
+Description=Dispatch due Custos Signal reminders without inference
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=HOME=/root
+Environment=HEADLONG_IDENTITY=custos
+EnvironmentFile=/etc/custos-headlong.env
+ExecStart=/bin/bash -c 'source /root/.headlong/app/.identities/custos/activate >/dev/null 2>&1; exec /usr/local/bin/custos-reminders dispatch'
+TimeoutStartSec=180
+UMask=0077
