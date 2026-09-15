@@ -213,6 +213,20 @@ class PersonAliasRemoveTests(MemoryFixture):
         self.assertIn("contradicts distinct-person prose", result["problems"][0]["error"])
         repaired = people.remove_alias(person_id, "Jack")
         self.assertTrue(repaired["removed"])
+
+    def test_multiple_distinct_person_aliases_are_removed_atomically(self):
+        people, person_id = self.create_person()
+        path, header = self.store.find(person_id)[:2]
+        body = ("Person: Hal\n\n'Jack'/'jack' in this note's aliases is a distinct person, not Hal."
+                + cm.PERSON_MARKER + cm.encode({"person_key": "hal", "display": "Hal",
+                                                "aliases": ["Hal", "Jack", "jack"],
+                                                "routes": ["signal:hal"],
+                                                "updated": "2020-01-01T00:00:00+00:00"}))
+        path.write_text("---\n" + header + "\n---\n\n" + body + "\n")
+        repaired = people.remove_alias(person_id, "Jack", "jack")
+        self.assertEqual(repaired["aliases"], ["Jack", "jack"])
+        self.assertTrue(repaired["removed"])
+        self.assertEqual(people.find("hal")[1]["aliases"], ["Hal"])
         self.assertEqual(self.store.validate([str(path)])["problems"], [])
 
     def test_person_normalize_deduplicates_only_updated_history_and_is_idempotent(self):

@@ -1065,15 +1065,17 @@ class People:
                     "routes": len(routes), "notes_chars": len(notes), "preimages": preimages,
                     "archived": str(merged_dir / spath.name)}
 
-    def remove_alias(self, person_id, alias):
-        """Remove one exact alias from one native person note, preserving a preimage."""
+    def remove_alias(self, person_id, alias, *more_aliases):
+        """Atomically remove exact aliases from one native person note, preserving a preimage."""
         try:
             text(person_id, "person_id", 8)
         except InvalidInput as exc:
             raise MemoryError("person-alias-remove person_id must be a full native eight-hex ID") from exc
         if not re.fullmatch(r"[0-9a-f]{8}", person_id):
             raise MemoryError("person-alias-remove person_id must be a full native eight-hex ID")
-        alias = text(alias, "alias", 48)
+        requested = list(dict.fromkeys(text(value, "alias", 48)
+                                       for value in (alias,) + more_aliases))
+        result_key = {"alias": requested[0]} if len(requested) == 1 else {"aliases": requested}
         with self.store.lock():
             matches = [item for item in self.store.files() if item[3].get("id") == person_id]
             if not matches:
@@ -1096,11 +1098,11 @@ class People:
             aliases = meta.get("aliases")
             if not isinstance(aliases, list) or not all(isinstance(value, str) for value in aliases):
                 raise MemoryError("person-alias-remove selected person has invalid aliases")
-            if alias not in aliases:
-                return {"person_id": person_id, "alias": alias, "removed": False,
+            if not any(value in aliases for value in requested):
+                return {"person_id": person_id, **result_key, "removed": False,
                         "unchanged": True, "preimage": None}
             updated = dict(meta)
-            updated["aliases"] = [value for value in aliases if value != alias]
+            updated["aliases"] = [value for value in aliases if value not in requested]
             updated["updated"] = now()
             identity = os.environ.get("IDENTITY_DIR")
             base = Path(identity) if identity else self.store.directory.parent
@@ -1113,7 +1115,7 @@ class People:
             prefix = body.rsplit(PERSON_MARKER, 1)[0]
             rewritten = prefix + PERSON_MARKER + encode(updated)
             self.store.commit(rewritten, memory_type="person", existing=item)
-            return {"person_id": person_id, "alias": alias, "removed": True,
+            return {"person_id": person_id, **result_key, "removed": True,
                     "unchanged": False, "preimage": str(preimage)}
 
     def normalize(self, person_id):
@@ -2274,7 +2276,7 @@ Examples (replace the sample ID and evidence with actual values):
   custos-memory validate                       # every record + the trajectory's captured provenance; exit 1 on a problem
   custos-memory validate memories/FILE.md      # one file, the way the store reads it (mem add/edit run this on managed records)
   custos-memory person-merge SOURCE_ID TARGET_ID   # fold a duplicate person note into the kept one; preimages archived
-  custos-memory person-alias-remove PERSON_ID ALIAS # remove one exact alias; preimage archived before mutation
+  custos-memory person-alias-remove PERSON_ID ALIAS [ALIAS ...] # atomically remove exact aliases; preimage archived
 An acknowledgment alone is not completion. Valid dispositions: completed, declined, abandoned.''')
     parser.add_argument("command", choices=["capture", "capture-envelope", "context", "pending", "show", "update", "complete", "respond",
                                             "replay-unanswered", "archive-conversations", "expire-asks", "note", "check",
@@ -2347,9 +2349,9 @@ An acknowledgment alone is not completion. Valid dispositions: completed, declin
             print(encode(People(store).merge(args.goal_id, args.words[0], notes)))
             return 0
         if args.command == "person-alias-remove":
-            if not args.goal_id or len(args.words) != 1:
-                raise InvalidInput("usage: custos-memory person-alias-remove PERSON_ID ALIAS")
-            print(encode(People(store).remove_alias(args.goal_id, args.words[0])))
+            if not args.goal_id or not args.words:
+                raise InvalidInput("usage: custos-memory person-alias-remove PERSON_ID ALIAS [ALIAS ...]")
+            print(encode(People(store).remove_alias(args.goal_id, args.words[0], *args.words[1:])))
             return 0
         if args.command == "person-normalize":
             if not args.goal_id or args.words:
