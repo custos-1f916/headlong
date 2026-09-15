@@ -212,7 +212,10 @@ def parse_memory_file(path, strict_person=False):
             # A note may discuss other people, but an alias explicitly called a
             # distinct person cannot simultaneously resolve to this record.
             named = re.escape(alias)
-            if re.search(r"(?:['\"]" + named + r"['\"]|\b" + named + r"\b).{0,100}\bis a distinct person\b", prose, re.I | re.S):
+            if re.search(r"(?:['\"]" + named + r"['\"]|\b" + named + r"\b)"
+                         r"(?:\s*/\s*['\"][^'\"]+['\"])?\s+"
+                         r"(?:in\s+this\s+note(?:'s)?\s+aliases\s+)?is\s+a\s+distinct\s+person\b",
+                         prose, re.I):
                 raise MemoryError("person alias contradicts distinct-person prose: " + alias)
     return path, header, body, fields, record
 

@@ -202,16 +202,16 @@ class PersonAliasRemoveTests(MemoryFixture):
         self.assertEqual(notes, "Hal is my operator.")
 
     def test_distinct_person_alias_is_rejected_and_supported_remove_repairs_it(self):
-        person_id = self.store.commit(
-            "Person: Hal\n\n'Jack' in this note's aliases is a distinct person, not Hal."
-            + cm.PERSON_MARKER + cm.encode({"person_key": "hal", "display": "Hal",
-                                            "aliases": ["Hal", "Jack"], "routes": ["signal:hal"],
-                                            "updated": "2020-01-01T00:00:00+00:00"}),
-            memory_type="person")
-        path = self.store.find(person_id)[0]
+        people, person_id = self.create_person()
+        path, header = self.store.find(person_id)[:2]
+        body = ("Person: Hal\n\n'Jack' in this note's aliases is a distinct person, not Hal."
+                + cm.PERSON_MARKER + cm.encode({"person_key": "hal", "display": "Hal",
+                                                "aliases": ["Hal", "Jack"], "routes": ["signal:hal"],
+                                                "updated": "2020-01-01T00:00:00+00:00"}))
+        path.write_text("---\n" + header + "\n---\n\n" + body + "\n")
         result = self.store.validate([str(path)])
         self.assertIn("contradicts distinct-person prose", result["problems"][0]["error"])
-        repaired = cm.People(self.store).remove_alias(person_id, "Jack")
+        repaired = people.remove_alias(person_id, "Jack")
         self.assertTrue(repaired["removed"])
         self.assertEqual(self.store.validate([str(path)])["problems"], [])
 
@@ -219,14 +219,16 @@ class PersonAliasRemoveTests(MemoryFixture):
         people, person_id = self.create_person()
         path = people.find("hal")[0][0]
         raw = path.read_text()
-        line = next(line for line in raw.splitlines() if line.startswith("  - "))
-        path.write_text(raw.replace(line, line + "\n" + line, 1))
+        created = next(line for line in raw.splitlines() if line.startswith("created: "))
+        duplicate = "updated:\n  - 2026-09-14 01:02:03\n  - 2026-09-14 01:02:03"
+        damaged = raw.replace(created, created + "\n" + duplicate, 1)
+        path.write_text(damaged)
         body_before = cm.split_memory(path.read_text())[1]
         result = people.normalize(person_id)
         self.assertTrue(result["normalized"])
         self.assertEqual(result["duplicates_removed"], 1)
         self.assertEqual(cm.split_memory(path.read_text())[1], body_before)
-        self.assertEqual(Path(result["preimage"]).read_text(), raw.replace(line, line + "\n" + line, 1))
+        self.assertEqual(Path(result["preimage"]).read_text(), damaged)
         second = people.normalize(person_id)
         self.assertFalse(second["normalized"])
         self.assertIsNone(second["preimage"])
@@ -235,8 +237,8 @@ class PersonAliasRemoveTests(MemoryFixture):
         people, person_id = self.create_person()
         path = people.find("hal")[0][0]
         raw = path.read_text()
-        line = next(line for line in raw.splitlines() if line.startswith("  - "))
-        path.write_text(raw.replace(line, line + "\n" + line, 1))
+        created = next(line for line in raw.splitlines() if line.startswith("created: "))
+        path.write_text(raw.replace(created, created + "\nupdated:\n  - 2026-09-14 01:02:03\n  - 2026-09-14 01:02:03", 1))
         completed = subprocess.run([sys.executable, cm.__file__, "person-normalize", person_id],
                                    text=True, capture_output=True, timeout=10, check=False)
         self.assertEqual(completed.returncode, 0, completed.stderr)
