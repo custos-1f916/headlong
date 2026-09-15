@@ -1814,14 +1814,6 @@ def response(store, payload):
                 "Signal context-only message noted; no reply or task accepted." if context_only else "Reaction event noted; no reply needed.",
                 "Noted context-only Signal conversation (no model call)" if context_only else "Noted a reaction from " + who + " (no model call)",
                 started)
-        if not saved and incoming["sender"].startswith("square:"):
-            budget = square_budget()
-            if budget and budget["queued"] >= budget["comments_remaining"]:
-                return settle_without_inference(
-                    store, goal_id, trigger, payload, who_key, "square_capacity_unavailable",
-                    "Square reply was not composed because every remaining delivery slot was already reserved by the outbox.",
-                    "Skipped square reply before model composition: no unreserved delivery slot (queued %d, remaining %d)." %
-                    (budget["queued"], budget["comments_remaining"]), started)
         if not saved:
             system = text(payload["system"], "system prompt", 98304) + RESPONSE_CONTRACT
             if incoming.get('signal_routing'):

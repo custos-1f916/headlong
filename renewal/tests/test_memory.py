@@ -921,7 +921,7 @@ class ResponderTests(MemoryFixture):
         self.assertIn("I will look into it.", seen["system"])
         self.assertIn("prefer a reaction or no-reply", seen["system"])
 
-    def test_square_responder_reserves_capacity_before_composition(self):
+    def test_square_responder_sees_the_daily_allowance_and_queue(self):
         # The observer has seen /api/me with the allowance spent, and two of Custos's
         # square replies sit in the trajectory past the outbox cursor.
         import custos_square
@@ -942,10 +942,9 @@ class ResponderTests(MemoryFixture):
                            "content": "@custos what do you make of this?", "step_id": "trigger-sq"}
         self.log.write_text(self.log.read_text() + cm.encode(square_envelope) + "\n")
         request = {**self.request, "envelope": square_envelope, "messages": [{"role": "user", "content": square_envelope["content"]}]}
-        seen = {"model_calls": 0}
+        seen = {}
         def capture_system(argv, *args, **kwargs):
             if argv[0] == "llm":
-                seen["model_calls"] += 1
                 seen["system"] = argv[argv.index("-s") + 1]
                 return cm.encode({**self.plan, "decision": "no-reply", "reply": "", "goal": None, "person": None})
             return self.real_run(argv, *args, **kwargs)
@@ -954,19 +953,16 @@ class ResponderTests(MemoryFixture):
             cm.response(self.store, request)
             budget = cm.square_budget()
             hint = cm.context_text(self.store.context())
-        self.assertEqual(seen["model_calls"], 0)
-        record = self.store.request("square:c50000")[4]
-        self.assertEqual(record["response"]["reason"], "square_capacity_unavailable")
-        self.assertFalse(record["response"]["inference"])
+        self.assertIn("Square allowance (data): 0 comments left today of 20, 2 of your replies still queued", seen["system"])
+        self.assertIn("a queued reply is not a delivered one", seen["system"])
         self.assertEqual((budget["comments_remaining"], budget["queued"]), (0, 2))
         self.assertIn("2 of your replies still queued", hint)
         self.assertIn("custos-observe withdraw STEP_ID", hint)
         # A Signal message never carries the square budget.
-        seen = {"model_calls": 0}
+        seen.clear()
         with mock.patch.dict(os.environ, {"CUSTOS_OBSERVE_STATE": str(state)}), mock.patch.object(custos_square, "STATE", state), \
                 mock.patch.object(cm, "run", side_effect=capture_system):
             cm.response(self.store, self.request)
-        self.assertEqual(seen["model_calls"], 1)
         self.assertNotIn("Square allowance", seen["system"])
 
     def test_context_flags_stale_and_duplicate_asks(self):

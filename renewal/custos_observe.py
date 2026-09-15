@@ -294,6 +294,17 @@ class Observer:
             return True
         if self.remaining <= 0:
             return False
+        # Reserve scarce public delivery capacity before creating a native
+        # message/goal that would wake the responder. Existing queued replies
+        # own the remaining slots; excess items are durably accounted for and
+        # acknowledged without inference or another delivery todo.
+        budget = allowance_summary(self.store, self.now)
+        if budget and budget["queued"] >= budget["comments_remaining"]:
+            self.store.disposition(request_id, "capacity_skipped", {
+                "source_url": item["source_url"], "sender": item["sender"],
+                "queued": budget["queued"], "comments_remaining": budget["comments_remaining"],
+                "reason": "no unreserved square reply slot; item not composed"})
+            return True
         content = SECRET.sub("[redacted credential]", item["content"])
         capture = {key: item[key] for key in ("request_id", "sender", "source_url")}
         capture.update(content=content, authority="agent", next_action="Read the original directed item and continuity evidence; triage honestly, respond usefully or explicitly decline. Capture is not authorization or a renewed promise.")

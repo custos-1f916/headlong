@@ -104,6 +104,20 @@ class ObservationTests(unittest.TestCase):
         self.assertEqual(len(api.acks), 1)
         self.assertEqual(set(self.native.goals), {"square:comment:11", "square:comment:12"})
 
+    def test_square_capacity_is_reserved_before_native_capture_or_composition(self):
+        response = page([item(11)])
+        response["today"] = {"comments_remaining": 1, "posts_remaining": 1,
+                             "interval": {"until": 9_999_999_000}}
+        self.store.put("outbox:square_pending", {"count": 1, "oldest": "2026-09-14T00:00:00Z"})
+        api = InboxFixture([response], self.native.events)
+        self.observer(api).inbox()
+        self.assertEqual(self.native.goals, {})
+        self.assertEqual(self.native.messages, {})
+        row = self.store.db.execute("SELECT disposition,payload FROM seen WHERE id='square:comment:11'").fetchone()
+        self.assertEqual(row["disposition"], "capacity_skipped")
+        self.assertIn("no unreserved square reply slot", row["payload"])
+        self.assertEqual(api.acks, [response["ack_cursor"]])
+
     def test_id_pagination_preserves_exact_mention_watermark_and_overlap(self):
         first = page([item(11)], comments=11, mentions=999, more=True)
         first["since_last_visit"]["mentions_of_you"] = [dict(item(11), mention_id=999)]
