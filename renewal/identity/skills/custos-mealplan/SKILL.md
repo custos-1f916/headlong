@@ -92,8 +92,8 @@ use the next-pickup planning week. Each recorded dinner includes its canonical
 `https://recipes.ha1.io/g/home/r/SLUG` link. Reply with the title and that link.
 If the command says no meal is recorded for the date, say exactly that; do not
 substitute a draft from another week or invent a link. `--json` is available when
-you need the exact dates/status. Historical queries read the retained weekly plan
-files through the kitchen API and do not modify the plan, catalog, or cart.
+you need the exact dates. Historical queries read Mealie's retained meal calendar
+through the kitchen API and do not modify the plan, catalog, or cart.
 
 ## The week (Hal, 2026-09-10: "We can always decline, that's a valid way to stop the week's meal plan")
 

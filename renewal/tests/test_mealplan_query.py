@@ -25,20 +25,21 @@ class MealQueryTests(unittest.TestCase):
         self.assertEqual(mealplan.meals_scope("2026-W04", today=today), ("2026-W04", None))
 
     def test_tomorrow_prints_only_that_meal_and_canonical_link(self):
-        plan = {"week": "2026-W38", "status": "final", "dinners": [
+        calendar = {"start": "2026-09-15", "end": "2026-09-15", "count": 1, "meals": [
             {"date": "2026-09-15", "title": "Cauliflower Curry", "slug": "cauliflower-curry",
              "url": "https://recipes.ha1.io/g/home/r/cauliflower-curry"},
-            {"date": "2026-09-16", "title": "Corn Pasta", "slug": "corn-pasta",
-             "url": "https://recipes.ha1.io/g/home/r/corn-pasta"},
         ]}
         out = io.StringIO()
         with patch.object(mealplan, "meals_scope", return_value=("2026-W38", "2026-09-15")), \
-             patch.object(mealplan, "call", return_value=plan), \
+             patch.object(mealplan, "call", return_value=calendar) as call, \
              patch.object(sys, "argv", ["mealplan", "meals", "tomorrow"]), redirect_stdout(out):
             mealplan.main()
+        call.assert_called_once_with("GET", "/meals", params={"start": "2026-09-15", "end": "2026-09-15"})
         self.assertIn("Cauliflower Curry", out.getvalue())
         self.assertIn("https://recipes.ha1.io/g/home/r/cauliflower-curry", out.getvalue())
-        self.assertNotIn("Corn Pasta", out.getvalue())
+
+    def test_week_query_uses_monday_through_sunday(self):
+        self.assertEqual(mealplan.meals_range("2026-W38"), ("2026-09-14", "2026-09-20"))
 
 
 if __name__ == "__main__":

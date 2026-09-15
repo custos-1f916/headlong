@@ -169,6 +169,14 @@ def meals_scope(selector=None, week=None, date_option=None, today=None):
     return f"{y}-W{w:02d}", None
 
 
+def meals_range(week, target_date=None):
+    if target_date:
+        return target_date, target_date
+    year, number = week.split("-W")
+    first = date.fromisocalendar(int(year), int(number), 1)
+    return first.isoformat(), (first + timedelta(days=6)).isoformat()
+
+
 def show_prefs(p):
     print("constraints:", ", ".join(f"{k}={v}" for k, v in p.get("constraints", {}).items()))
     for k in ("rules", "questions", "likes", "dislikes", "brands"):
@@ -239,12 +247,13 @@ def main():
             meals_week, target_date = meals_scope(a.sub, a.week, a.date)
         except ValueError as error:
             sys.exit(str(error))
-        plan = call("GET", f"/plans/{meals_week}")
-        dinners = [d for d in plan.get("dinners", []) if not target_date or d.get("date") == target_date]
-        result = {"week": meals_week, "date": target_date, "status": plan.get("status"), "dinners": dinners}
+        start, end = meals_range(meals_week, target_date)
+        calendar = call("GET", "/meals", params={"start": start, "end": end})
+        dinners = calendar.get("meals", [])
+        result = {"week": meals_week, "date": target_date, **calendar}
         if a.json:
             print(json.dumps(result, indent=1, ensure_ascii=False)); return
-        print((target_date or meals_week) + f" planned meals (status={plan.get('status') or 'unknown'}):")
+        print((target_date or meals_week) + " meals in recipes.ha1.io:")
         if not dinners:
             print("  No planned meal is recorded" + (f" for {target_date}." if target_date else " for this week."))
         for dinner in dinners:
