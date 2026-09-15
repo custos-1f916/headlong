@@ -23,7 +23,7 @@ SSH = ("/usr/bin/ssh", "-F", "/dev/null", "-T", "-o", "BatchMode=yes", "-o", "Id
        "-o", "ControlMaster=auto", "-o", "ControlPersist=60",
        "-o", "ControlPath=/run/custos-gateway/probe-control",
        "-o", "ClearAllForwardings=yes", "-o", "RequestTTY=no", "-i", "/etc/custos-gateway/probe_ed25519",
-       "user@192.168.86.117", "custos-backend-probe")
+       "user@johan.lan", "custos-backend-probe")
 
 
 def publish(value, directory=DIRECTORY):

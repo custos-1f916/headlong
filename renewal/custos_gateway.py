@@ -18,7 +18,7 @@ import stat
 import time
 from custos_images import inline_jpeg, MAX_IMAGES
 
-UPSTREAM = ("192.168.86.117", 8080)
+UPSTREAM = ("johan.lan", 8080)
 MODEL = "qwen3.8-27b"
 MODEL_PATHS = {"/v1/models", "/v1/models/" + MODEL}
 # Where this gateway may listen: on blink1 (historical) or in LXC 131 custos-brain (2026-09-11,
@@ -233,13 +233,14 @@ class Gateway:
             eof.cancel()
             await asyncio.gather(eof, return_exceptions=True)
 
-    async def proxy(self, writer, method, path, body, sent):
+    async def proxy(self, writer, method, path, body, sent, upstream=None):
         upstream_writer = None
+        upstream = upstream or self.upstream
         try:
             reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(*self.upstream, limit=self.p["max_header_bytes"]),
+                asyncio.open_connection(*upstream, limit=self.p["max_header_bytes"]),
                 self.p["connect_timeout_seconds"])
-            upstream_writer.write((f"{method} {path} HTTP/1.1\r\nHost: {UPSTREAM[0]}:{UPSTREAM[1]}\r\n"
+            upstream_writer.write((f"{method} {path} HTTP/1.1\r\nHost: {upstream[0]}:{upstream[1]}\r\n"
                                    "Connection: close\r\nContent-Type: application/json\r\n"
                                    f"Content-Length: {len(body)}\r\n\r\n").encode() + body)
             await asyncio.wait_for(upstream_writer.drain(), self.p["io_timeout_seconds"])
@@ -340,12 +341,10 @@ class Gateway:
     def cloud_mode(self):
         return self.brain is not None and self.brain.mode(self.clock()) == "cloud"
 
-    async def cloud_completion(self, writer, chat, sent):
-        """One completion through the cloud tier (custos_brain). Output is written as a chunked
-        response in the same shapes johan would produce (SSE chunks or one JSON document)."""
+    async def brain_completion(self, writer, chat, sent, complete):
+        """One completion through a Brain backend, preserving Chat Completions framing."""
         stream = bool(chat.get("stream"))
         content_type = "text/event-stream" if stream else "application/json"
-        pending = []
 
         def emit(data):
             if not sent[0]:
@@ -353,16 +352,111 @@ class Gateway:
                               "Connection: close\r\nCache-Control: no-store\r\n\r\n").encode())
                 sent[0] = True
             writer.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
-            pending.append(len(data))
-        status, error = await self.brain.complete(chat, emit)
+        status, error = await complete(chat, emit)
         if status != 200:
-            code = "cloud_upstream_error"
+            code = "brain_upstream_error"
             if isinstance(error, dict):
                 inner = error.get("error") if isinstance(error.get("error"), dict) else error
                 code = str(inner.get("code") or inner.get("type") or code)[:60]
             raise Denied(status if status in (400, 401, 403, 404, 408, 413, 429, 500, 502, 503) else 502, code, 30)
+        if not sent[0]:
+            raise Denied(502, "empty_brain_response", 30)
         writer.write(b"0\r\n\r\n")
         await asyncio.wait_for(writer.drain(), self.p["io_timeout_seconds"])
+
+    async def cloud_completion(self, writer, chat, sent):
+        """One completion through the time-bounded Codex cloud tier."""
+        await self.brain_completion(writer, chat, sent, self.brain.complete)
+
+    async def backup_completion(self, writer, chat, sent):
+        """One completion through OpenRouter after local failure is established."""
+        await self.brain_completion(writer, chat, sent, self.brain.complete_backup)
+
+    async def upstream_healthy(self, upstream):
+        """Bounded local health probe used only to label/select the Tycho fallback."""
+        writer = None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(*upstream, limit=self.p["max_header_bytes"]),
+                self.p["connect_timeout_seconds"])
+            writer.write(("GET /health HTTP/1.1\r\nHost: %s:%s\r\nConnection: close\r\n\r\n" % upstream).encode())
+            await asyncio.wait_for(writer.drain(), self.p["io_timeout_seconds"])
+            line, headers = await asyncio.wait_for(
+                read_headers(reader, self.p["max_header_bytes"]), self.p["connect_timeout_seconds"])
+            parts = line.split(" ", 2)
+            return (len(parts) >= 2 and parts[1] == "200" and
+                    headers.get("content-type", "").split(";", 1)[0].lower() == "application/json")
+        except (Denied, OSError, ValueError, asyncio.TimeoutError,
+                asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+            return False
+        finally:
+            await close_writer(writer)
+
+    async def local_route(self, now):
+        """Return Johan, Tycho, or OpenRouter for a non-admitting snapshot."""
+        try:
+            self.busy.check(now, admission=False)
+            return "johan"
+        except Denied as denial:
+            if denial.code != "busy_observation_unavailable" or self.brain is None:
+                raise
+        tycho = self.brain.tycho_upstream()
+        if tycho and await self.upstream_healthy(tycho):
+            return "tycho"
+        if self.brain.backup_ready():
+            return "openrouter"
+        raise Denied(503, "local_fallbacks_unavailable", 30)
+
+    async def fallback_completion(self, writer, method, path, body, sent, reason):
+        """Try Tycho, then OpenRouter; never replay after any response byte."""
+        tycho = self.brain.tycho_upstream()
+        if tycho:
+            try:
+                await self.proxy(writer, method, path, body, sent, upstream=tycho)
+                self.brain.note_local_route("tycho", reason)
+                return
+            except (Denied, OSError, ValueError, asyncio.TimeoutError,
+                    asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+                if sent[0]:
+                    raise
+        if not self.brain.backup_ready():
+            raise Denied(503, "local_fallbacks_unavailable", 30)
+        self.brain.note_local_route("openrouter", reason + "; tycho unavailable")
+        await self.backup_completion(writer, json.loads(body), sent)
+
+    async def local_fallback_completion(self, writer, method, path, body, sent):
+        """Prefer Johan, wait through contention, then try Tycho and OpenRouter in order."""
+        async with self.slot:
+            while True:
+                self.check_pause()
+                try:
+                    self.busy.check(self.clock())
+                    break
+                except Denied as denial:
+                    if denial.code == "backend_busy_or_unavailable":
+                        await asyncio.sleep(0.2)
+                        continue
+                    if (denial.code == "busy_observation_unavailable" and self.brain is not None and
+                            (self.brain.tycho_upstream() or self.brain.backup_ready())):
+                        await self.fallback_completion(writer, method, path, body, sent,
+                                                       "johan observer unavailable")
+                        return
+                    raise
+            self.inflight = True
+            try:
+                try:
+                    await self.proxy(writer, method, path, body, sent)
+                except (Denied, OSError, ValueError, asyncio.TimeoutError,
+                        asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+                    if (sent[0] or self.brain is None or
+                            (not self.brain.tycho_upstream() and not self.brain.backup_ready())):
+                        raise
+                    await self.fallback_completion(writer, method, path, body, sent,
+                                                   "johan failed before response")
+                    return
+                self.brain.note_local_route("johan", "johan available")
+            finally:
+                self.inflight = False
 
     def accept(self, reader, writer):
         # Synchronous admission bounds task creation as well as active handlers.
@@ -420,19 +514,40 @@ class Gateway:
                 sent[0] = True
                 await asyncio.wait_for(writer.drain(), self.p["io_timeout_seconds"])
             if path == "/brain":
-                await reply_json(self.brain.status() if self.brain else {"mode": "local", "reason": "no brain policy"})
+                if self.brain:
+                    document = self.brain.status()
+                    if document["mode"] == "local":
+                        route = await self.local_route(now)
+                        document["effective_model"] = ({"tycho": self.brain.tycho_label(),
+                                                        "openrouter": self.brain.backup_model()}.get(
+                                                            route, document["local_model"]))
+                        document["local_route"] = route
+                else:
+                    document = {"mode": "local", "reason": "no brain policy", "effective_model": MODEL}
+                await reply_json(document)
                 return
             if path == "/health":
                 if cloud:
                     await reply_json({"status": "ok", "scope": "brain_cloud_window",
                                       "brain": self.brain.status(), "usage_quota": None})
                     return
-                self.busy.check(now)
                 if self.inflight:
                     raise Denied(429, "custos_request_in_flight", 30)
-                await reply_json({"status": "ok", "scope": "gateway_admission_snapshot", "usage_quota": None})
+                route = await self.local_route(now) if self.brain else (self.busy.check(now, admission=False) or "johan")
+                await reply_json({"status": "ok",
+                                  "scope": ({"tycho": "tycho_fallback_ready",
+                                             "openrouter": "openrouter_fallback_ready"}.get(
+                                                 route, "gateway_admission_snapshot")),
+                                  "effective_model": ({"tycho": self.brain.tycho_label(),
+                                                       "openrouter": self.brain.backup_model()}.get(
+                                                           route, MODEL) if self.brain else MODEL),
+                                  "usage_quota": None})
                 return
             if cloud and path in MODEL_PATHS:
+                names = sorted(self.brain.accepted_models())
+                await reply_json({"object": "list", "data": [{"id": name, "object": "model", "owned_by": "custos-brain"} for name in names]})
+                return
+            if not cloud and path in MODEL_PATHS and self.brain and await self.local_route(now) != "johan":
                 names = sorted(self.brain.accepted_models())
                 await reply_json({"object": "list", "data": [{"id": name, "object": "model", "owned_by": "custos-brain"} for name in names]})
                 return
@@ -455,7 +570,10 @@ class Gateway:
                 body = json.dumps(chat, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
             # Existing 600-second end-to-end bound includes admission waiting;
             # no change to client deadlines, output budget or backend concurrency.
-            jobs = [asyncio.create_task(self.admitted_proxy(writer, method, path, body, sent)),
+            local_job = (self.local_fallback_completion(writer, method, path, body, sent)
+                         if self.brain is not None and method == "POST"
+                         else self.admitted_proxy(writer, method, path, body, sent))
+            jobs = [asyncio.create_task(local_job),
                     asyncio.create_task(self.watch(reader, started + duration))]
             done, _ = await asyncio.wait(jobs, return_when=asyncio.FIRST_COMPLETED)
             if jobs[1] in done:

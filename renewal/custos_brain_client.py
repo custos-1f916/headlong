@@ -4,9 +4,10 @@ The guest's environment names the cloud models (THINK_MODEL=gpt-6-astra, MONOLIT
 gpt-5.6-terra). In local mode the router sends every name to johan's Qwen, but the trajectory
 recorded whatever name the client asked for — Hal, 2026-09-13: "The monolith steps and other things
 still say gpt-6-astra ... make the names dynamic so that when the toggle from cloud to johan
-happens, the label stays honest." `resolve_model(name)` returns the router's `local_model` while it
-is in local mode and the given name otherwise; if the router cannot be reached in two seconds the
-name is returned unchanged (the call would fail anyway, and a wrong label is worse than none).
+happens, the label stays honest." `resolve_model(name)` returns the router's `effective_model`
+while it is in local mode. That is normally Johan's Qwen and becomes the configured OpenRouter
+model only while the local observer is unavailable. If the router cannot be reached in two seconds
+the name is returned unchanged (the call would fail anyway, and a wrong label is worse than none).
 """
 import json
 import os
@@ -40,8 +41,11 @@ def resolve_model(name, status=None, url=None, timeout=2.0, opener=urllib.reques
         key = url or brain_url()
         status = _cache.get(key) if _cache.get(key) is not None else brain_status(url, timeout, opener)
         _cache[key] = status
-    if status and status.get("mode") == "local" and status.get("local_model"):
-        return status["local_model"]
+    if status and status.get("mode") == "local":
+        if status.get("effective_model"):
+            return status["effective_model"]
+        if status.get("local_model"):
+            return status["local_model"]
     return name
 
 

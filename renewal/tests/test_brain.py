@@ -29,7 +29,7 @@ def policy(**changes):
     value = {"window_id": "w1", "until": "2026-09-13T08:00:00Z",
              "tiers": {"astra": "gpt-6-astra", "terra": "gpt-5.6-terra"},
              "routes": {"gpt-6-astra": "astra", "gpt-5.6-terra": "terra", "*": "terra"},
-             "johan": {"mac": "d8:43:ae:4d:bc:6d", "ip": "192.168.86.117"}, "ntfy_topic": None}
+             "johan": {"mac": "d8:43:ae:4d:bc:6d", "host": "johan.lan"}, "ntfy_topic": None}
     value.update(changes)
     return brain_mod.load_brain_policy_dict(value) if hasattr(brain_mod, "load_brain_policy_dict") else _load(value)
 
@@ -56,11 +56,34 @@ class PolicyAndStateTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
 
     def test_policy_validation(self):
-        for bad in ({"until": "soon"}, {"routes": {"gpt-6-astra": "astra"}}, {"routes": {"*": "nope"}}, {"johan": {"mac": "zz", "ip": "x"}}):
+        for bad in ({"until": "soon"}, {"routes": {"gpt-6-astra": "astra"}}, {"routes": {"*": "nope"}}, {"johan": {"mac": "zz", "host": "x"}}):
             with self.assertRaises(ValueError):
                 policy(**bad)
         p = policy()
         self.assertEqual(p["effort"], {"medium": "medium", "xhigh": "xhigh"}); self.assertEqual(p["codex_url"], brain_mod.CODEX_URL)
+        with self.assertRaises(ValueError):
+            policy(backup={"provider": "openrouter", "model": "x", "url": "http://example.test/v1",
+                           "key_file": "/tmp/key"})
+        with self.assertRaises(ValueError):
+            policy(tycho={"provider": "tycho", "host": "192.168.86.104", "port": 8080,
+                          "model": "q", "label": "tycho/q"})
+
+    def test_backup_key_requires_private_file_owned_by_service_user(self):
+        key = Path(self.temp.name, "key")
+        key.write_text("secret")
+        key.chmod(0o600)
+        f = Fixture(self.temp.name, backup={"provider": "openrouter", "model": "deepseek/test",
+                                           "url": "http://127.0.0.1:9/v1/chat/completions",
+                                           "key_file": str(key)})
+        self.assertTrue(f.brain.backup_ready())
+        self.assertEqual(f.brain._backup_key(), "secret")
+        key.chmod(0o640)
+        self.assertFalse(f.brain.backup_ready())
+        key.chmod(0o600)
+        link = Path(self.temp.name, "key-link")
+        link.symlink_to(key)
+        f.p["backup"]["key_file"] = str(link)
+        self.assertFalse(f.brain.backup_ready())
 
     def test_fresh_state_is_cloud_and_persists(self):
         f = Fixture(self.temp.name)
@@ -143,29 +166,52 @@ class CloudWireTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.now = T0
-        self.codex_calls, self.johan_calls, self.tasks = [], 0, set()
+        self.codex_calls, self.openrouter_calls = [], []
+        self.johan_calls, self.tycho_calls, self.tasks = 0, 0, set()
         self.codex_mode = "ok"
         self.codex = await asyncio.start_server(self.codex_handle, "127.0.0.1", 0)
+        self.openrouter = await asyncio.start_server(self.openrouter_handle, "127.0.0.1", 0)
         self.johan = await asyncio.start_server(self.johan_handle, "127.0.0.1", 0)
+        self.tycho = await asyncio.start_server(self.tycho_handle, "127.0.0.1", 0)
         codex_port = self.codex.sockets[0].getsockname()[1]
+        openrouter_port = self.openrouter.sockets[0].getsockname()[1]
+        tycho_port = self.tycho.sockets[0].getsockname()[1]
+        self.backup_key = Path(self.directory.name, "openrouter-key")
+        self.backup_key.write_text("test-key")
+        self.backup_key.chmod(0o600)
         self.woken, self.notices = [], []
-        p = policy(codex_url="http://127.0.0.1:%d/backend-api/codex/responses" % codex_port)
+        p = policy(codex_url="http://127.0.0.1:%d/backend-api/codex/responses" % codex_port,
+                   tycho={"provider": "tycho", "host": "tycho.lan", "port": 8080,
+                          "model": "qwen3.8-27b", "label": "tycho/qwen3.8-27b"},
+                   backup={"provider": "openrouter", "model": "deepseek/deepseek-v4.1-flash",
+                           "url": "http://127.0.0.1:%d/v1/chat/completions" % openrouter_port,
+                           "key_file": str(self.backup_key)})
         self.brain = brain_mod.Brain(p, state_dir=self.directory.name, clock=lambda: self.now,
                                      notify=self.notices.append, wake=lambda: self.woken.append(1), log=lambda line: None)
         Path(self.directory.name, "codex-auth.json").write_text(json.dumps({"tokens": {"access_token": fake_jwt(T0 + 86400 * 5), "account_id": "acct-1"}}))
+        # Tests keep the policy's production-safe name but inject the loopback endpoint after
+        # validation; production code never accepts an arbitrary Tycho destination.
+        self.brain.p["tycho"]["host"], self.brain.p["tycho"]["port"] = self.tycho.sockets[0].getsockname()[:2]
         gp = gateway.load_policy(Path(__file__).resolve().parents[1] / "gateway-policy.json")
         gp.update(allowed_clients=["127.0.0.1"], pause_file=str(Path(self.directory.name) / "paused"))
 
         class Busy:
+            stale = False
+            occupied = False
             def check(self, now, admission=True):
+                if self.stale:
+                    raise gateway.Denied(503, "busy_observation_unavailable", 30)
+                if admission and self.occupied:
+                    raise gateway.Denied(503, "backend_busy_or_unavailable", 30)
                 return None
-        self.gateway = gateway.Gateway(gp, busy=Busy(), clock=lambda: self.now,
+        self.busy = Busy()
+        self.gateway = gateway.Gateway(gp, busy=self.busy, clock=lambda: self.now,
                                        upstream=self.johan.sockets[0].getsockname()[:2], brain=self.brain)
         self.server = await asyncio.start_server(self.gateway.accept, "127.0.0.1", 0, limit=gp["max_header_bytes"])
         self.address = self.server.sockets[0].getsockname()[:2]
 
     async def asyncTearDown(self):
-        for server in (self.server, self.codex, self.johan):
+        for server in (self.server, self.codex, self.openrouter, self.johan, self.tycho):
             server.close(); await server.wait_closed()
         tasks = list(self.gateway.tasks | self.tasks)
         for task in tasks:
@@ -207,6 +253,43 @@ class CloudWireTests(unittest.IsolatedAsyncioTestCase):
             sse = b'data: {"choices":[{"delta":{"content":"local"}}]}\n\ndata: [DONE]\n\n'
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
             writer.write(f"{len(sse):x}\r\n".encode() + sse + b"\r\n0\r\n\r\n")
+            await writer.drain()
+        finally:
+            await gateway.close_writer(writer)
+
+    async def openrouter_handle(self, reader, writer):
+        self.tasks.add(asyncio.current_task())
+        try:
+            line, headers = await gateway.read_headers(reader, 16384)
+            body = json.loads(await reader.readexactly(int(headers["content-length"])))
+            self.openrouter_calls.append((line, headers, body))
+            if body.get("stream"):
+                response = b'data: {"choices":[{"delta":{"content":"backup"}}]}\n\ndata: [DONE]\n\n'
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: " +
+                             str(len(response)).encode() + b"\r\n\r\n" + response)
+            else:
+                response = json.dumps({"choices": [{"message": {"role": "assistant", "content": "backup"}}]}).encode()
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+                             str(len(response)).encode() + b"\r\n\r\n" + response)
+            await writer.drain()
+        finally:
+            await gateway.close_writer(writer)
+
+    async def tycho_handle(self, reader, writer):
+        self.tasks.add(asyncio.current_task())
+        try:
+            line, headers = await gateway.read_headers(reader, 16384)
+            if line.startswith("GET /health"):
+                response = b'{"status":"ok"}'
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+                             str(len(response)).encode() + b"\r\n\r\n" + response)
+            else:
+                body = json.loads(await reader.readexactly(int(headers["content-length"])))
+                self.tycho_calls += 1
+                self.tycho_model = body.get("model")
+                response = b'data: {"choices":[{"delta":{"content":"tycho"}}]}\n\ndata: [DONE]\n\n'
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: " +
+                             str(len(response)).encode() + b"\r\n\r\n" + response)
             await writer.drain()
         finally:
             await gateway.close_writer(writer)
@@ -290,6 +373,51 @@ class CloudWireTests(unittest.IsolatedAsyncioTestCase):
         status, _, body = await self.request("POST", "/v1/chat/completions", self.chat())
         self.assertEqual(status, 200); self.assertIn(b"local", body); self.assertEqual(self.johan_calls, 1)
         self.assertIn("window ended", self.notices[0])
+
+    async def test_local_observer_failure_uses_tycho_and_labels_it_honestly(self):
+        self.brain.flip_local("test")
+        self.busy.stale = True
+        status, _, body = await self.request("POST", "/v1/chat/completions", self.chat())
+        self.assertEqual(status, 200); self.assertIn(b"tycho", body)
+        self.assertEqual(self.johan_calls, 0); self.assertEqual(self.tycho_calls, 1)
+        self.assertEqual(self.openrouter_calls, []); self.assertEqual(self.tycho_model, "qwen3.8-27b")
+        status, _, body = await self.request("GET", "/brain")
+        document = json.loads(body)
+        self.assertEqual(document["effective_model"], "tycho/qwen3.8-27b")
+        self.assertEqual(document["local_route"], "tycho")
+        status, _, body = await self.request("GET", "/health")
+        self.assertEqual(json.loads(body)["scope"], "tycho_fallback_ready")
+        status, _, body = await self.request("GET", "/v1/models")
+        self.assertEqual(status, 200); self.assertEqual(len(json.loads(body)["data"]), 3)
+
+    async def test_backend_contention_waits_for_johan_instead_of_using_backup(self):
+        self.brain.flip_local("test")
+        self.busy.occupied = True
+        request = asyncio.create_task(self.request("POST", "/v1/chat/completions", self.chat()))
+        await asyncio.sleep(0.25)
+        self.assertFalse(request.done()); self.assertEqual(self.openrouter_calls, []); self.assertEqual(self.tycho_calls, 0)
+        self.busy.occupied = False
+        status, _, body = await asyncio.wait_for(request, 2)
+        self.assertEqual(status, 200); self.assertIn(b"local", body)
+
+    async def test_local_connect_failure_before_response_uses_tycho(self):
+        self.brain.flip_local("test")
+        self.johan.close(); await self.johan.wait_closed()
+        status, _, body = await self.request("POST", "/v1/chat/completions", self.chat())
+        self.assertEqual(status, 200); self.assertIn(b"tycho", body)
+        self.assertEqual(self.tycho_calls, 1); self.assertEqual(self.openrouter_calls, [])
+
+    async def test_openrouter_is_third_after_johan_and_tycho_are_unavailable(self):
+        self.brain.flip_local("test")
+        self.busy.stale = True
+        self.tycho.close(); await self.tycho.wait_closed()
+        status, _, body = await self.request("POST", "/v1/chat/completions", self.chat())
+        self.assertEqual(status, 200); self.assertIn(b"backup", body)
+        self.assertEqual(self.johan_calls, 0); self.assertEqual(self.tycho_calls, 0)
+        self.assertEqual(len(self.openrouter_calls), 1)
+        _, headers, sent = self.openrouter_calls[0]
+        self.assertEqual(headers["authorization"], "Bearer test-key")
+        self.assertEqual(sent["model"], "deepseek/deepseek-v4.1-flash")
 
 
 if __name__ == "__main__":

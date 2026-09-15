@@ -12,9 +12,10 @@ token lives only in this container. Custos cannot deploy here: this is where the
 |---|---|---|
 | `/opt/custos-brain/{custos_gateway.py,custos_brain.py,custos_busy.py,custos_images.py}` | root 0644 | copies of `renewal/` at the installed commit (record it in HOST-PATCHES style below) |
 | `/etc/custos-brain/gateway-policy.json` | root 0644 | the gateway policy, `bind_host` `192.168.86.69`, `allowed_clients` `["192.168.86.52"]` |
-| `/etc/custos-brain/brain.json` | root 0644 | the brain policy (window, tiers, routes, johan MAC, ntfy topic) |
+| `/etc/custos-brain/brain.json` | root 0644 | the brain policy (window, tiers, routes, Johan/Tycho DNS names, OpenRouter backup, ntfy topic) |
 | `/etc/custos-gateway/{probe_ed25519,known_hosts}` | root 0600 | the forced-command probe key for johan (moved from blink1; used by `custos-busy` only) |
 | `/var/lib/custos-brain/codex-auth.json` | custos-brain 0600 | copy of `~/.codex/auth.json`; rotated in place on refresh |
+| `/var/lib/custos-brain/openrouter-api-key` | custos-brain 0600 | OpenRouter credential; never present in LXC 122 or release artifacts |
 | `/var/lib/custos-brain/state.json` | custos-brain 0600 | `{mode, reason, at, window_id, quota}` — the sticky revert |
 | `/run/custos-gateway/busy.json` | root 0644 | johan busy observation (written by `custos-busy`, read by the gateway in local mode) |
 
@@ -31,7 +32,12 @@ Edit `/etc/custos-brain/brain.json`:
  "tiers": {"astra": "gpt-6-astra", "terra": "gpt-5.6-terra"},
  "routes": {"gpt-6-astra": "astra", "gpt-5.6-terra": "terra", "*": "terra"},
  "effort": {"medium": "medium", "xhigh": "xhigh"},
- "johan": {"mac": "d8:43:ae:4d:bc:6d", "ip": "192.168.86.117", "port": 8080},
+ "johan": {"mac": "d8:43:ae:4d:bc:6d", "host": "johan.lan", "port": 8080},
+ "tycho": {"provider": "tycho", "host": "tycho.lan", "port": 8080,
+           "model": "qwen3.8-27b", "label": "tycho/qwen3.8-27b"},
+ "backup": {"provider": "openrouter", "model": "deepseek/deepseek-v4.1-flash",
+            "url": "https://openrouter.ai/api/v1/chat/completions",
+            "key_file": "/var/lib/custos-brain/openrouter-api-key"},
  "ntfy_topic": "<uuid>"}
 ```
 
@@ -44,6 +50,17 @@ for that model). `qwen3.8-27b`, which sub-runs, recap, mem-search, the summary m
 model profile send, lands on the default tier. While `mode == local` every accepted model name is
 coerced to `qwen3.8-27b` and served by johan through the unchanged admission path.
 
+In local mode the deterministic order is **Johan → Tycho → OpenRouter**. A fresh observation that
+says Johan is occupied waits in the existing FIFO and does **not** fail over. Missing/stale Johan
+observation or a local connection failure before any response byte tries Tycho; only a Tycho
+connection failure before response bytes selects OpenRouter. It never replays a request after
+response bytes have begun. `/brain` exposes `effective_model` and `local_route`; `/health` reports
+`tycho_fallback_ready` or `openrouter_fallback_ready` while Johan's observer is unavailable.
+Entering and leaving actual fallback routes logs and notifies once per transition rather than once
+per request. OpenRouter receives the already validated Chat Completions body, so prompts may
+contain Custos memory, Signal/family context and homelab details; this egress was explicitly
+approved by Hal on 2026-09-15.
+
 ## What flips it back (sticky)
 
 1. `now >= until`.
@@ -53,7 +70,7 @@ coerced to `qwen3.8-27b` and served by johan through the unchanged admission pat
 
 On the flip the service writes `state.json`, sends a wake-on-LAN packet to johan's MAC, posts to
 Hal's ntfy topic, and serves johan from then on (503 `upstream_or_admission_unavailable` while johan
-is still booting; `bin/llm` retries that code). Rehearse without touching the live state:
+is still booting and no ready backup is configured; `bin/llm` retries that code). Rehearse without touching the live state:
 `python3 /opt/custos-brain/custos_brain.py --policy /etc/custos-brain/brain.json --simulate-flip`
 (sends the packet and a "[rehearsal]" ntfy). `--wake-johan` sends the packet only; `--status` prints
 the state.

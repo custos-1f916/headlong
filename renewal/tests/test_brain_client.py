@@ -29,6 +29,12 @@ class BrainClientTests(unittest.TestCase):
         self.assertEqual(bc.resolve_model("gpt-6-astra", status=st), "qwen3.8-27b")
         self.assertEqual(bc.resolve_model("gpt-5.6-terra", status=st), "qwen3.8-27b")
 
+    def test_local_mode_uses_effective_backup_name_when_present(self):
+        st = {"mode": "local", "local_model": "qwen3.8-27b",
+              "effective_model": "deepseek/deepseek-v4.1-flash"}
+        self.assertEqual(bc.resolve_model("gpt-6-astra", status=st),
+                         "deepseek/deepseek-v4.1-flash")
+
     def test_cloud_mode_keeps_the_name(self):
         st = bc.brain_status("http://x", opener=opener_for({"mode": "cloud", "local_model": "qwen3.8-27b"}))
         self.assertEqual(bc.resolve_model("gpt-6-astra", status=st), "gpt-6-astra")

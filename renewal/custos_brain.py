@@ -11,7 +11,12 @@ Policy (operator, /etc/custos-brain/brain.json):
    "tiers": {"astra": "gpt-6-astra", "terra": "gpt-5.6-terra"},
    "routes": {"gpt-6-astra": "astra", "gpt-5.6-terra": "terra", "*": "terra"},
    "effort": {"medium": "medium", "xhigh": "xhigh"},
-   "johan": {"mac": "d8:43:ae:4d:bc:6d", "ip": "192.168.86.117", "port": 8080},
+   "johan": {"mac": "d8:43:ae:4d:bc:6d", "host": "johan.lan", "port": 8080},
+   "tycho": {"provider": "tycho", "host": "tycho.lan", "port": 8080,
+             "model": "qwen3.8-27b", "label": "tycho/qwen3.8-27b"},
+   "backup": {"provider": "openrouter", "model": "deepseek/deepseek-v4.1-flash",
+              "url": "https://openrouter.ai/api/v1/chat/completions",
+              "key_file": "/var/lib/custos-brain/openrouter-api-key"},
    "ntfy_topic": "<uuid>", "codex_url": "https://chatgpt.com/backend-api/codex/responses"}
 
 State (this service, /var/lib/custos-brain/state.json): {"mode": "cloud"|"local", "reason", "at",
@@ -32,6 +37,7 @@ import os
 from pathlib import Path
 import socket
 import ssl
+import stat
 import sys
 import tempfile
 import time
@@ -47,6 +53,7 @@ QUOTA_CODES = {"usage_limit_reached", "usage_not_included", "workspace_owner_usa
                "workspace_member_credits_depleted"}
 MAX_UPSTREAM_BYTES = 32 * 1024 * 1024
 STATE_DIR = Path("/var/lib/custos-brain")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 def utc_now_iso(now=None):
@@ -126,9 +133,28 @@ def load_brain_policy(path):
             v in value["tiers"] for v in value["routes"].values()):
         raise ValueError("brain policy routes must map model names (and '*') to tiers")
     johan = value["johan"]
-    if not isinstance(johan, dict) or not isinstance(johan.get("mac"), str) or not isinstance(johan.get("ip"), str):
-        raise ValueError("brain policy johan needs mac and ip")
+    if not isinstance(johan, dict) or not isinstance(johan.get("mac"), str) or not isinstance(johan.get("host"), str):
+        raise ValueError("brain policy johan needs mac and host")
     magic_packet(johan["mac"])
+    tycho = value.get("tycho")
+    if tycho is not None:
+        if (not isinstance(tycho, dict) or tycho.get("provider") != "tycho" or
+                tycho.get("host") != "tycho.lan" or tycho.get("port") != 8080 or
+                not isinstance(tycho.get("model"), str) or not tycho["model"] or
+                not isinstance(tycho.get("label"), str) or not tycho["label"]):
+            raise ValueError("brain tycho fallback must use tycho.lan:8080 with model and label")
+    backup = value.get("backup")
+    if backup is not None:
+        if not isinstance(backup, dict) or backup.get("provider") != "openrouter":
+            raise ValueError("brain backup provider must be openrouter")
+        if not isinstance(backup.get("model"), str) or not backup["model"]:
+            raise ValueError("brain backup needs a model")
+        if not isinstance(backup.get("key_file"), str) or not Path(backup["key_file"]).is_absolute():
+            raise ValueError("brain backup needs an absolute key_file")
+        backup.setdefault("url", OPENROUTER_URL)
+        scheme, host, _, _ = split_url(backup["url"])
+        if scheme not in ("http", "https") or (scheme == "http" and host not in ("127.0.0.1", "localhost")):
+            raise ValueError("brain backup URL must use HTTPS (except loopback tests)")
     value.setdefault("effort", {"medium": "medium", "xhigh": "xhigh"})
     value.setdefault("codex_url", CODEX_URL)
     value.setdefault("ntfy_topic", None)
@@ -150,6 +176,8 @@ class Brain:
         self.state = self._load_state()
         self._effort_fallback = {}
         self.calls = 0
+        self.backup_calls = 0
+        self._active_local_route = "johan"
 
     # -- state ------------------------------------------------------------------------------
 
@@ -200,11 +228,83 @@ class Brain:
 
     def status(self):
         until = self.until()
+        backup = self.p.get("backup")
         return {"mode": self.mode(), "window_id": self.p["window_id"], "until": self.p["until"],
                 "seconds_left": max(0, int(until - self.clock())) if self.state["mode"] == "cloud" else 0,
                 "tiers": self.p["tiers"], "routes": self.p["routes"], "local_model": self.p["local_model"],
                 "reason": self.state.get("reason"), "since": self.state.get("at"),
-                "quota": self.state.get("quota", {}), "calls": self.calls}
+                "quota": self.state.get("quota", {}), "calls": self.calls,
+                "tycho": ({"model": self.p["tycho"]["model"], "label": self.p["tycho"]["label"]}
+                          if self.p.get("tycho") else None),
+                "backup": ({"provider": "openrouter", "model": backup["model"],
+                            "ready": self.backup_ready(),
+                            "active": self._active_local_route == "openrouter",
+                            "calls": self.backup_calls} if backup else None),
+                "active_local_route": self._active_local_route}
+
+    def backup_model(self):
+        backup = self.p.get("backup")
+        return backup.get("model") if backup else None
+
+    def tycho_model(self):
+        tycho = self.p.get("tycho")
+        return tycho.get("model") if tycho else None
+
+    def tycho_label(self):
+        tycho = self.p.get("tycho")
+        return tycho.get("label") if tycho else None
+
+    def tycho_upstream(self):
+        tycho = self.p.get("tycho")
+        return (tycho["host"], tycho["port"]) if tycho else None
+
+    def _backup_key(self):
+        backup = self.p.get("backup")
+        if not backup:
+            raise ValueError("backup is not configured")
+        path = Path(backup["key_file"])
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or
+                    metadata.st_mode & 0o077):
+                raise ValueError("backup key has unsafe ownership or mode")
+            raw = stream.read(4097)
+        if len(raw) > 4096:
+            raise ValueError("backup key is too large")
+        try:
+            key = raw.decode("ascii").strip()
+        except UnicodeDecodeError as exc:
+            raise ValueError("backup key is malformed") from exc
+        if not key or any(ch.isspace() for ch in key):
+            raise ValueError("backup key is empty or malformed")
+        return key
+
+    def backup_ready(self):
+        try:
+            self._backup_key()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def note_local_route(self, route, reason):
+        """Log and notify once per Johan/Tycho/OpenRouter transition, never per request."""
+        if route not in {"johan", "tycho", "openrouter"}:
+            raise ValueError("unknown local route")
+        if self._active_local_route == route:
+            return
+        self._active_local_route = route
+        if route == "tycho":
+            text = "Custos brain using Tycho fallback (%s): %s" % (self.tycho_label(), reason)
+        elif route == "openrouter":
+            text = "Custos brain using OpenRouter fallback (%s): %s" % (self.backup_model(), reason)
+        else:
+            text = "Custos brain returned to johan (%s): %s" % (self.p["local_model"], reason)
+        self.log(text)
+        try:
+            self.notify(text)
+        except Exception as exc:  # noqa: BLE001 - routing must not depend on notifications
+            self.log("backup transition ntfy failed: " + str(exc)[:200])
 
     # -- routing ------------------------------------------------------------------------------
 
@@ -440,6 +540,70 @@ class Brain:
             return 200, None
         finally:
             await closer()
+
+    async def complete_backup(self, chat, emit, request_id=None):
+        """Forward one already-validated Chat Completions request to OpenRouter.
+
+        The backup keeps the gateway's wire format, output bounds and client deadline.  It is
+        intentionally a separate method from the Codex cloud window: the gateway calls it only
+        after local-Johan admission has proved unavailable, never merely because Johan is busy.
+        """
+        backup = self.p.get("backup")
+        if not backup:
+            return 503, {"error": {"type": "backup_unavailable", "code": "backup_not_configured"}}
+        try:
+            key = self._backup_key()
+        except (OSError, ValueError) as exc:
+            self.log("OpenRouter backup key unavailable: " + str(exc)[:200])
+            return 503, {"error": {"type": "backup_unavailable", "code": "backup_not_ready"}}
+
+        request = dict(chat)
+        request["model"] = backup["model"]
+        body = json.dumps(request, ensure_ascii=False, allow_nan=False,
+                          separators=(",", ":")).encode("utf-8")
+        headers = {"Authorization": "Bearer " + key,
+                   "Content-Type": "application/json",
+                   "Accept": "text/event-stream" if request.get("stream") else "application/json",
+                   "HTTP-Referer": "https://1f916.ai",
+                   "X-OpenRouter-Title": "Custos",
+                   "X-Request-ID": request_id or str(uuid.uuid4())}
+        started = time.monotonic()
+        self.backup_calls += 1
+        try:
+            status, response_headers, (reader, closer) = await open_sse(
+                "POST", backup["url"], body, headers,
+                timeout=self.p.get("connect_seconds", 20))
+            try:
+                if response_headers.get("content-encoding", "identity").lower() != "identity":
+                    raise ValueError("unsupported OpenRouter content encoding")
+                if status != 200:
+                    raw = await read_all(reader, 262144)
+                    try:
+                        received = json.loads(raw) if raw else {}
+                    except ValueError:
+                        received = {}
+                    inner = received.get("error") if isinstance(received, dict) else None
+                    code = (inner.get("code") or inner.get("type")) if isinstance(inner, dict) else None
+                    safe = {"error": {"type": "backup_upstream_error",
+                                      "code": str(code or "openrouter_http_%d" % status)[:80]}}
+                    self.log("OpenRouter backup -> HTTP %d (%s)" % (status, safe["error"]["code"]))
+                    return status, safe
+                expected = "text/event-stream" if request.get("stream") else "application/json"
+                received_type = response_headers.get("content-type", "").split(";", 1)[0].lower()
+                if received_type != expected:
+                    raise ValueError("unexpected OpenRouter content type")
+                async for data in reader:
+                    emit(data)
+                self.log("OpenRouter backup/%s -> 200 in %.1fs" %
+                         (backup["model"], time.monotonic() - started))
+                return 200, None
+            finally:
+                await closer()
+        except (OSError, ValueError, asyncio.TimeoutError) as exc:
+            self.log("OpenRouter backup transport unavailable: %s: %s" %
+                     (type(exc).__name__, str(exc)[:200]))
+            return 503, {"error": {"type": "backup_unavailable",
+                                   "code": "backup_transport_unavailable"}}
 
 
 # --- minimal HTTP/1.1 client over asyncio (stdlib only) ----------------------------------------
