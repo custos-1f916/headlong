@@ -204,6 +204,16 @@ def parse_memory_file(path, strict_person=False):
         meta = strict_json(body.rsplit(PERSON_MARKER, 1)[1])
         if not isinstance(meta, dict) or not isinstance(meta.get("person_key"), str) or not meta["person_key"]:
             raise MemoryError("person note without a person_key")
+        aliases = meta.get("aliases") or []
+        if not isinstance(aliases, list) or any(not isinstance(alias, str) for alias in aliases):
+            raise MemoryError("person note with invalid aliases")
+        prose = body.rsplit(PERSON_MARKER, 1)[0]
+        for alias in aliases:
+            # A note may discuss other people, but an alias explicitly called a
+            # distinct person cannot simultaneously resolve to this record.
+            named = re.escape(alias)
+            if re.search(r"(?:['\"]" + named + r"['\"]|\b" + named + r"\b).{0,100}\bis a distinct person\b", prose, re.I | re.S):
+                raise MemoryError("person alias contradicts distinct-person prose: " + alias)
     return path, header, body, fields, record
 
 
@@ -1069,7 +1079,9 @@ class People:
                 raise MemoryError("person-alias-remove selected native person record is ambiguous")
             path = matches[0][0]
             try:
-                item = parse_memory_file(path, strict_person=True)
+                # This command is also the supported repair path for a record
+                # that the semantic validator now rejects.
+                item = parse_memory_file(path, strict_person=False)
             except (MemoryError, OSError, UnicodeError, ValueError) as exc:
                 raise MemoryError("person-alias-remove selected record is not a valid person note") from exc
             if item[3].get("type") != "person":
@@ -1100,6 +1112,54 @@ class People:
             self.store.commit(rewritten, memory_type="person", existing=item)
             return {"person_id": person_id, "alias": alias, "removed": True,
                     "unchanged": False, "preimage": str(preimage)}
+
+    def normalize(self, person_id):
+        """Deduplicate the native YAML updated history without touching the
+        person body or structured identity metadata. Preserve the exact preimage."""
+        if not re.fullmatch(r"[0-9a-f]{8}", str(person_id or "")):
+            raise MemoryError("person-normalize person_id must be a full native eight-hex ID")
+        with self.store.lock():
+            matches = [item for item in self.store.files() if item[3].get("id") == person_id]
+            if len(matches) != 1 or matches[0][3].get("type") != "person":
+                raise MemoryError("person-normalize selected native person record is missing or ambiguous")
+            path = matches[0][0]
+            raw = path.read_text(encoding="utf-8")
+            lines = raw.splitlines()
+            if len(lines) < 3 or lines[0] != "---":
+                raise MemoryError("person-normalize selected record has invalid frontmatter")
+            end = lines.index("---", 1)
+            seen, changed, in_updated = set(), False, False
+            rewritten = []
+            for index, line in enumerate(lines):
+                if index < end:
+                    if re.match(r"^updated:\s*$", line):
+                        in_updated = True
+                    elif in_updated and re.match(r"^[a-z_]+:\s*", line):
+                        in_updated = False
+                    if in_updated and re.match(r"^\s+-\s+", line):
+                        value = line.strip()
+                        if value in seen:
+                            changed = True
+                            continue
+                        seen.add(value)
+                rewritten.append(line)
+            if not changed:
+                return {"person_id": person_id, "normalized": False, "unchanged": True,
+                        "duplicates_removed": 0, "preimage": None}
+            identity = os.environ.get("IDENTITY_DIR")
+            base = Path(identity) if identity else self.store.directory.parent
+            changes = base / "dream" / "operator-cleanup" / "changes"
+            changes.mkdir(parents=True, exist_ok=True)
+            name = path.stem.split("_")[1] if "_" in path.stem else path.stem
+            preimage = changes / (name + "-" + hashlib.sha256(raw.encode()).hexdigest()[:16] + ".before.md")
+            preimage.write_text(raw, encoding="utf-8")
+            candidate = path.with_suffix(".normalize-tmp")
+            candidate.write_text("\n".join(rewritten) + ("\n" if raw.endswith("\n") else ""), encoding="utf-8")
+            parse_memory_file(candidate, strict_person=True)
+            os.replace(candidate, path)
+            self.store.sync(path)
+            return {"person_id": person_id, "normalized": True, "unchanged": False,
+                    "duplicates_removed": len(lines) - len(rewritten), "preimage": str(preimage)}
 
     def prompt(self, key, display):
         found = self.find(key)
@@ -1691,6 +1751,28 @@ def compose_plan(raw, argv, incoming, attempt, started):
     return plan
 
 
+def settle_without_inference(store, goal_id, trigger, payload, who_key, reason, evidence, summary, started):
+    """Complete a captured conversation deterministically before composition."""
+    plan = {"reply": "", "decision": "no-reply", "goal": None, "memories": [], "person": None}
+    with store.lock():
+        item = store.find(goal_id)
+        record = item[4]
+        record["response"] = {"state": "no-reply", "plan": plan, "at": now(),
+                              "inference": False, "reason": reason}
+        record["responder_attempt"]["state"] = "succeeded"
+        resolution = {"disposition": "completed", "evidence": evidence}
+        record["status"] = "completed"
+        record["resolution"] = resolution
+        record["events"].append({"at": now(), "resolution": resolution})
+        store.save(item, record)
+    metrics = dict(payload["metrics"]) if isinstance(payload.get("metrics"), dict) else {}
+    metrics["compose_ms"] = int(metrics.get("compose_ms", 0)) + int((time.monotonic() - started) * 1000)
+    append_step({**metrics, "type": "observation", "source": "responder", "trigger_step": trigger,
+                 "goal_id": goal_id, "decision": "no-reply", "deferred": False, "person_key": who_key,
+                 "reason": reason, "content": summary})
+    return {"goal_id": goal_id, "decision": "no-reply", "replayed": False}
+
+
 def response(store, payload):
     started = time.monotonic()
     keys(payload, {"envelope", "system", "messages", "metrics"})
@@ -1726,27 +1808,28 @@ def response(store, payload):
             # up to a minute of the shared slot per reaction (8 of them on the
             # first night). The record stays as ambient conversation memory,
             # which the social thinker sees in its transcript.
-            with store.lock():
-                item = store.find(goal_id)
-                record = item[4]
-                plan = {"reply": "", "decision": "no-reply", "goal": None, "memories": [], "person": None}
-                record["response"] = {"state": "no-reply", "plan": plan, "at": now(), "inference": False}
-                record["responder_attempt"]["state"] = "succeeded"
-                resolution = {"disposition": "completed", "evidence": ("Signal context-only message noted; no reply or task accepted." if context_only else "Reaction event noted; no reply needed.")}
-                record["status"] = "completed"
-                record["resolution"] = resolution
-                record["events"].append({"at": now(), "resolution": resolution})
-                store.save(item, record)
-            metrics = payload["metrics"] if isinstance(payload["metrics"], dict) else {}
-            metrics["compose_ms"] = int(metrics.get("compose_ms", 0)) + int((time.monotonic() - started) * 1000)
-            append_step({**metrics, "type": "observation", "source": "responder", "trigger_step": trigger,
-                         "goal_id": goal_id, "decision": "no-reply", "deferred": False, "person_key": who_key,
-                         "content": ("Noted context-only Signal conversation (no model call)" if context_only else "Noted a reaction from " + who + " (no model call)")})
-            return {"goal_id": goal_id, "decision": "no-reply", "replayed": False}
+            return settle_without_inference(
+                store, goal_id, trigger, payload, who_key,
+                "signal_context_only" if context_only else "reaction_event",
+                "Signal context-only message noted; no reply or task accepted." if context_only else "Reaction event noted; no reply needed.",
+                "Noted context-only Signal conversation (no model call)" if context_only else "Noted a reaction from " + who + " (no model call)",
+                started)
+        if not saved and incoming["sender"].startswith("square:"):
+            budget = square_budget()
+            if budget and budget["queued"] >= budget["comments_remaining"]:
+                return settle_without_inference(
+                    store, goal_id, trigger, payload, who_key, "square_capacity_unavailable",
+                    "Square reply was not composed because every remaining delivery slot was already reserved by the outbox.",
+                    "Skipped square reply before model composition: no unreserved delivery slot (queued %d, remaining %d)." %
+                    (budget["queued"], budget["comments_remaining"]), started)
         if not saved:
             system = text(payload["system"], "system prompt", 98304) + RESPONSE_CONTRACT
             if incoming.get('signal_routing'):
                 system += signal_targeting.contract(incoming['signal_routing'])
+            if "[Attachment unavailable to Custos." in incoming["content"]:
+                system += ("\nHard attachment fact: one or more attachments in the current message are unavailable. "
+                           "You did not see or read them. Do not infer, quote, summarize, or describe their contents. "
+                           "You may answer visible text; if the answer depends on the attachment, say it was unavailable.")
             system += "\n" + people.prompt(who_key, who)
             policy, policy_path = social_policy()
             if incoming.get("ambient"):
@@ -2200,7 +2283,7 @@ Examples (replace the sample ID and evidence with actual values):
 An acknowledgment alone is not completion. Valid dispositions: completed, declined, abandoned.''')
     parser.add_argument("command", choices=["capture", "capture-envelope", "context", "pending", "show", "update", "complete", "respond",
                                             "replay-unanswered", "archive-conversations", "expire-asks", "note", "check",
-                                            "validate", "person-merge", "person-alias-remove"])
+                                            "validate", "person-merge", "person-alias-remove", "person-normalize"])
     parser.add_argument("goal_id", nargs="?", help="Goal ID for show, update and complete (writes also take JSON on stdin)")
     parser.add_argument("words", nargs="*", help="complete: [completed|declined|abandoned] evidence…; update: the next action")
     parser.add_argument("--json", action="store_true")
@@ -2211,8 +2294,8 @@ An acknowledgment alone is not completion. Valid dispositions: completed, declin
     parser.add_argument("--older-than", type=int, default=None,
                         help="replay-unanswered: seconds (default 900); archive-conversations: days (default 2); expire-asks: hours (default 24)")
     args = parser.parse_args()
-    if args.goal_id is not None and args.command not in {"show", "update", "complete", "note", "check", "validate", "person-merge", "person-alias-remove"}:
-        parser.error("Only show, update, complete, note, check, validate, person-merge and person-alias-remove take positional arguments; see --help for examples.")
+    if args.goal_id is not None and args.command not in {"show", "update", "complete", "note", "check", "validate", "person-merge", "person-alias-remove", "person-normalize"}:
+        parser.error("Only show, update, complete, note, check, validate and person repair commands take positional arguments; see --help for examples.")
     try:
         store = Store()
         if args.command in {"context", "pending"}:
@@ -2272,6 +2355,11 @@ An acknowledgment alone is not completion. Valid dispositions: completed, declin
             if not args.goal_id or len(args.words) != 1:
                 raise InvalidInput("usage: custos-memory person-alias-remove PERSON_ID ALIAS")
             print(encode(People(store).remove_alias(args.goal_id, args.words[0])))
+            return 0
+        if args.command == "person-normalize":
+            if not args.goal_id or args.words:
+                raise InvalidInput("usage: custos-memory person-normalize PERSON_ID")
+            print(encode(People(store).normalize(args.goal_id)))
             return 0
         if args.command == "replay-unanswered":
             print(encode(replay_unanswered(store, args.older_than if args.older_than is not None else 900,

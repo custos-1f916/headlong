@@ -41,6 +41,9 @@ SOCIAL_WAKE_INTERVAL="${SOCIAL_WAKE_INTERVAL:-7200}"
 # Nudge to start a conversation with someone when none was started for this long (policy: initiate_after_hours).
 SOCIAL_INITIATE_HOURS="${SOCIAL_INITIATE_HOURS:-20}"
 SOCIAL_CONTEXT_MSGS="${SOCIAL_CONTEXT_MSGS:-40}"
+# When a quiet timer tick spends one model call considering whether to start a
+# conversation and chooses not to, do not ask the same question every tick.
+SOCIAL_IDLE_RECHECK_HOURS="${SOCIAL_IDLE_RECHECK_HOURS:-6}"
 
 state_dir="$IDENTITY_DIR/run"
 mkdir -p "$state_dir"
@@ -57,14 +60,17 @@ arm_wake() {
 }
 
 last_run=0
+last_idle_check=0
 if [[ -f "$state_file" ]]; then
     last_run=$(jq -r '.last_run // 0' "$state_file" 2>/dev/null) || last_run=0
+    last_idle_check=$(jq -r '.last_idle_check // 0' "$state_file" 2>/dev/null) || last_idle_check=0
     [[ "$last_run" =~ ^[0-9]+$ ]] || last_run=0
+    [[ "$last_idle_check" =~ ^[0-9]+$ ]] || last_idle_check=0
 fi
 _save_state() {
-    local tmp
+    local tmp idle="${2:-$last_idle_check}"
     tmp=$(mktemp) || return 0
-    jq -nc --argjson l "$1" '{last_run:$l}' > "$tmp" 2>/dev/null && mv "$tmp" "$state_file" || rm -f "$tmp"
+    jq -nc --argjson l "$1" --argjson i "$idle" '{last_run:$l,last_idle_check:$i}' > "$tmp" 2>/dev/null && mv "$tmp" "$state_file" || rm -f "$tmp"
 }
 
 # Policy: Custos's own file; a missing or unreadable one means the defaults.
@@ -82,6 +88,8 @@ _pi=$(printf '%s' "$policy_json" | jq -r '.wake_interval_seconds // empty' 2>/de
 [[ "$_pi" =~ ^[0-9]+$ && "$_pi" -ge 60 ]] && SOCIAL_WAKE_INTERVAL="$_pi"
 _ph=$(printf '%s' "$policy_json" | jq -r '.initiate_after_hours // empty' 2>/dev/null) || _ph=""
 [[ "$_ph" =~ ^[0-9]+$ ]] && SOCIAL_INITIATE_HOURS="$_ph"
+_pr=$(printf '%s' "$policy_json" | jq -r '.idle_recheck_hours // empty' 2>/dev/null) || _pr=""
+[[ "$_pr" =~ ^[0-9]+$ && "$_pr" -ge 1 ]] && SOCIAL_IDLE_RECHECK_HOURS="$_pr"
 
 # ---------------------------------------------------------------------------
 # Trigger
@@ -242,6 +250,15 @@ if [[ "$wake_mode" == "timer" && "$new_inbound" -eq 0 && -z "$initiate_hint" && 
     # EXIT trap keeps the timer armed.
     exit 0
 fi
+idle_check_this_run=0
+if [[ "$wake_mode" == "timer" && "$new_inbound" -eq 0 && -z "$quick_asks" ]]; then
+    if (( now - last_idle_check < SOCIAL_IDLE_RECHECK_HOURS * 3600 )); then
+        # The prior quiet check already gave the mind a chance to initiate.
+        # Nothing changed, so this tick is decided without inference.
+        exit 0
+    fi
+    idle_check_this_run=1
+fi
 
 system_prompt=$(_build_system_prompt)
 prompt_body=$(load_prompt "$SCRIPT_DIR/prompt.md" "$IDENTITY_NAME" "")
@@ -320,5 +337,9 @@ if [[ -n "$terminal_run_id" ]]; then
           content:(if $rc == 0 then "social run exited successfully" else "social run exited with rc=\($rc)" end)}' \
         | traj append >/dev/null || true
 fi
-_save_state "$now"
+if [[ "$idle_check_this_run" -eq 1 ]]; then
+    _save_state "$now" "$now"
+else
+    _save_state "$now"
+fi
 exit 0

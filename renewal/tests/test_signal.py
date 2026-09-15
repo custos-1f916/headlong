@@ -43,7 +43,7 @@ class SignalPolicyTests(unittest.TestCase):
         big={'contentType':'application/pdf','id':'big.pdf','size':9*1024*1024}
         item=cs.classify(envelope(message='Read this',attachments=[big]),POLICY)
         self.assertNotIn('pdf_attachments',item)
-        self.assertIn('not readable',item['body'])
+        self.assertIn('Attachment unavailable to Custos',item['body'])
         pdf3={'contentType':'application/pdf','id':'c.pdf','size':11}
         item=cs.classify(envelope(message='Read this',attachments=[pdf,pdf,pdf3]),POLICY)
         self.assertEqual(len(item['pdf_attachments']),2)
@@ -94,6 +94,12 @@ class SignalPolicyTests(unittest.TestCase):
         item=cs.classify(envelope(message=None,attachments=[image]),POLICY)
         self.assertNotIn('image_attachments',item)
         self.assertIn('unavailable',item['body'])
+
+    def test_unavailable_non_image_attachment_is_an_explicit_non_inference_fact(self):
+        video={'contentType':'video/mp4','id':'clip','size':1234}
+        item=cs.classify(envelope(message='What does this say?',attachments=[video]),POLICY)
+        self.assertIn('Attachment unavailable to Custos',item['body'])
+        self.assertIn('Do not infer, quote, or describe its contents',item['body'])
     def test_reactions_are_ambient_in_dm_and_group_including_removals(self):
         for group in (None, {'groupId': 'agreed-group'}):
             for removed in (False, True):
@@ -577,6 +583,40 @@ class SignalSpoolTests(unittest.TestCase):
         path = self.root / 'bad.json'; path.write_text(json.dumps(bad))
         with self.assertRaises(ValueError):
             cs.load_policy(path)
+
+    def test_identical_bot_service_error_opens_circuit_after_two_text_replies(self):
+        kim = '00000000-0000-4000-8000-00000000000b'
+        policy = copy.deepcopy(POLICY)
+        policy['people'][kim] = {'label': 'Kim', 'authority': 'external', 'bot': True}
+        self.policy_path.write_text(json.dumps(policy))
+        error = ("I couldn't finish that request because an internal error occurred. "
+                 "Files already saved are preserved. Please ask me to continue.")
+        base = 1_000_000
+        for n in range(2):
+            item = cs.classify(envelope(sender=kim, message=error, timestamp=base + n), policy)
+            self.spool.receive(item)
+            with self.spool.db:
+                self.spool.db.execute("UPDATE inbox SET phase='queued' WHERE id=?", (item['request_id'],))
+                self.spool.db.execute("INSERT INTO outbox(id,request_id,content,created,reaction,phase) VALUES(?,?,?,?,?,'submitted')",
+                                      ('prior-' + str(n), item['request_id'], 'Try again', n, None))
+        third = cs.classify(envelope(sender=kim, message=error, timestamp=base + 2), policy)
+        self.spool.receive(third)
+        bridge = cs.Bridge(self.policy_path, self.spool, str(self.policy_path)+'.actions.sqlite')
+        bridge.rpc = mock.Mock()
+        with mock.patch.object(cs, 'transport') as transport:
+            bridge.deliver_pending(self.spool.db)
+        transport.assert_not_called()
+        row = self.spool.db.execute("SELECT phase,receipt FROM inbox WHERE id=?", (third['request_id'],)).fetchone()
+        self.assertEqual(row['phase'], 'suppressed')
+        self.assertIn('circuit open', row['receipt'])
+
+        recovered = cs.classify(envelope(sender=kim, message='The service recovered; here is the result.',
+                                         timestamp=base + 3), policy)
+        self.spool.receive(recovered)
+        with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport',
+                return_value={'queued': True}) as transport:
+            bridge.deliver_pending(self.spool.db)
+        transport.assert_called_once()
 
     def test_intake_sends_read_receipt_and_keeps_typing_until_the_reply_is_sent(self):
         calls = []; bridge = self.bridge_with_rpc(calls)

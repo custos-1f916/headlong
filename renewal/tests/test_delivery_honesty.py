@@ -96,9 +96,11 @@ class ChatFixture(unittest.TestCase):
 
     def fake_actions(self, contacts):
         log = self.root / "actions.log"
+        argv_log = self.root / "actions.argv"
         executable(self.fake_bin / "custos-actions", "#!/usr/bin/env python3\nimport json, sys\n"
                    "if sys.argv[1] == 'signal-contacts':\n    print(json.dumps({'ok': True, 'contacts': " + repr(contacts) + "})); sys.exit(0)\n"
                    "if sys.argv[1] == 'signal-send':\n    raw = sys.stdin.read(); open(" + repr(str(log)) + ", 'a').write(raw + '\\n')\n"
+                   "    open(" + repr(str(argv_log)) + ", 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
                    "    print(json.dumps({'ok': True, 'request_id': json.loads(raw)['request_id'], 'phase': 'queued'})); sys.exit(0)\n"
                    "sys.exit(2)\n")
         return log
@@ -151,6 +153,31 @@ class ChatOutboundTests(ChatFixture):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not sent", result.stderr)
         self.assertIn("bridge only carries replies", result.stderr)
+        self.assertEqual(self.outgoing(), [])
+
+    def test_signal_send_file_uses_attachment_broker_and_never_raw_native_append(self):
+        log = self.fake_actions([{"target": self.contact, "label": "Bob", "kind": "dm"}])
+        self.inbound(self.bob, UUID_B, "send the report", receipt=True)
+        report = self.root / "report.txt"
+        report.write_text("verified report")
+        result = self.chat("send-file", "--from", "custos", "--to", self.bob,
+                           "--reply-to", UUID_B[:8], "--caption", "Here it is.", str(report))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("receipt-bearing request", result.stderr)
+        self.assertEqual(self.outgoing(), [])
+        payload = json.loads(log.read_text().strip().splitlines()[-1])
+        self.assertEqual((payload["target"], payload["message"]), (self.contact, "Here it is."))
+        argv = json.loads((self.root / "actions.argv").read_text().splitlines()[-1])
+        self.assertEqual(argv, ["signal-send", "--attach", str(report), "--reply-to", UUID_B[:8]])
+
+    def test_signal_send_file_refusal_is_not_reported_as_delivery(self):
+        self.fake_actions([{"target": "dm:someone-else", "label": "Else", "kind": "dm"}])
+        report = self.root / "report.txt"
+        report.write_text("contents")
+        result = self.chat("send-file", "--from", "custos", "--to", self.bob, str(report))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not sent", result.stderr)
+        self.assertNotIn("File sent", result.stderr)
         self.assertEqual(self.outgoing(), [])
 
     def test_follow_up_delivery_is_exempt_from_the_double_text_guard(self):

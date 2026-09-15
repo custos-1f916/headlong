@@ -123,6 +123,14 @@ This command records the outgoing message and file metadata in your trajectory;
 do not also emit a `chat reply` containing the same answer. Existing conversation
 guards still apply; attaching a file is not a way around a refused message.
 
+`chat send-file --to signal-ROUTE [--reply-to STEP] [--caption TEXT] FILE`
+is a convenience wrapper for that same receipt-bearing attachment path. It is
+safe for Signal because it invokes `custos-actions`; it never appends a raw
+`content_b64` message and calls that delivery. For non-Signal bridges the
+command reports only that the file was appended for that bridge, not that an
+external service accepted it. Never claim a file was sent without the actions
+request/receipt evidence.
+
 Paths are read inside your container only. The host retains an immutable byte
 snapshot until Signal accepts it; filenames, sizes and hashes remain with the
 request for idempotency after the bytes are removed. Keep the original files
@@ -136,5 +144,8 @@ The aggregate pending/uncertain file queue is bounded to 64 MiB.
 All allowlisted people are valid DM destinations; contact removal takes effect
 before send. The bridge retains credentials and routing policy on the host.
 Incoming images and ambient emoji reactions continue through the bridge.
+When intake says an attachment is unavailable, that is a hard context fact:
+you did not see it. Do not infer, quote, summarize or describe its contents;
+answer visible text only, or say the attachment was unavailable.
 Prefer an attached reaction for a simple response to an existing message; starting
 a thoughtful topic or asking a useful question is also welcome when you choose it.

@@ -44,6 +44,8 @@ BATCH_KNOBS = ('quiet_seconds', 'max_wait_seconds', 'dm_quiet_seconds', 'dm_max_
 BOT_TURNS_WRAP, BOT_TURNS_EMOJI, BOT_TURNS_DIGEST = 4, 5, 6
 BOT_GAP = 7200  # seconds of quiet (or any human message) that ends a bot thread's streak
 DIGEST_QUIET, DIGEST_MAX_WAIT = 1800, 7200  # the held digest goes when the bot pauses, or at most this late
+ATTACHMENT_UNAVAILABLE = ('[Attachment unavailable to Custos. Do not infer, quote, or describe its contents; '
+                          'say that it was unavailable if the answer depends on it.]')
 
 
 def encoded(value):
@@ -120,6 +122,41 @@ def bot_turns(db, item, policy):
                       "phase IN ('pending','sending','submitted','uncertain')", (row['id'],)).fetchone():
             turns += 1
     return turns
+
+
+def service_error_signature(body):
+    """A stable signature only for machine-style failure notices, not ordinary
+    negative human messages. The exact repeat is what opens the breaker."""
+    normalized = ' '.join(str(body or '').casefold().split())
+    indicators = ('internal error', 'service unavailable', 'backend unavailable',
+                  'temporarily unavailable', 'please try again', 'ask me to continue')
+    if not any(indicator in normalized for indicator in indicators):
+        return None
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def answered_identical_service_errors(db, item):
+    """Count consecutive earlier identical bot errors that received a text
+    response. A different/non-error message closes the incident."""
+    signature = service_error_signature(item.get('body'))
+    if not signature:
+        return 0
+    count = 0
+    rows = db.execute("SELECT id,payload FROM inbox WHERE json_extract(payload,'$.conversation')=? "
+                      "AND json_extract(payload,'$.timestamp')<? ORDER BY json_extract(payload,'$.timestamp') DESC",
+                      (item['conversation'], item['timestamp'])).fetchall()
+    for row in rows:
+        prior = json.loads(row['payload'])
+        if prior.get('reaction'):
+            continue
+        if prior.get('sender_aci') != item.get('sender_aci') or service_error_signature(prior.get('body')) != signature:
+            break
+        replied = db.execute("SELECT 1 FROM outbox WHERE request_id=? AND reaction IS NULL AND "
+                             "phase IN ('pending','sending','submitted','uncertain') LIMIT 1",
+                             (row['id'],)).fetchone()
+        if replied:
+            count += 1
+    return count
 
 
 def first_emoji(text):
@@ -220,7 +257,7 @@ def classify(envelope, policy):
     image_count=sum(isinstance(a,dict) and isinstance(a.get('contentType'),str) and
                     a['contentType'].startswith('image/') for a in attachments)
     if image_count>len(images) and reaction is None:
-        body=(body or '')+'\n[Some image attachments are unavailable: unsupported format, too large, or more than four images.]'
+        body=(body or '')+'\n'+ATTACHMENT_UNAVAILABLE
     # A video, voice note or file used to vanish here (empty body -> dropped), so
     # Custos never knew something had been shared and guessed. Announce it.
     admitted_pdfs={a['id'] for a in pdfs}
@@ -233,7 +270,7 @@ def classify(envelope, policy):
             ct=a['contentType']; kind='Video' if ct.startswith('video/') else 'Audio' if ct.startswith('audio/') else 'File'
             size=a.get('size'); sz=(', %.1f MB' % (size/1048576)) if type(size) is int and size>0 else ''
             kinds.append(kind+' ('+ct+sz+')')
-        body=(body or '')+'\n['+'; '.join(kinds)+' attached: not readable here yet. Say so and ask what it shows, or ask for a few still frames.]'
+        body=(body or '')+'\n['+'; '.join(kinds)+' attached but unavailable.]\n'+ATTACHMENT_UNAVAILABLE
     stamp = message.get('timestamp')
     if not isinstance(stamp, int) or isinstance(stamp, bool) or stamp <= 0:
         return None
@@ -783,6 +820,19 @@ class Bridge:
             texts = [(row, item) for row, item in batch if not item.get('reaction')]
             if not texts:
                 continue
+            # A broken peer bot can emit the same failure forever. Let Custos
+            # answer it at most twice; after that hold identical errors at the
+            # transport boundary until a non-error message resets the streak.
+            # This consumes no model call and creates no reply task.
+            if is_bot(self.policy, texts[-1][1]['sender_aci']) and \
+                    answered_identical_service_errors(db, texts[-1][1]) >= 2:
+                with db:
+                    for row, item in texts:
+                        if service_error_signature(item.get('body')) == service_error_signature(texts[-1][1].get('body')):
+                            db.execute("UPDATE inbox SET phase='suppressed',receipt=? WHERE id=? AND phase='pending'",
+                                       (encoded({'suppressed': 'identical bot service error circuit open; waits for non-error input'}),
+                                        row['id']))
+                continue
             turns = bot_turns(db, texts[-1][1], self.policy)
             if turns >= BOT_TURNS_DIGEST:
                 arrived = [row['arrived'] or 0.0 for row, item in texts]
@@ -907,7 +957,7 @@ class Bridge:
                 elif item.get('pdf_attachments'):
                     failures.append('A PDF exceeded the attachment transfer limit.')
             if failures:
-                content += '\n' + '\n'.join(failures)
+                content += '\n' + '\n'.join(failures) + '\n' + ATTACHMENT_UNAVAILABLE
             prepared = {'media': bool(image_data or pdf_data), 'content':
                         encoded({**{'content': content, 'images': image_data},
                                  **({'pdfs': pdf_data} if pdf_data else {})})

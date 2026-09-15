@@ -169,8 +169,8 @@ _transport_receipt_request() {
 # <route> <message>: the proactive path. 0 = sent and recorded by custos-actions
 # (do not append a second step); 1 = refused (reason printed); 2 = no contact
 # maps to this route, or custos-actions is not installed.
-_send_via_actions() {
-    local route="$1" message="$2" contacts target rid out
+_signal_target_for_route() {
+    local route="$1" contacts target
     command -v custos-actions >/dev/null 2>&1 || return 2
     contacts=$(custos-actions signal-contacts 2>/dev/null) || return 2
     target=$(printf '%s' "$contacts" | ROUTE="$route" python3 -c '
@@ -187,6 +187,12 @@ for c in items:
         print(t)
         break') || target=""
     [[ -n "$target" ]] || return 2
+    printf '%s' "$target"
+}
+
+_send_via_actions() {
+    local route="$1" message="$2" target rid out
+    target=$(_signal_target_for_route "$route") || return 2
     rid=$(printf '%s\n%s' "$route" "$message" | python3 -c 'import hashlib,sys; print("chat-" + hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16])')
     if ! out=$(jq -nc --arg r "$rid" --arg t "$target" --arg m "$message" '{request_id:$r,target:$t,message:$m}' | custos-actions signal-send 2>&1); then
         printf 'chat: error: %s\n' "${out:-not sent: custos-actions refused or is unavailable}" >&2
@@ -411,15 +417,17 @@ Use the name of the person you mean to reach: chat reply <their-name> <message>"
 }
 
 cmd_send_file() {
-    local from="" to="${IDENTITY_NAME:-}" filepath=""
+    local from="" to="${IDENTITY_NAME:-}" filepath="" reply_to="" caption=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --from) from="${2:?--from requires a name}"; shift 2 ;;
             --to)   to="${2:?--to requires a name}"; shift 2 ;;
+            --reply-to) reply_to="${2:?--reply-to requires a step id}"; shift 2 ;;
+            --caption) caption="${2:?--caption requires text}"; shift 2 ;;
             *)      filepath="$1"; shift ;;
         esac
     done
-    [[ -z "$filepath" ]] && die "Usage: chat send-file [--from <name>] [--to <name>] <filename>"
+    [[ -z "$filepath" ]] && die "Usage: chat send-file [--from <name>] [--to <name>] [--reply-to STEP] [--caption TEXT] <filename>"
     [[ -f "$filepath" ]] || die "File not found: $filepath"
 
     local size max
@@ -438,6 +446,27 @@ cmd_send_file() {
 
     local filename
     filename=$(basename "$filepath")
+    # Signal files must use the host-owned actions channel. It snapshots the
+    # bytes, applies the conversation guard, obtains a Signal acceptance
+    # receipt, and records delivered_by=custos-actions. A raw native message
+    # carrying content_b64 never reaches the Signal bridge and must not be
+    # described as sent (2026-09-14 audit).
+    if [[ "$from" == "${IDENTITY_NAME:-}" && "$to" == signal-* ]]; then
+        local target rid out digest
+        target=$(_signal_target_for_route "$to") || die "not sent: '$to' is not a current custos-actions Signal contact"
+        digest=$(shasum -a 256 "$filepath" 2>/dev/null | awk '{print $1}') || die "failed to hash $filepath"
+        rid=$(printf '%s\n%s\n%s\n%s' "$to" "$caption" "$filename" "$digest" \
+            | python3 -c 'import hashlib,sys; print("chat-file-" + hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16])')
+        local -a action_args=(signal-send --attach "$filepath")
+        [[ -n "$reply_to" ]] && action_args+=(--reply-to "$reply_to")
+        if ! out=$(jq -nc --arg r "$rid" --arg t "$target" --arg m "$caption" \
+                '{request_id:$r,target:$t,message:$m}' | custos-actions "${action_args[@]}" 2>&1); then
+            die "${out:-not sent: custos-actions refused or is unavailable}"
+        fi
+        printf 'File accepted by custos-actions for Signal delivery (receipt-bearing request %s): %s\n' "$rid" "$out" >&2
+        return 0
+    fi
+    [[ -z "$reply_to" ]] || die "not sent: --reply-to is only supported for Signal files"
     # Binary-safe: JSON cannot hold raw bytes, so stamp standard base64
     # via a temp file (never argv). Text files also keep their body in
     # `content` so Slack and web chat still deliver the file text; binary
@@ -472,7 +501,7 @@ cmd_send_file() {
     rm -f "$b64tmp"
     [[ "$jq_rc" -eq 0 ]] || die "failed to encode/append $filepath"
 
-    printf 'File sent: %s\n' "$filename" >&2
+    printf 'File appended for the configured non-Signal bridge: %s\n' "$filename" >&2
 }
 
 cmd_react() {

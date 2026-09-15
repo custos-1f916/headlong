@@ -201,6 +201,47 @@ class PersonAliasRemoveTests(MemoryFixture):
         self.assertEqual(meta["routes"], ["signal:hal"])
         self.assertEqual(notes, "Hal is my operator.")
 
+    def test_distinct_person_alias_is_rejected_and_supported_remove_repairs_it(self):
+        person_id = self.store.commit(
+            "Person: Hal\n\n'Jack' in this note's aliases is a distinct person, not Hal."
+            + cm.PERSON_MARKER + cm.encode({"person_key": "hal", "display": "Hal",
+                                            "aliases": ["Hal", "Jack"], "routes": ["signal:hal"],
+                                            "updated": "2020-01-01T00:00:00+00:00"}),
+            memory_type="person")
+        path = self.store.find(person_id)[0]
+        result = self.store.validate([str(path)])
+        self.assertIn("contradicts distinct-person prose", result["problems"][0]["error"])
+        repaired = cm.People(self.store).remove_alias(person_id, "Jack")
+        self.assertTrue(repaired["removed"])
+        self.assertEqual(self.store.validate([str(path)])["problems"], [])
+
+    def test_person_normalize_deduplicates_only_updated_history_and_is_idempotent(self):
+        people, person_id = self.create_person()
+        path = people.find("hal")[0][0]
+        raw = path.read_text()
+        line = next(line for line in raw.splitlines() if line.startswith("  - "))
+        path.write_text(raw.replace(line, line + "\n" + line, 1))
+        body_before = cm.split_memory(path.read_text())[1]
+        result = people.normalize(person_id)
+        self.assertTrue(result["normalized"])
+        self.assertEqual(result["duplicates_removed"], 1)
+        self.assertEqual(cm.split_memory(path.read_text())[1], body_before)
+        self.assertEqual(Path(result["preimage"]).read_text(), raw.replace(line, line + "\n" + line, 1))
+        second = people.normalize(person_id)
+        self.assertFalse(second["normalized"])
+        self.assertIsNone(second["preimage"])
+
+    def test_person_normalize_cli(self):
+        people, person_id = self.create_person()
+        path = people.find("hal")[0][0]
+        raw = path.read_text()
+        line = next(line for line in raw.splitlines() if line.startswith("  - "))
+        path.write_text(raw.replace(line, line + "\n" + line, 1))
+        completed = subprocess.run([sys.executable, cm.__file__, "person-normalize", person_id],
+                                   text=True, capture_output=True, timeout=10, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout)["duplicates_removed"], 1)
+
     def test_person_alias_remove_cli_and_invalid_targets(self):
         people, person_id = self.create_person()
         completed = subprocess.run(
@@ -880,7 +921,7 @@ class ResponderTests(MemoryFixture):
         self.assertIn("I will look into it.", seen["system"])
         self.assertIn("prefer a reaction or no-reply", seen["system"])
 
-    def test_square_responder_sees_the_daily_allowance_and_queue(self):
+    def test_square_responder_reserves_capacity_before_composition(self):
         # The observer has seen /api/me with the allowance spent, and two of Custos's
         # square replies sit in the trajectory past the outbox cursor.
         import custos_square
@@ -901,9 +942,10 @@ class ResponderTests(MemoryFixture):
                            "content": "@custos what do you make of this?", "step_id": "trigger-sq"}
         self.log.write_text(self.log.read_text() + cm.encode(square_envelope) + "\n")
         request = {**self.request, "envelope": square_envelope, "messages": [{"role": "user", "content": square_envelope["content"]}]}
-        seen = {}
+        seen = {"model_calls": 0}
         def capture_system(argv, *args, **kwargs):
             if argv[0] == "llm":
+                seen["model_calls"] += 1
                 seen["system"] = argv[argv.index("-s") + 1]
                 return cm.encode({**self.plan, "decision": "no-reply", "reply": "", "goal": None, "person": None})
             return self.real_run(argv, *args, **kwargs)
@@ -912,16 +954,19 @@ class ResponderTests(MemoryFixture):
             cm.response(self.store, request)
             budget = cm.square_budget()
             hint = cm.context_text(self.store.context())
-        self.assertIn("Square allowance (data): 0 comments left today of 20, 2 of your replies still queued", seen["system"])
-        self.assertIn("a queued reply is not a delivered one", seen["system"])
+        self.assertEqual(seen["model_calls"], 0)
+        record = self.store.request("square:c50000")[4]
+        self.assertEqual(record["response"]["reason"], "square_capacity_unavailable")
+        self.assertFalse(record["response"]["inference"])
         self.assertEqual((budget["comments_remaining"], budget["queued"]), (0, 2))
         self.assertIn("2 of your replies still queued", hint)
         self.assertIn("custos-observe withdraw STEP_ID", hint)
         # A Signal message never carries the square budget.
-        seen.clear()
+        seen = {"model_calls": 0}
         with mock.patch.dict(os.environ, {"CUSTOS_OBSERVE_STATE": str(state)}), mock.patch.object(custos_square, "STATE", state), \
                 mock.patch.object(cm, "run", side_effect=capture_system):
             cm.response(self.store, self.request)
+        self.assertEqual(seen["model_calls"], 1)
         self.assertNotIn("Square allowance", seen["system"])
 
     def test_context_flags_stale_and_duplicate_asks(self):
