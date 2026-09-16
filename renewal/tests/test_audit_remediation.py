@@ -34,7 +34,7 @@ class ReceiptTests(unittest.TestCase):
             api = Square(store)
             valid = dict(payload, body='Exact result', author='custos', id=7, created_at=2000000)
             for wrong in ({'body': 'Exact  result'}, {'body': 'Exact result '}, {'author': 'other'},
-                          {'post_id': 45}, {'parent_id': 10}, {'created_at': 1000}):
+                          {'id': 8}, {'post_id': 45}, {'parent_id': 10}, {'created_at': 1000}):
                 with patch.object(api, 'get', return_value={'comment': {**valid, **wrong}}), patch.object(api, 'request') as send:
                     with self.assertRaises(APIError): api.receipt('x')
                     send.assert_not_called()
@@ -42,6 +42,12 @@ class ReceiptTests(unittest.TestCase):
                 self.assertEqual(api.receipt('x')['status'], 'delivered')
                 send.assert_not_called()
             self.assertEqual(store.db.execute('SELECT payload FROM outbound').fetchone()[0], raw)
+            with patch.object(api, 'request') as send:
+                self.assertEqual(api.write('x', 'comment', {**payload, 'body': 'Exact result'})['status'], 'delivered')
+                send.assert_not_called()
+            with patch.object(api, 'request') as send, patch.object(api, 'validate'), patch.object(api, 'get', return_value={'handle': 'custos', 'today': {'comments_remaining': 20}}):
+                self.assertEqual(api.write('new-id', 'comment', {**payload, 'body': 'Exact result'})['request_id'], 'x')
+                send.assert_not_called()
 
 
 class AdmissionTests(unittest.TestCase):

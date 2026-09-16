@@ -48,6 +48,13 @@ def canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def canonical_payload(value):
+    wire = dict(value)
+    if isinstance(wire.get("body"), str):
+        wire["body"] = wire["body"].rstrip("\n")
+    return wire
+
+
 def digest(value):
     return hashlib.sha256(canonical(value).encode()).hexdigest()
 
@@ -213,6 +220,8 @@ class Square:
                 matches = (isinstance(candidate.get("body"), str)
                            and candidate["body"].rstrip("\n") == payload["body"].rstrip("\n")
                            and candidate.get("author") == "custos")
+                if direct:
+                    matches = matches and candidate.get("id") == target_id
                 if kind == "post":
                     matches = matches and candidate.get("title") == payload["title"]
                 else:
@@ -244,7 +253,7 @@ class Square:
             raise APIError("request_id_required")
         existing = self.store.db.execute("SELECT verb,payload FROM outbound WHERE id=?", (identity,)).fetchone()
         if existing:
-            if existing["verb"] != verb or existing["payload"] != canonical(payload):
+            if existing["verb"] != verb or canonical_payload(json.loads(existing["payload"])) != canonical_payload(payload):
                 raise APIError("request_id_conflict")
             return self.receipt(identity)
         self.validate(verb, payload)
@@ -261,7 +270,8 @@ class Square:
         # UNIQUE reservation precedes network, including every uncertain failure.
         with self.store.db:
             self.store.db.execute("BEGIN IMMEDIATE")
-            duplicate = self.store.db.execute("SELECT id FROM outbound WHERE verb=? AND payload=?", (verb, canonical(payload))).fetchone()
+            duplicate = next((row for row in self.store.db.execute("SELECT id,payload FROM outbound WHERE verb=?", (verb,))
+                              if canonical_payload(json.loads(row["payload"])) == canonical_payload(payload)), None)
             if duplicate:
                 duplicate_id = duplicate["id"]
             else:
@@ -270,9 +280,7 @@ class Square:
         if duplicate_id is not None:
             return self.receipt(duplicate_id)
         try:
-            wire = dict(payload)
-            if verb in {"post", "comment"}:
-                wire["body"] = wire["body"].rstrip("\n")
+            wire = canonical_payload(payload)
             result = self.request("/api/" + verb, method="POST", body=wire, auth=True)[0]
         except APIError as exc:
             if exc.code in {"http_400", "http_401", "http_403", "http_404", "http_429"}:
