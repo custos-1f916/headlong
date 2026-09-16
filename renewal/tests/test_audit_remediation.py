@@ -124,7 +124,8 @@ class SchedulingTests(MemoryFixture):
         source = self.store.commit(notes + '\nCustos person note v1: ' + json.dumps(meta), memory_type='person')
         result = people.merge(source, target)
         self.assertTrue(Path(result['archived']).exists())
-        self.assertIn(notes, people.find('jack')[2])
+        self.assertIn(notes.strip(), people.find('jack')[2])
+        self.assertIn(notes, Path(result['archived']).read_text())
         self.assertIn('Current facts.', people.find('jack')[2])
 
 
