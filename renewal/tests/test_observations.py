@@ -382,6 +382,7 @@ class SquareOutboxTests(unittest.TestCase):
 
     def test_allowance_exhausted_waits_until_reset_and_reports_each_queued_reply(self):
         api = self.square(remaining=1)
+        self.store.put('square:directed:3100:50000', {'at': self.now, 'request_id': 'verified-incoming'})
         for step in ("aaaaaaa1", "aaaaaaa2", "aaaaaaa3"):
             self.compose(step)
         observer = self.observer(api)
@@ -397,7 +398,7 @@ class SquareOutboxTests(unittest.TestCase):
         self.assertNotIn("allowance-wait:aaaaaaa3", self.native.messages)
         # The source retries at the reset (+30 s), not after an exponential backoff.
         state = self.store.get("source:square-outbox")
-        self.assertEqual(state["error"], "platform_allowance_exhausted")
+        self.assertEqual(state["deferred"], "platform_allowance_exhausted")
         self.assertAlmostEqual(state["next"], self.reset_ms / 1000 + 30, delta=1)
         # Queue depth and the cached allowance are visible to other processes.
         from custos_square import allowance_summary, square_queue
@@ -424,7 +425,7 @@ class SquareOutboxTests(unittest.TestCase):
         with patch("custos_square.time.time", return_value=observer.now):
             observer.source("square-outbox", 60, observer.outbox)
         self.assertEqual(api.posted, ["reply bbbbbbb1", "reply bbbbbbb2"])
-        self.assertIn("recovery:square-outbox:1", self.native.messages)
+        self.assertNotIn("recovery:square-outbox:1", self.native.messages)
         self.assertEqual(self.store.get("outbox:square_pending")["count"], 0)
 
     def test_withdrawn_reply_is_skipped_and_the_rest_still_deliver(self):

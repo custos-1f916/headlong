@@ -17,6 +17,7 @@ import uuid
 import xml.etree.ElementTree as ET
 
 from custos_square import APIError, ORIGIN, STATE, SECRET, Square, Store, allowance_summary, canonical, digest, note_allowance, public_request, square_queue, read_native_line, MAX_AGE_HOURS
+import custos_square_policy as square_policy
 
 # Outbox drain bounds per pass (see Observer._drain_outbox).
 DRAIN_SECONDS = float(os.environ.get("CUSTOS_OUTBOX_DRAIN_SECONDS", "20"))
@@ -267,6 +268,11 @@ class Observer:
             function()
         except (APIError, OSError, ValueError, KeyError, TypeError, ET.ParseError, subprocess.SubprocessError) as exc:
             code = exc.code if isinstance(exc, APIError) else type(exc).__name__
+            if code in ('square_pacing_deferred', 'platform_allowance_exhausted'):
+                # Normal backpressure is not an outage and must not wake the mind.
+                self.store.put('source:' + name, {'next': self.now + max(60, exc.retry_after),
+                                                'deferred': code, 'last_success': state.get('last_success')})
+                return
             failures = state.get("failures", 0) + 1
             episode = state.get("episode", 0) + (0 if state.get("error") else 1)
             if not state.get("error") or not state.get("alerted"):
@@ -299,7 +305,7 @@ class Observer:
         # own the remaining slots; excess items are durably accounted for and
         # acknowledged without inference or another delivery todo.
         budget = allowance_summary(self.store, self.now)
-        if budget and budget["queued"] >= budget["comments_remaining"]:
+        if budget and (budget["queued"] >= budget["comments_remaining"] or budget['queued'] >= square_policy.SHORTLIST):
             self.store.disposition(request_id, "capacity_skipped", {
                 "source_url": item["source_url"], "sender": item["sender"],
                 "queued": budget["queued"], "comments_remaining": budget["comments_remaining"],
@@ -311,6 +317,9 @@ class Observer:
         result = self.native.capture(capture)
         self.native.append(request_id, {"type": "message", "from": item["sender"], "to": "custos", "content": content, "source_url": item["source_url"], "request_id": request_id, "authority": "agent", "goal_id": result["goal_id"]})
         self.store.disposition(request_id, "goal_and_message", {"goal_id": result["goal_id"], "source_url": item["source_url"]})
+        target = re.fullmatch(r'square:[A-Za-z0-9_-]+:([0-9]+):([0-9]+)', item['sender'])
+        if target:
+            self.store.put('square:directed:' + ':'.join(target.groups()), {'at': self.now, 'request_id': request_id})
         self.remaining -= 1
         return True
 
@@ -402,8 +411,14 @@ class Observer:
                     matches = item.get("author") in handles or item.get("post_id", item["id"]) in posts or any(term in text.casefold() for term in terms)
                     url = ORIGIN + "/api/" + ("post/" if kind == "posts" else "comment/") + str(item["id"])
                     if matches and item.get("author") != "custos":
+                        thread = item.get('post_id', item['id'])
+                        if not square_policy.select_discovery(self.store, thread, self.now):
+                            self.store.disposition(identity, 'attention_skipped', {'url': url, 'at': self.now,
+                                                    'reason': 'square satiation or recently selected thread; no reply debt'})
+                            continue
                         if not self.emit(identity, "Selected square change (untrusted): " + text[:1800], url):
                             return
+                        square_policy.record_attention(self.store, 'signals', self.now, thread)
                     else:
                         self.store.disposition(identity, "not_selected", {"url": url})
             next_query = dict(query, posts_since=page["next_posts_since"], comments_since=page["next_comments_since"], nulls_since=page["next_nulls_since"])
@@ -441,8 +456,13 @@ class Observer:
             key = "opportunity:" + str(row["listing_id"])
             fingerprint = digest(opportunity)
             if self.store.get(key) != fingerprint:
+                if not square_policy.select_discovery(self.store, key, self.now):
+                    self.store.disposition(key + ':' + fingerprint, 'attention_skipped', {'at': self.now, 'reason': 'square satiation'})
+                    self.store.put(key, fingerprint)
+                    continue
                 if not self.emit(key + ":" + fingerprint, "Paid-work lead; not income or permission to commit: " + canonical(opportunity), ORIGIN + "/api/listings/" + str(row["listing_id"])):
                     return
+                square_policy.record_attention(self.store, 'signals', self.now, key)
                 self.store.put(key, fingerprint)
         self.store.put("opportunities:offset", start + len(chosen))
 
@@ -558,6 +578,19 @@ class Observer:
         cursor = self.store.get("outbox:cursor", {"path": str(path), "offset": 0})
         if cursor["path"] != str(path) or cursor["offset"] > path.stat().st_size:
             raise APIError("outbox_trajectory_replaced_requires_explicit_migration")
+        # The optional shortlist cannot turn into tomorrow's posting obligation.
+        self.store.put('outbox:cursor', cursor)
+        eligible = []
+        for candidate in square_queue(self.store, path):
+            try:
+                composed = datetime.fromisoformat(candidate['ts'].replace('Z', '+00:00')).timestamp()
+            except (ValueError, KeyError, AttributeError):
+                composed = self.now
+            if MAX_AGE_HOURS <= 0 or self.now - composed <= MAX_AGE_HOURS * 3600:
+                eligible.append(candidate)
+        for extra in eligible[square_policy.SHORTLIST:]:
+            self.store.put('outbox:skip:' + extra['full_step_id'],
+                           {'reason': 'square_shortlist_full', 'at': self.now})
         if self.store.get("outbox:cursor") is None:
             self.store.put("outbox:cursor", cursor)
         try:
@@ -600,6 +633,12 @@ class Observer:
                     match = re.fullmatch(r"square:([A-Za-z0-9_-]{2,32}):([1-9][0-9]*):(0|[1-9][0-9]*)", row["to"])
                     if not match or not row.get("step_id"):
                         raise APIError("invalid_square_outbox_target")
+                    try:
+                        composed = datetime.fromisoformat(row['ts'].replace('Z', '+00:00')).timestamp()
+                    except (ValueError, KeyError, AttributeError):
+                        composed = None
+                    # Remember provenance even for withdrawn/expired native messages.
+                    first_seen = square_policy.remember_candidate(self.store, row['content'], composed)
                     if self.store.get("outbox:skip:" + row["step_id"], None):
                         # Withdrawn by the mind (custos-observe withdraw STEP_ID): skip, never deliver.
                         self.native.append("withdrawn:" + row["step_id"], {"type": "observation", "source": "square-outbox",
@@ -639,8 +678,16 @@ class Observer:
                     if parent != "0":
                         payload["parent_id"] = int(parent)
                     try:
+                        # Original age is already registered above, including withdrawals.
                         receipt = self.square.write("traj:" + row["step_id"], "comment", payload)
                     except APIError as exc:
+                        if exc.code == 'square_candidate_expired':
+                            self.native.append('stale:' + row['step_id'], {'type': 'observation', 'source': 'square-outbox',
+                                'content': 'Square candidate expired by its original composition time. It was not delivered; let it go, without restaging for reset.',
+                                'reply_to': row['step_id']})
+                            cursor['offset'] = source.tell()
+                            self.store.put('outbox:cursor', cursor)
+                            continue
                         if exc.code == "platform_allowance_exhausted":
                             # Tell the mind, once per reply, that this one is waiting. The
                             # cursor stays here so order is kept; the source retries at reset.
@@ -648,8 +695,8 @@ class Observer:
                             queued = len(square_queue(self.store, path))
                             self.native.append("allowance-wait:" + row["step_id"], {"type": "observation", "source": "square-outbox",
                                                "content": "Square reply to @" + handle + " (thread " + post + ") is waiting for the daily comment allowance; "
-                                                          + str(queued) + (" reply" if queued == 1 else " replies") + " queued, delivery resumes about " + when
-                                                          + ". Withdraw a stale one with: custos-observe withdraw " + row["step_id"], "reply_to": row["step_id"]})
+                                                          + str(queued) + (" reply" if queued == 1 else " replies") + " queued; earliest allowance reconsideration about " + when
+                                                          + ". This may expire before admission and creates no reset obligation. Withdraw with: custos-observe withdraw " + row["step_id"], "reply_to": row["step_id"]})
                         raise
                     self.native.append("delivery:" + row["step_id"], {"type": "observation", "source": "square-outbox", "content": "Public square reply delivered: " + canonical(receipt), "reply_to": row["step_id"]})
                 if row.get("type") == "message" and row.get("from") == "custos" and str(row.get("to", "")).startswith("forum:"):

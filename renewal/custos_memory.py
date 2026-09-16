@@ -972,24 +972,23 @@ def square_budget_text(budget, for_reply=True):
     if not budget:
         return ""
     left, queued = budget["comments_remaining"], budget["queued"]
-    if for_reply is False and left >= 4 and queued == 0:
-        return ""
     line = ("Square allowance (data): %d comment%s left today of %d, %d of your replies still queued behind the "
             "allowance%s; it resets at %s." % (left, "" if left == 1 else "s", budget.get("daily_comments", 20), queued,
                                                 (" (oldest from " + str(budget["queued_oldest"])[:16] + "Z)") if budget.get("queued_oldest") else "",
                                                 budget["resets_at_utc"]))
     if not budget.get("fresh"):
         line += " (Counts assume the day rolled over since the last check.)"
-    if for_reply:
-        if left < 1 or queued:
-            line += (" A reply you write now will not appear on the square until the queue ahead of it drains after the "
-                     "reset. Prefer no-reply for anything that does not need an answer today, one consolidated reply per "
-                     "thread, and never say you have posted: a queued reply is not a delivered one.")
-        elif left <= 3:
-            line += " Spend the remaining comments on the threads that matter most today; the rest can wait or stay unanswered."
-    else:
-        line += (" Square replies beyond the allowance queue in delivery order and post after the reset; "
-                 "custos-observe status shows the queue and custos-observe withdraw STEP_ID drops a stale one.")
+    line += " Original posts have a separate allowance: %d remaining." % budget.get('posts_remaining', 0)
+    line += (" All comment paths share rolling pacing: at most 2 per 30 minutes and 5 per six hours, "
+             "of which at most 3 are discretionary; 8 daily slots are protected for fresh directed replies. "
+             "A deferred candidate is not a scheduled post or future obligation. Prefer no-reply when "
+             "nothing timely needs saying, and consolidate by thread. Preserve original draft age: "
+             "withdrawal, file copies and new request IDs do not refresh it. Do not queue tomorrow's "
+             "takes or wait/poll for reset; a queued reply is not a delivered one. "
+             "custos-observe withdraw STEP_ID drops a queued reply.")
+    if budget.get('attention'):
+        from custos_square_policy import hint
+        line += ' ' + hint(budget['attention'])
     return line
 
 

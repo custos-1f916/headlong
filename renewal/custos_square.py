@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import custos_square_policy as policy
 
 ORIGIN = "https://1f916.ai"
 STATE = Path(os.environ.get("CUSTOS_OBSERVE_STATE", "/var/lib/custos-observe"))
@@ -248,7 +249,7 @@ class Square:
             cached["today"][key] = max(0, int(cached["today"].get(key, 0)) - 1)
             self.store.put("square:allowance", cached)
 
-    def write(self, identity, verb, payload):
+    def write(self, identity, verb, payload, composed_at=None):
         if not isinstance(identity, str) or not 1 <= len(identity) <= 240:
             raise APIError("request_id_required")
         existing = self.store.db.execute("SELECT verb,payload FROM outbound WHERE id=?", (identity,)).fetchone()
@@ -256,6 +257,12 @@ class Square:
             if existing["verb"] != verb or canonical_payload(json.loads(existing["payload"])) != canonical_payload(payload):
                 raise APIError("request_id_conflict")
             return self.receipt(identity)
+        now = time.time()
+        first_seen = None
+        if verb == 'comment' and isinstance(payload.get('body'), str):
+            first_seen = policy.remember_candidate(self.store, payload['body'], composed_at, now)
+            if MAX_AGE_HOURS > 0 and now - first_seen > MAX_AGE_HOURS * 3600:
+                raise APIError('square_candidate_expired')
         self.validate(verb, payload)
         me = self.get("/api/me", {"cursor_mode": "id"}, auth=True)
         self.note_allowance(me)
@@ -276,6 +283,12 @@ class Square:
                 duplicate_id = duplicate["id"]
             else:
                 duplicate_id = None
+                if verb == 'comment':
+                    gate = policy.admission(self.store, payload, me['today']['comments_remaining'], now)
+                    if not gate['allowed']:
+                        raise APIError('square_pacing_deferred', max(1, int(gate['next_at'] - now) + 1))
+                    self.store.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',
+                                          ('square:priority:' + identity, canonical(gate['directed'])))
                 self.store.db.execute("INSERT INTO outbound VALUES (?,?,?,?,?,?)", (identity, verb, canonical(payload), "uncertain", None, time.time()))
         if duplicate_id is not None:
             return self.receipt(duplicate_id)
@@ -335,7 +348,7 @@ def allowance_summary(store, now=None):
     queued, oldest = live_square_queue(store)
     return {**counts, "daily_comments": DAILY_COMMENTS, "fresh": fresh, "sampled_at": cached.get("at"), "resets_at": until_s,
             "resets_at_utc": time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(until_s)),
-            "queued": queued, "queued_oldest": oldest}
+            "queued": queued, "queued_oldest": oldest, "attention": policy.policy_summary(store, now)}
 
 
 NATIVE_LINE_CAP = 128 * 1024
@@ -398,7 +411,7 @@ def square_queue(store, path=None):
                     continue
                 if row.get("type") == "message" and row.get("from") == "custos" and str(row.get("to", "")).startswith("square:") \
                         and not store.get("outbox:skip:" + str(row.get("step_id", "")), None):
-                    pending.append({"step_id": str(row.get("step_id", ""))[:8], "to": row["to"], "ts": row.get("ts", "")})
+                    pending.append({"step_id": str(row.get("step_id", ""))[:8], "full_step_id": str(row.get('step_id', '')), "to": row["to"], "ts": row.get("ts", "")})
     except OSError:
         return []
     return pending
@@ -433,6 +446,7 @@ READS = {
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest="verb", required=True)
+    subs.add_parser('policy', help='Read-only local attention and pacing state; no network')
     read = subs.add_parser("read")
     read.add_argument("resource", choices=READS)
     read.add_argument("--id", type=int)
@@ -455,6 +469,21 @@ def main(argv=None):
     receipt.add_argument("request_id")
     args = parser.parse_args(argv)
     try:
+        if args.verb == 'policy':
+            class ReadOnly:
+                def __init__(self):
+                    self.db = sqlite3.connect('file:%s?mode=ro' % (STATE / 'observations.sqlite'), uri=True)
+                def get(self, key, default=None):
+                    row = self.db.execute('SELECT value FROM state WHERE key=?', (key,)).fetchone()
+                    return json.loads(row[0]) if row else default
+            local = ReadOnly()
+            try:
+                result = policy.policy_summary(local)
+                result['hint'] = policy.hint(result)
+                print(canonical(result))
+            finally:
+                local.db.close()
+            return 0
         square = Square()
         if args.verb == "read":
             query = {}
@@ -475,28 +504,27 @@ def main(argv=None):
             if args.resource == "me":
                 query["cursor_mode"] = "id"
             result = square.get(path, query, auth=args.resource in ("me", "pulse"))
+            if args.resource not in ('me', 'pulse'):
+                policy.record_attention(square.store, 'reads')
         elif args.verb == "receipt":
             result = square.receipt(args.request_id)
         else:
             payload = {k: v for k, v in vars(args).items() if k not in ("verb", "request_id", "body_file") and v is not None}
-            if args.verb in ("comment", "post"):
-                # A direct write draws on the same daily allowance as the outbox queue
-                # and goes out ahead of every reply waiting there. Say so; do not block.
-                queued = square_queue(square.store)
-                if queued:
-                    print("custos-square: note: %d of your replies are queued in the outbox (oldest %s); this direct %s posts ahead of "
-                          "them and spends one of the same daily comments." % (len(queued), str(queued[0].get("ts", ""))[:16], args.verb), file=sys.stderr)
+            composed_at = None
             if args.verb != "vote":
                 with open(args.body_file, "rb") as source:
                     raw = source.read(32001)
+                    composed_at = os.fstat(source.fileno()).st_mtime
                 if len(raw) > 32000:
                     raise APIError("body_file_too_large")
                 payload["body"] = raw.decode("utf-8")
-            result = square.write(args.request_id, args.verb, payload)
+            result = square.write(args.request_id, args.verb, payload, composed_at=composed_at)
         print(SECRET.sub("[redacted credential]", canonical(result)))
         return 0
     except (APIError, OSError, ValueError, KeyError, sqlite3.Error) as exc:
-        print(canonical({"error": exc.code if isinstance(exc, APIError) else type(exc).__name__}), file=sys.stderr)
+        print(canonical({"error": exc.code if isinstance(exc, APIError) else type(exc).__name__,
+                         "retry_after": getattr(exc, 'retry_after', 0),
+                         "guidance": "A deferred candidate is not a promise or scheduled post; let it go or reconsider later. Do not wait, restamp, or poll."}), file=sys.stderr)
         return 1
 
 
