@@ -1,0 +1,388 @@
+{
+  "sources": [
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "type": "rss",
+      "url": "https://openai.com/news/rss.xml",
+      "homepage": "https://openai.com/news"
+    },
+    {
+      "id": "deepmind",
+      "name": "Google DeepMind",
+      "type": "rss",
+      "url": "https://deepmind.google/blog/rss.xml",
+      "homepage": "https://deepmind.google/discover/blog/"
+    },
+    {
+      "id": "gemini-blog",
+      "name": "Google Gemini",
+      "type": "rss",
+      "url": "https://blog.google/products/gemini/rss/",
+      "homepage": "https://blog.google/products/gemini/"
+    },
+    {
+      "id": "google-ai",
+      "name": "Google AI",
+      "type": "rss",
+      "url": "https://blog.google/technology/ai/rss/",
+      "homepage": "https://blog.google/technology/ai/"
+    },
+    {
+      "id": "google-research",
+      "name": "Google Research",
+      "type": "rss",
+      "url": "https://research.google/blog/rss/",
+      "homepage": "https://research.google/blog/"
+    },
+    {
+      "id": "mistral",
+      "name": "Mistral",
+      "type": "rss",
+      "url": "https://mistral.ai/rss.xml",
+      "homepage": "https://mistral.ai/news"
+    },
+    {
+      "id": "thinking-machines",
+      "name": "Thinking Machines",
+      "type": "rss",
+      "url": "https://thinkingmachines.ai/index.xml",
+      "homepage": "https://thinkingmachines.ai/news/"
+    },
+    {
+      "id": "hf-blog",
+      "name": "Hugging Face blog",
+      "type": "rss",
+      "url": "https://huggingface.co/blog/feed.xml",
+      "homepage": "https://huggingface.co/blog"
+    },
+    {
+      "id": "apple-ml",
+      "name": "Apple ML",
+      "type": "rss",
+      "url": "https://machinelearning.apple.com/rss.xml",
+      "homepage": "https://machinelearning.apple.com"
+    },
+    {
+      "id": "together",
+      "name": "Together AI",
+      "type": "rss",
+      "url": "https://www.together.ai/blog/rss.xml",
+      "homepage": "https://www.together.ai/blog"
+    },
+    {
+      "id": "sakana",
+      "name": "Sakana AI",
+      "type": "rss",
+      "url": "https://sakana.ai/feed.xml",
+      "homepage": "https://sakana.ai"
+    },
+    {
+      "id": "eleuther",
+      "name": "EleutherAI",
+      "type": "rss",
+      "url": "https://blog.eleuther.ai/index.xml",
+      "homepage": "https://blog.eleuther.ai"
+    },
+    {
+      "id": "anthropic-news",
+      "name": "Anthropic",
+      "type": "rss",
+      "url": "https://raw.githubusercontent.com/alan-turing-institute/ai-rss-feeds/refs/heads/main/feeds/anthropic-news.xml",
+      "homepage": "https://www.anthropic.com/news",
+      "staleDays": 14
+    },
+    {
+      "id": "anthropic-research",
+      "name": "Anthropic Research",
+      "type": "rss",
+      "url": "https://raw.githubusercontent.com/alan-turing-institute/ai-rss-feeds/refs/heads/main/feeds/anthropic-research.xml",
+      "homepage": "https://www.anthropic.com/research",
+      "staleDays": 14
+    },
+    {
+      "id": "claude-blog",
+      "name": "Claude blog",
+      "type": "rss",
+      "url": "https://raw.githubusercontent.com/alan-turing-institute/ai-rss-feeds/refs/heads/main/feeds/claude-blog.xml",
+      "homepage": "https://claude.com/blog",
+      "staleDays": 14
+    },
+    {
+      "id": "cohere",
+      "name": "Cohere",
+      "type": "rss",
+      "url": "https://raw.githubusercontent.com/alan-turing-institute/ai-rss-feeds/refs/heads/main/feeds/cohere-blog.xml",
+      "homepage": "https://cohere.com/blog",
+      "staleDays": 14
+    },
+    {
+      "id": "ai2",
+      "name": "Ai2 (Allen Institute)",
+      "type": "rss",
+      "url": "https://raw.githubusercontent.com/alan-turing-institute/ai-rss-feeds/refs/heads/main/feeds/allenai-news.xml",
+      "homepage": "https://allenai.org/news",
+      "staleDays": 14
+    },
+    {
+      "id": "uk-aisi",
+      "name": "UK AISI",
+      "type": "rss",
+      "url": "https://raw.githubusercontent.com/alan-turing-institute/ai-rss-feeds/refs/heads/main/feeds/aisi-blog.xml",
+      "homepage": "https://www.aisi.gov.uk",
+      "staleDays": 14
+    },
+    {
+      "id": "ollama",
+      "name": "Ollama release",
+      "type": "rss",
+      "url": "https://github.com/ollama/ollama/releases.atom",
+      "homepage": "https://github.com/ollama/ollama/releases"
+    },
+    {
+      "id": "llama-cpp",
+      "name": "llama.cpp release",
+      "type": "rss",
+      "url": "https://github.com/ggml-org/llama.cpp/releases.atom",
+      "homepage": "https://github.com/ggml-org/llama.cpp/releases",
+      "enabled": false,
+      "note": "several b-tag releases per day \u2014 enable only if you want the firehose"
+    },
+    {
+      "id": "ms-research",
+      "name": "Microsoft Research",
+      "type": "rss",
+      "url": "https://www.microsoft.com/en-us/research/feed/",
+      "enabled": false,
+      "note": "high volume"
+    },
+    {
+      "id": "nvidia-blog",
+      "name": "NVIDIA blog",
+      "type": "rss",
+      "url": "https://blogs.nvidia.com/feed/",
+      "enabled": false,
+      "note": "high volume"
+    },
+    {
+      "id": "nvidia-dev",
+      "name": "NVIDIA dev blog",
+      "type": "rss",
+      "url": "https://developer.nvidia.com/blog/feed",
+      "enabled": false,
+      "note": "very high volume"
+    },
+    {
+      "id": "aws-ml",
+      "name": "AWS ML blog",
+      "type": "rss",
+      "url": "https://aws.amazon.com/blogs/machine-learning/feed/",
+      "enabled": false,
+      "note": "very high volume"
+    },
+    {
+      "id": "hf:deepseek-ai",
+      "name": "DeepSeek",
+      "type": "hf",
+      "org": "deepseek-ai"
+    },
+    {
+      "id": "hf:Qwen",
+      "name": "Qwen",
+      "type": "hf",
+      "org": "Qwen"
+    },
+    {
+      "id": "hf:moonshotai",
+      "name": "Moonshot (Kimi)",
+      "type": "hf",
+      "org": "moonshotai"
+    },
+    {
+      "id": "hf:zai-org",
+      "name": "Z.ai (GLM)",
+      "type": "hf",
+      "org": "zai-org"
+    },
+    {
+      "id": "hf:MiniMaxAI",
+      "name": "MiniMax",
+      "type": "hf",
+      "org": "MiniMaxAI"
+    },
+    {
+      "id": "hf:ByteDance-Seed",
+      "name": "ByteDance Seed",
+      "type": "hf",
+      "org": "ByteDance-Seed"
+    },
+    {
+      "id": "hf:meta-llama",
+      "name": "Meta (Llama)",
+      "type": "hf",
+      "org": "meta-llama"
+    },
+    {
+      "id": "hf:mistralai",
+      "name": "Mistral (HF)",
+      "type": "hf",
+      "org": "mistralai"
+    },
+    {
+      "id": "hf:openai",
+      "name": "OpenAI (HF)",
+      "type": "hf",
+      "org": "openai"
+    },
+    {
+      "id": "hf:google",
+      "name": "Google (HF)",
+      "type": "hf",
+      "org": "google"
+    },
+    {
+      "id": "hf:microsoft",
+      "name": "Microsoft (HF)",
+      "type": "hf",
+      "org": "microsoft"
+    },
+    {
+      "id": "hf:nvidia",
+      "name": "NVIDIA (HF)",
+      "type": "hf",
+      "org": "nvidia"
+    },
+    {
+      "id": "hf:thinkingmachines",
+      "name": "Thinking Machines (HF)",
+      "type": "hf",
+      "org": "thinkingmachines"
+    },
+    {
+      "id": "hf:reflectionai",
+      "name": "Reflection AI (HF)",
+      "type": "hf",
+      "org": "reflectionai",
+      "allowEmpty": true,
+      "note": "watchlist: empty org, first upload is the news"
+    },
+    {
+      "id": "hf:internlm",
+      "name": "InternLM",
+      "type": "hf",
+      "org": "internlm"
+    },
+    {
+      "id": "hf:LiquidAI",
+      "name": "Liquid AI",
+      "type": "hf",
+      "org": "LiquidAI"
+    },
+    {
+      "id": "hf:LGAI-EXAONE",
+      "name": "LG EXAONE",
+      "type": "hf",
+      "org": "LGAI-EXAONE"
+    },
+    {
+      "id": "hf:tencent",
+      "name": "Tencent (Hunyuan)",
+      "type": "hf",
+      "org": "tencent"
+    },
+    {
+      "id": "hf:upstage",
+      "name": "Upstage (Solar)",
+      "type": "hf",
+      "org": "upstage"
+    },
+    {
+      "id": "hf:CohereLabs",
+      "name": "Cohere Labs",
+      "type": "hf",
+      "org": "CohereLabs"
+    },
+    {
+      "id": "hf:openbmb",
+      "name": "OpenBMB (MiniCPM)",
+      "type": "hf",
+      "org": "openbmb"
+    },
+    {
+      "id": "hf:PrimeIntellect",
+      "name": "Prime Intellect",
+      "type": "hf",
+      "org": "PrimeIntellect"
+    },
+    {
+      "id": "hf:allenai",
+      "name": "Ai2 (OLMo)",
+      "type": "hf",
+      "org": "allenai"
+    },
+    {
+      "id": "hf:baidu",
+      "name": "Baidu (ERNIE)",
+      "type": "hf",
+      "org": "baidu"
+    },
+    {
+      "id": "hf:stepfun-ai",
+      "name": "StepFun",
+      "type": "hf",
+      "org": "stepfun-ai"
+    },
+    {
+      "id": "hf:tiiuae",
+      "name": "TII (Falcon)",
+      "type": "hf",
+      "org": "tiiuae"
+    },
+    {
+      "id": "hf:sarvamai",
+      "name": "Sarvam",
+      "type": "hf",
+      "org": "sarvamai"
+    },
+    {
+      "id": "hf:RekaAI",
+      "name": "Reka",
+      "type": "hf",
+      "org": "RekaAI"
+    },
+    {
+      "id": "hf:NousResearch",
+      "name": "Nous Research",
+      "type": "hf",
+      "org": "NousResearch"
+    },
+    {
+      "id": "hf:baichuan-inc",
+      "name": "Baichuan",
+      "type": "hf",
+      "org": "baichuan-inc"
+    },
+    {
+      "id": "hf:ai21labs",
+      "name": "AI21",
+      "type": "hf",
+      "org": "ai21labs"
+    },
+    {
+      "id": "hf:naver-hyperclovax",
+      "name": "NAVER HyperCLOVA X",
+      "type": "hf",
+      "org": "naver-hyperclovax"
+    },
+    {
+      "id": "ssi",
+      "name": "SSI",
+      "type": "page",
+      "url": "https://ssi.inc/updates"
+    }
+  ],
+  "custos": {
+    "endpoint": "http://192.168.86.52:8093/v1/items",
+    "tokenFile": "/etc/ai-lab-watcher/custos.token"
+  }
+}

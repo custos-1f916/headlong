@@ -1,0 +1,17 @@
+[Unit]
+Description=AI Lab Watcher — poll AI lab feeds and queue news for Custos review
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=watcher
+Group=watcher
+ExecStart=/usr/bin/node /opt/ai-lab-watcher/watcher.mjs
+StateDirectory=ai-lab-watcher
+Environment=AI_LAB_WATCHER_STATE=/var/lib/ai-lab-watcher/state.json
+TimeoutStartSec=300
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
