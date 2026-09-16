@@ -48,6 +48,7 @@ RESPONSE_TIMEOUT = 650  # longer than client 630 and gateway 600
 # responder as part of its single composition (design/conversation_memory.md
 # part 4, folded into the one-call contract instead of a second model call).
 PERSON_NOTE_MAX = 1500
+PERSON_MERGE_MAX = 12000  # preserve existing long notes during operator repair
 # A message becomes a goal only when the responder decides to defer real work.
 # Everything else is conversation: kept for replay and memory, never a task.
 DEFAULT_SOCIAL_POLICY = {
@@ -201,6 +202,13 @@ def validate_record(record):
     return record
 
 
+def person_parts(body):
+    # Hand-edited older notes sometimes have one newline before metadata and
+    # no "Person:" heading. Neither variation should erase their prose.
+    marker = "\nCustos person note v1: "
+    return body.rsplit(marker, 1) if marker in body else None
+
+
 def parse_memory_file(path, strict_person=False):
     """One store file as (path, header, body, fields, record), checked the way the
     store reads it. With strict_person (validate, and the write hook in mem), a
@@ -212,14 +220,14 @@ def parse_memory_file(path, strict_person=False):
     record = None
     if MARKER in body:
         record = validate_record(strict_json(body.split(MARKER, 1)[1]))
-    if strict_person and fields.get("type") == "person" and PERSON_MARKER in body:
-        meta = strict_json(body.rsplit(PERSON_MARKER, 1)[1])
+    if strict_person and fields.get("type") == "person" and person_parts(body):
+        prose, metadata = person_parts(body)
+        meta = strict_json(metadata)
         if not isinstance(meta, dict) or not isinstance(meta.get("person_key"), str) or not meta["person_key"]:
             raise MemoryError("person note without a person_key")
         aliases = meta.get("aliases") or []
         if not isinstance(aliases, list) or any(not isinstance(alias, str) for alias in aliases):
             raise MemoryError("person note with invalid aliases")
-        prose = body.rsplit(PERSON_MARKER, 1)[0]
         for alias in aliases:
             # A note may discuss other people, but an alias explicitly called a
             # distinct person cannot simultaneously resolve to this record.
@@ -1013,16 +1021,18 @@ class People:
     @staticmethod
     def parse(item):
         path, header, body, fields, record = item
-        if fields.get("type") != "person" or PERSON_MARKER not in body:
+        parts = person_parts(body)
+        if fields.get("type") != "person" or not parts:
             return None
         try:
-            meta = strict_json(body.rsplit(PERSON_MARKER, 1)[1])
+            meta = strict_json(parts[1])
         except InvalidInput:
             return None
         if not isinstance(meta, dict):
             return None
-        notes = body.split(PERSON_MARKER, 1)[0]
-        notes = notes.split("\n", 1)[1].strip() if "\n" in notes else ""
+        notes = parts[0].strip()
+        if notes.startswith("Person:"):
+            notes = notes.partition("\n")[2].strip()
         return item, meta, notes
 
     def find_all(self, key):
@@ -1072,10 +1082,7 @@ class People:
                 raise MemoryError("person-merge refuses two different people (person_key differs)")
             if notes is None:
                 notes = tnotes if snotes.strip() in tnotes else (tnotes.rstrip() + "\n\n" + snotes.strip()).strip()
-            notes = redact_secrets(text(notes, "person notes", PERSON_NOTE_MAX * 4)).strip()
-            if len(notes) > PERSON_NOTE_MAX:
-                raise MemoryError("merged note would be %d characters (max %d); pass a compressed note on stdin"
-                                  % (len(notes), PERSON_NOTE_MAX))
+            notes = redact_secrets(text(notes, "person notes", PERSON_MERGE_MAX)).strip()
             aliases = [text(a, "alias", 48) for a in dict.fromkeys((tmeta.get("aliases") or []) + (smeta.get("aliases") or []))][:12]
             routes = list(dict.fromkeys((tmeta.get("routes") or []) + (smeta.get("routes") or [])))[-8:]
             meta = {"person_key": tmeta["person_key"], "display": tmeta.get("display") or smeta.get("display") or "?",
@@ -1149,7 +1156,7 @@ class People:
             name = path.stem.split("_")[1] if "_" in path.stem else path.stem
             preimage = changes / (name + "-" + hashlib.sha256(raw.encode()).hexdigest()[:16] + ".before.md")
             preimage.write_text(raw, encoding="utf-8")
-            prefix = body.rsplit(PERSON_MARKER, 1)[0]
+            prefix = person_parts(body)[0].rstrip()
             rewritten = prefix + PERSON_MARKER + encode(updated)
             self.store.commit(rewritten, memory_type="person", existing=item)
             return {"person_id": person_id, **result_key, "removed": True,

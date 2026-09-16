@@ -108,6 +108,17 @@ class SchedulingTests(MemoryFixture):
         self.assertNotEqual(stub, target)
         self.assertEqual(people.find('kim')[0][3]['id'], target)
 
+    def test_merge_preserves_legacy_headingless_and_long_prose(self):
+        people = cm.People(self.store)
+        target = people.save('jack', 'Jack', {'notes': 'Current facts.', 'aliases': []}, 'jack')
+        notes = 'First paragraph must survive.\n\n' + ('Detailed existing fact. ' * 100)
+        meta = {'person_key': 'jack', 'display': 'Jack', 'updated': '2026-01-01', 'aliases': [], 'routes': []}
+        source = self.store.commit(notes + '\nCustos person note v1: ' + json.dumps(meta), memory_type='person')
+        result = people.merge(source, target)
+        self.assertTrue(Path(result['archived']).exists())
+        self.assertIn(notes, people.find('jack')[2])
+        self.assertIn('Current facts.', people.find('jack')[2])
+
 
 class ErrorBudgetTests(unittest.TestCase):
     def setUp(self):
