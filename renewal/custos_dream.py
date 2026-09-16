@@ -223,23 +223,57 @@ class Dream:
         return entry
 
     def review(self, key, expected, verdict, evidence):
-        if verdict not in {"keep", "uncertain", "revised", "archived"} or not evidence.strip(): raise ValueError("verdict and evidence required")
-        with self.store.lock("dream-schedule"):
+        return self.review_batch([{"id": key, "expected": expected, "verdict": verdict, "evidence": evidence}])[key]
+
+    def review_batch(self, decisions):
+        """Validate the entire bounded batch before recording any decision."""
+        if not isinstance(decisions, list) or not 1 <= len(decisions) <= self.config['batch_size']:
+            raise ValueError("review batch must be a nonempty list within the selection budget")
+        with self.store.lock("dream-schedule"), self.store.lock():
             s = self.active()
-            if key not in {r["id"] for r in s["selected"]}: raise ValueError("not selected for this dream")
-            if verdict == "archived":
-                entries = [read_json(Path(p)) for p in s["edits"]]
-                matches = [e for e in entries if e["id"] == key and e["operation"] == "archive" and e["status"] == "applied"]
-                if not matches: raise ValueError("no verified archive receipt")
-                actual = sha(Path(matches[-1]["target"]).read_bytes())
-            else: actual = sha(self.store.find(key)[0].read_bytes())
-            if actual != expected: raise ValueError("reviewed bytes changed")
-            if verdict == "revised" and not any(read_json(Path(p))["id"] == key and read_json(Path(p))["status"] == "applied" for p in s["edits"]): raise ValueError("no revision receipt")
-            s["reviews"][key] = {"verdict": verdict, "sha256": actual, "evidence": evidence, "at": self.stamp()}
+            entries = [read_json(Path(p)) for p in s["edits"]]
+            updates = {}
+            for decision in decisions:
+                if not isinstance(decision, dict) or set(decision) != {'id', 'expected', 'verdict', 'evidence'}:
+                    raise ValueError("each review requires id, expected, verdict and evidence")
+                key, expected, verdict, evidence = (decision[k] for k in ('id', 'expected', 'verdict', 'evidence'))
+                if not isinstance(key, str) or key not in {r['id'] for r in s['selected']}:
+                    raise ValueError("not selected for this dream")
+                if key in updates: raise ValueError("duplicate review ID in batch")
+                if not isinstance(expected, str) or not re.fullmatch(r'[0-9a-f]{64}', expected):
+                    raise ValueError("current expected SHA-256 required for every review")
+                if not isinstance(verdict, str) or verdict not in {'keep', 'uncertain', 'revised', 'archived'} or not isinstance(evidence, str) or not evidence.strip() or len(evidence) > 4096:
+                    raise ValueError("verdict and bounded specific evidence required")
+                matches = [e for e in entries if e['id'] == key and e['status'] == 'applied']
+                if verdict == 'archived':
+                    archives = [e for e in matches if e['operation'] == 'archive']
+                    if not archives: raise ValueError("no verified archive receipt")
+                    actual = sha(Path(archives[-1]['target']).read_bytes())
+                else: actual = sha(self.store.find(key)[0].read_bytes())
+                if actual != expected: raise ValueError("reviewed bytes changed: " + key)
+                if verdict == 'revised' and not any(e['operation'] == 'revise' and e['after_sha256'] == actual for e in matches):
+                    raise ValueError("no revision receipt for reviewed bytes")
+                updates[key] = {'verdict': verdict, 'sha256': actual, 'evidence': evidence, 'at': self.stamp()}
+            s['reviews'].update(updates)
             write_json(self.session_path(), s)
-            # Persist completed decisions even when interrupted before finish.
-            seen = read_json(self.root / "reviewed.json", {}); seen[key] = {"sha256": actual, "at": self.stamp()}; write_json(self.root / "reviewed.json", seen)
-        return s["reviews"][key]
+            # Session is authoritative. If interrupted before this index write,
+            # replaying the batch repairs rotation without inventing decisions.
+            seen = read_json(self.root / "reviewed.json", {})
+            seen.update({key: {'sha256': r['sha256'], 'at': r['at']} for key, r in updates.items()})
+            write_json(self.root / "reviewed.json", seen)
+        return updates
+
+    def finish_preview(self):
+        with self.store.lock('dream-schedule'):
+            s = read_json(self.session_path())
+            if not s: raise ValueError('no dream scheduled today')
+            missing = [r['id'] for r in s['selected'] if r['id'] not in s['reviews']]
+            return {'day': s['day'], 'status': s['status'], 'selected': len(s['selected']),
+                    'reviewed': len(s['reviews']), 'missing': missing,
+                    'persona_reviewed': bool(s.get('persona_reflection')),
+                    'can_continue': s['status'] == 'running' and self.window() and self.stamp() < s.get('deadline', ''),
+                    'finish_status': 'partial' if missing else 'complete',
+                    'warning': 'Finish closes today irreversibly; missing decisions carry forward. Reading is not a recorded review.'}
 
     # ---- the day's trajectory, audited (Hal, 2026-09-12: "the dream skill should not just go through
     # memories. It should go through the entire day's trajectory, audit problems, and set its own
@@ -274,16 +308,23 @@ class Dream:
                 except ValueError: continue
                 ts = st.get("ts") or ""
                 if st.get("type") == "shellm-run":
-                    runs[st.get("step_id")] = {"thinker": st.get("launched_by") or "?", "ts": ts, "wake": st.get("wake") or ""}
+                    runs[st.get("step_id")] = {"thinker": st.get("launched_by") or "?", "ts": ts, "wake": st.get("wake") or "",
+                                               "max_iterations": st.get('max_iterations')}
+                    if ts >= since:
+                        steps_by_run.setdefault(st.get('step_id'), {'reasoning': 0, 'durable': 0, 'final': 0, 'maintenance': False, 'handoff': False, 'first_durable': None})
                     continue
                 if ts < since: continue
                 rid = st.get("run_id"); kind = st.get("type")
                 if rid:
-                    b = steps_by_run.setdefault(rid, {"reasoning": 0, "durable": 0, "first_durable": None})
+                    b = steps_by_run.setdefault(rid, {"reasoning": 0, "durable": 0, "final": 0, "maintenance": False, "handoff": False, "first_durable": None})
                     if kind == "reasoning": b["reasoning"] += 1
-                    elif kind in {"observation", "message", "action", "thought", "final"}:
+                    elif kind == 'final': b['final'] += 1
+                    elif kind in {"observation", "message", "action", "thought", "idle", "merge"}:
                         b["durable"] += 1
                         if b["first_durable"] is None: b["first_durable"] = b["reasoning"]
+                    if kind == 'feedback' and (st.get('content') or '').startswith('[harness maintenance]'):
+                        b['maintenance'] = True
+                    if kind == 'harness-handoff': b['handoff'] = True
                 if kind == "run-end": run_end[rid] = {"rc": st.get("rc"), "ts": ts}
                 if kind == "message" and st.get("from") == me and st.get("source") == "responder" and st.get("content"):
                     replies.append({"ts": ts, "to": st.get("to"), "reply_to": st.get("reply_to"), "text": st["content"][:200],
@@ -297,13 +338,34 @@ class Dream:
                     if re.search(r"Helper returned nonzero|hit iteration limit|timed out 900|without FINAL|killed by watchdog", o):
                         helper_failures.append({"ts": ts, "run": (rid or "")[:8], "text": o[:160].replace("\n", " ")})
         per = {}
+        out['cap_basis'] = 'Recorded max_iterations per run; otherwise current SHELLM_MAX_ITERATIONS (historical estimate).'
+        out['run_details'] = []
         for rid, b in steps_by_run.items():
             t = runs.get(rid, {}).get("thinker", "?")
-            row = per.setdefault(t, {"runs": 0, "rc_nonzero": 0, "no_durable": 0, "reasoning_steps": 0, "at_cap": 0})
+            row = per.setdefault(t, {"runs": 0, "rc_nonzero": 0, "no_durable": 0, "reasoning_steps": 0, "at_cap": 0,
+                                     'maintenance_interrupted': 0, 'incomplete': 0, 'final_only': 0, 'failures': 0})
             row["runs"] += 1; row["reasoning_steps"] += b["reasoning"]
-            if run_end.get(rid, {}).get("rc") not in (0, None): row["rc_nonzero"] += 1
-            if b["durable"] == 0 and b["reasoning"] > 0: row["no_durable"] += 1
-            if b["reasoning"] >= int(os.environ.get("MONOLITH_MAX_ITERATIONS", "40")) and t == "monolith": row["at_cap"] += 1; capped.append(rid[:8])
+            rc = run_end.get(rid, {}).get('rc')
+            failed = rc not in (0, None)
+            interrupted = rc is not None and (b['handoff'] or (failed and b['maintenance']))
+            if failed: row['rc_nonzero'] += 1
+            if interrupted: row['maintenance_interrupted'] += 1
+            elif failed: row['failures'] += 1
+            if rc is None: row['incomplete'] += 1
+            if b['final'] and not b['durable']: row['final_only'] += 1
+            if rc is not None and not interrupted and not b['final'] and b['durable'] == 0:
+                row['no_durable'] += 1
+            recorded = runs.get(rid, {}).get('max_iterations')
+            cap_source = 'run' if recorded is not None else 'current-environment-estimate'
+            raw_cap = recorded if recorded is not None else os.environ.get('SHELLM_MAX_ITERATIONS')
+            try: cap = int(raw_cap)
+            except (TypeError, ValueError): cap = None
+            if cap is not None and cap <= 0: cap = None
+            at_cap = t == 'monolith' and cap is not None and b['reasoning'] >= cap
+            if at_cap: row['at_cap'] += 1; capped.append(rid[:8])
+            out['run_details'].append({'run_id': rid, 'thinker': t, 'rc': rc, 'reasoning_steps': b['reasoning'],
+                                       'maintenance_interrupted': interrupted, 'cap': cap, 'cap_source': cap_source,
+                                       'at_cap': at_cap})
         out["runs"] = per
         # Asks nobody touched: active directed tasks older than 6 h with no event after capture and no scratchpad.
         untouched = []
@@ -322,8 +384,8 @@ class Dream:
         for t, row in per.items():
             if row["no_durable"] >= 3 or (row["runs"] and row["no_durable"] / row["runs"] > 0.25):
                 out["problems"].append({"kind": "wasted-wakes", "thinker": t, "detail": f"{row['no_durable']} of {row['runs']} runs produced no durable step"})
-            if row["rc_nonzero"] >= 3:
-                out["problems"].append({"kind": "failed-runs", "thinker": t, "detail": f"{row['rc_nonzero']} of {row['runs']} runs ended rc!=0"})
+            if row['failures'] >= 3:
+                out["problems"].append({"kind": "failed-runs", "thinker": t, "detail": f"{row['failures']} of {row['runs']} runs failed without an explicit maintenance handoff; causes require inspection"})
         if capped: out["problems"].append({"kind": "iteration-cap", "detail": "monolith runs at the cap: " + ", ".join(capped[:8])})
         for u in untouched:
             out["problems"].append({"kind": "untouched-ask", "goal_id": u["goal_id"], "who": u["who"], "quick": u["quick"],
@@ -380,12 +442,13 @@ class Dream:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command', choices=['due','begin','inventory','status','show','revise','archive','review','finish','audit',
+    p.add_argument('command', choices=['due','begin','inventory','status','show','revise','archive','review','review-batch','finish-preview','finish','audit',
                                     'persona-show','persona-reflect','persona-revise','persona-render'])
     p.add_argument('id', nargs='?'); p.add_argument('--expected'); p.add_argument('--body-file'); p.add_argument('--evidence', default='')
     p.add_argument('--replacement'); p.add_argument('--verdict'); p.add_argument('--note', default='')
     p.add_argument('--hours', type=int, default=24); p.add_argument('--trajectory')
     p.add_argument('--replaces'); p.add_argument('--follow-up'); p.add_argument('--identity-dir')
+    p.add_argument('--decisions-file'); p.add_argument('--preview', action='store_true')
     a = p.parse_args()
     try:
         if a.command == 'persona-render':
@@ -415,6 +478,12 @@ def main():
         elif a.command in {'revise','archive'}:
             result=d.revise(a.id,a.expected,Path(a.body_file).read_text() if a.body_file else None,a.evidence,a.command=='archive',a.replacement)
         elif a.command == 'review': result=d.review(a.id,a.expected,a.verdict,a.evidence)
+        elif a.command == 'review-batch':
+            if not a.decisions_file: raise ValueError('--decisions-file required')
+            with open(a.decisions_file, 'rb') as f: raw = f.read(524289)
+            if len(raw) > 524288: raise ValueError('review batch file too large')
+            result=d.review_batch(json.loads(raw))
+        elif a.command == 'finish-preview' or (a.command == 'finish' and a.preview): result=d.finish_preview()
         else: result=d.finish(a.note or 'Bounded review finished; see individual evidence and unresolved items.')
         print(json.dumps(result,ensure_ascii=False));return 0
     except (ValueError,cm.MemoryError,OSError,KeyError,TypeError) as e:

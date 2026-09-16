@@ -94,8 +94,15 @@ For a new conversation/message:
 On a timeout, check the same request ID and replay the exact payload if needed.
 A reused ID with different content is rejected. `uncertain` means sending began
 but acceptance could not be established; do not mint a new ID and duplicate the
-message. Preserve it for reconciliation. `blocked` means the destination/group
-no longer passes host policy. The host checks current membership, disappearing
+message. Preserve it for reconciliation. `blocked` is terminal for that request ID: **it is not queued and never automatically
+retries**. Its receipt gives the actual reason: policy, bot-error claim, pacing,
+reply eligibility, or attachment failure. Record that reason and the event needed
+to reconsider (for example a new eligible inbound message or confirmed policy/error
+resolution), then choose other work. Do not spend later wakes polling the same
+blocked row; it stays blocked even if conditions improve. Never mint a fresh ID
+to bypass a guard. Reconsider only after the relevant event and fresh eligibility
+checks. `custos-actions` exposes these semantics in `delivery_state`; the original
+phase and receipt remain the evidence. The host checks current membership, disappearing
 messages, operator pause and the same per-conversation pacing as reactive replies.
 
 ## Sending images and files

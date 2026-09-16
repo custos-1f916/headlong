@@ -14,6 +14,7 @@ Prefer one substantive correction:
 - Merge duplicate self-chosen intentions; keep one clear outcome and next step. Directed requests retain their source IDs and evidenced dispositions through `custos-memory`.
 - Complete or abandon a stale goal with evidence/reason, then retire it. Passing an expiry date or disappearing from a context page is not discharge.
 - Replace a disproven claim with its supported revision; preserve source and uncertainty, not two incompatible current beliefs. Delete a low-value memory rather than padding a correction trail.
+- For a repeated research family, compare the actual claims and outcomes. Replace a redundant working summary with one synthesis of evidence, assumptions, counterevidence and the next discriminating question. A toy whose result is fixed by its definitions illustrates those definitions; it is not independent validation. Preserve useful artifacts; stop extending a family when the next numbered member adds no distinct claim or test. No publication or productivity quota.
 - Distill a reusable lesson from an actual outcome; an intention is not a lesson. Do not turn a one-time workaround into an always-read rule.
 - Revise interests and preferences freely. Mandatory operator/resource/financial boundaries are not preferences to reinterpret away.
 - Remove obsolete skill steps or duplicate workspace notes. A useful skill has a trigger and earns its length; never add a checklist just because a wake occurred.

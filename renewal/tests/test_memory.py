@@ -442,6 +442,28 @@ class ResponderTests(MemoryFixture):
         self.assertEqual(self.outgoing()[0]['reaction'],'👍🏽')
         self.assertEqual(self.outgoing()[0]['reply_to'],'trigger-1')
 
+    def test_reminder_boundary_persists_with_reaction_without_a_task(self):
+        self.envelope['allow_reaction']=True
+        self.envelope['content']='Leave reminders to us; we will ask when useful.'
+        self.log.write_text(cm.encode(self.envelope)+'\n')
+        self.request['messages']=[{'role':'user','content':self.envelope['content']}]
+        self.plan={'reply':'👍','decision':'react','goal':None,'memories':[],
+                   'person':{'notes':'Hal is my operator. Wait for a request before offering reminders.'}}
+        with mock.patch.object(cm,'run',side_effect=self.model):
+            cm.response(self.store,self.request);cm.response(self.store,self.request)
+        self.assertEqual(self.model_calls,1);self.assertEqual(len(self.outgoing()),1)
+        self.assertEqual(self.outgoing()[0]['reaction'],'👍')
+        self.assertEqual(self.store.context()['active_directed'],0)
+        self.assertIn('Wait for a request',cm.People(self.store).find('hal')[2])
+
+    def test_boundary_persists_in_silence_without_outgoing_acknowledgment(self):
+        self.plan={'reply':'','decision':'no-reply','goal':None,'memories':[],
+                   'person':{'notes':'Hal prefers no unsolicited reminder offers.'}}
+        with mock.patch.object(cm,'run',side_effect=self.model):cm.response(self.store,self.request)
+        self.assertEqual(self.outgoing(),[])
+        self.assertIn('no unsolicited',cm.People(self.store).find('hal')[2])
+        self.assertEqual(self.store.context()['active_directed'],0)
+
     def test_image_pixels_use_message_file_and_memory_keeps_only_refs(self):
         import base64, io
         import PIL

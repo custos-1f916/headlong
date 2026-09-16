@@ -127,6 +127,23 @@ class ActionsTests(unittest.TestCase):
         with patch.object(cs,'paused',return_value=False): self.bridge.proactive()
         self.assertEqual(self.status()['phase'],'blocked');self.bridge.rpc.call.assert_not_called()
 
+    def test_blocked_receipt_explains_no_retry_and_survives_policy_recovery(self):
+        from custos_actions_client import explain_status
+        self.channel.handle(self.p)
+        policy=copy.deepcopy(POLICY);del policy['people'][HAL];self.policy.write_text(json.dumps(policy))
+        with patch.object(cs,'paused',return_value=False):self.bridge.proactive()
+        result=explain_status(self.status())
+        self.assertEqual(result['phase'],'blocked')
+        self.assertTrue(result['delivery_state']['terminal'])
+        self.assertFalse(result['delivery_state']['automatic_retry'])
+        self.assertIn('will not automatically retry',result['delivery_state']['meaning'])
+        self.assertEqual(result['receipt'],self.status()['receipt'])
+        self.policy.write_text(json.dumps(POLICY))
+        with patch.object(cs,'paused',return_value=False):
+            self.bridge.proactive();self.bridge.proactive()
+        self.assertEqual(self.status()['phase'],'blocked');self.bridge.rpc.call.assert_not_called()
+        self.assertEqual(self.channel.handle(self.p)['phase'],'blocked')
+
     def test_new_group_member_blocks_send(self):
         self.channel.handle({**self.p,'target':'Group'})
         self.bridge.rpc.call.return_value=[{'id':'agreed-group','isMember':True,'members':[BOT,HAL,STRANGER]}]
@@ -274,3 +291,25 @@ class ActionsClientTests(unittest.TestCase):
         self.assertEqual(calls[-1]['action'], 'signal-send')
         self.assertEqual(calls[-1]['target'], 'Dani')
         self.assertEqual(recorded, [(self.cac.route_for('dm:aci-1'), 'hello', 'signal-test-1', 'queued')])
+
+class ActionSemanticsTests(unittest.TestCase):
+    def test_no_phase_claims_success_or_discards_receipt(self):
+        from custos_actions_client import explain_status
+        for phase in ['queued','running','blocked','uncertain','submitted','succeeded','failed','new-phase']:
+            raw={'ok':True,'phase':phase,'receipt':{'error':'sentinel'}}
+            result=explain_status(raw)
+            self.assertEqual(result['receipt'],raw['receipt'])
+            self.assertEqual(set(raw),{'ok','phase','receipt'})
+            self.assertEqual(result['delivery_state']['automatic_retry'],phase=='queued')
+        self.assertEqual(explain_status({'ok':False}),{'ok':False})
+
+    def test_cli_status_exposes_host_phase_without_sending(self):
+        import custos_actions_client as client
+        raw={'ok':True,'phase':'blocked','request_id':'one','receipt':{'error':'bot-error input already claimed'}}
+        output=io.StringIO()
+        with patch.object(sys,'argv',['custos-actions','status','one']), patch.object(client,'call',return_value=(200,raw)) as call, patch('sys.stdout',output):
+            self.assertEqual(client.main(),0)
+        call.assert_called_once_with({'action':'status','request_id':'one'})
+        result=json.loads(output.getvalue())
+        self.assertFalse(result['delivery_state']['automatic_retry'])
+        self.assertEqual(result['receipt'],raw['receipt'])

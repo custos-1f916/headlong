@@ -65,6 +65,54 @@ class DreamTests(unittest.TestCase):
         self.assertEqual(self.d.finish('Both reviewed')['status'],'complete')
         self.now+=dt.timedelta(days=1);self.put('33333333','New question')
         self.assertEqual(self.d.begin()['selected'][0]['id'],'33333333')
+    def decisions(self):
+        return [{'id': key, 'expected': self.digest(key), 'verdict': 'keep',
+                 'evidence': 'Read full fact and checked source ' + key} for key in ['11111111','22222222']]
+
+    def test_batch_records_decisions_and_preview_does_not_close(self):
+        self.d.begin()
+        preview=self.d.finish_preview()
+        self.assertEqual(preview['reviewed'],0)
+        self.assertEqual(set(preview['missing']),{'11111111','22222222'})
+        self.assertTrue(preview['can_continue'])
+        self.d.review_batch(self.decisions())
+        self.assertEqual(self.d.finish_preview()['finish_status'],'complete')
+        self.assertEqual(len(d.read_json(self.d.root/'reviewed.json')),2)
+        self.assertEqual(self.d.finish('evidence recorded')['reviewed'],2)
+        with self.assertRaisesRegex(ValueError,'no active dream'):
+            self.d.review_batch(self.decisions())
+
+    def test_invalid_batch_is_rejected_without_partial_decisions(self):
+        self.d.begin()
+        for replacement in [{'expected':'0'*64}, {'evidence':''}, {'verdict':'invented'},
+                            {'id':'33333333'}, {'expected':None}, {'verdict':[]}]:
+            rows=self.decisions();rows[1].update(replacement)
+            with self.assertRaises(ValueError):self.d.review_batch(rows)
+            self.assertEqual(d.read_json(self.d.session_path())['reviews'],{})
+            self.assertFalse((self.d.root/'reviewed.json').exists())
+        row=self.decisions()[0]
+        with self.assertRaisesRegex(ValueError,'duplicate'):self.d.review_batch([row,row])
+        self.d.config['batch_size']=1
+        with self.assertRaises(ValueError):self.d.review_batch(self.decisions())
+
+    def test_batch_current_hash_and_revision_receipt_required(self):
+        self.d.begin();rows=self.decisions()
+        change=self.d.revise('11111111',rows[0]['expected'],'Corrected fact','primary source')
+        rows[0]['verdict']='revised'
+        with self.assertRaisesRegex(ValueError,'changed'):self.d.review_batch(rows)
+        rows[0]['expected']=change['after_sha256'];rows[1]['verdict']='revised'
+        with self.assertRaisesRegex(ValueError,'no revision receipt'):self.d.review_batch(rows)
+        rows[1]['verdict']='uncertain';self.d.review_batch(rows)
+        self.assertEqual(self.d.finish_preview()['missing'],[])
+
+    def test_partial_preview_and_expired_budget_never_manufacture_reviews(self):
+        self.d.begin();self.d.review_batch(self.decisions()[:1])
+        self.now+=dt.timedelta(minutes=20)
+        self.assertFalse(self.d.finish_preview()['can_continue'])
+        with self.assertRaises(ValueError):self.d.review_batch(self.decisions()[1:])
+        result=self.d.finish('Only one record reviewed')
+        self.assertEqual((result['status'],result['reviewed'],result['remaining']),('partial',1,1))
+
     def test_protected_identity_values_and_goals(self):
         self.put('33333333','Value','value');self.put('44444444','Active objective','objective')
         meta={'person_key':'hal','display':'Hal','aliases':[],'routes':['hal']}
@@ -175,3 +223,36 @@ class TrajectoryAuditTests(MemoryFixture):
         # finish folds the audit into the report
         dr.begin();r=dr.finish('done');self.assertIn('Trajectory audit',(dr.root/dr.day()/'report.md').read_text())
         self.assertIn('untouched-ask',(dr.root/dr.day()/'report.md').read_text())
+
+class AuditAccountingTests(MemoryFixture):
+    def test_recorded_cap_maintenance_final_only_and_incomplete(self):
+        now=dt.datetime(2026,9,16,9,45,tzinfo=dt.timezone.utc)
+        dr=d.Dream(self.store,clock=lambda:now)
+        rows=[]
+        def add(run,steps,cap=None,rc=0,extra=None):
+            start={'type':'shellm-run','step_id':run,'launched_by':'monolith','ts':'2026-09-16T08:00:00Z'}
+            if cap is not None:start['max_iterations']=cap
+            rows.append(start)
+            rows.extend({'type':'reasoning','run_id':run,'ts':'2026-09-16T08:01:00Z'} for _ in range(steps))
+            if extra:rows.append(dict(extra,run_id=run,ts='2026-09-16T08:02:00Z'))
+            if rc is not None:rows.append({'type':'run-end','run_id':run,'rc':rc,'ts':'2026-09-16T08:03:00Z'})
+        add('below-real-cap',44,150,extra={'type':'final','content':'done'})
+        add('at-recorded-cap',3,3,rc=1)
+        add('fallback',44,extra={'type':'thought','content':'useful'})
+        add('maintenance',5,150,rc=1,extra={'type':'feedback','content':'[harness maintenance] yield'})
+        add('handoff',0,150,extra={'type':'harness-handoff','content':'Yielded for harness maintenance'})
+        add('incomplete',7,150,rc=None)
+        add('zero-failure',0,150,rc=1)
+        add('unknown-cap',2,'invalid',extra={'type':'final','content':'done'})
+        traj=self.root/'audit.jsonl';traj.write_text('\n'.join(json.dumps(r) for r in rows))
+        with mock.patch.dict(os.environ,{'SHELLM_MAX_ITERATIONS':'150','MONOLITH_MAX_ITERATIONS':'40'}):
+            result=dr.audit(path=traj)
+        m=result['runs']['monolith']
+        self.assertEqual(m['runs'],8);self.assertEqual(m['at_cap'],1)
+        self.assertEqual(m['maintenance_interrupted'],2)
+        self.assertEqual(m['rc_nonzero'],3);self.assertEqual(m['failures'],2)
+        self.assertEqual(m['incomplete'],1);self.assertEqual(m['final_only'],2)
+        self.assertEqual(m['no_durable'],2)
+        details={r['run_id']:r for r in result['run_details']}
+        self.assertEqual(details['fallback']['cap_source'],'current-environment-estimate')
+        self.assertIsNone(details['unknown-cap']['cap'])

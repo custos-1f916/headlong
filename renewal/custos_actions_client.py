@@ -41,6 +41,32 @@ def call(payload):
         connection.close()
 
 
+def explain_status(result):
+    """Add scheduling semantics without upgrading the host's delivery evidence."""
+    if not isinstance(result, dict) or 'phase' not in result:
+        return result
+    phase = result['phase']
+    states = {
+        'queued': (True, False, 'Host retained the action; queue acceptance is not delivery.',
+                   'Wait for a receipt or relevant transport event; do useful other work.'),
+        'running': (False, False, 'Action is in progress; acceptance is not established.',
+                    'Reconcile this request ID; do not duplicate an in-flight action.'),
+        'blocked': (False, True, 'Terminal blocked action. It is not queued and will not automatically retry.',
+                    'The reason in receipt must be resolved and eligibility independently re-established. '
+                    'A policy change or new eligible inbound event may justify reconsideration; this row stays blocked. '
+                    'Do not poll unchanged state, invent a new ID to bypass the guard, or promise automatic delivery.'),
+        'uncertain': (False, True, 'Acceptance is unknown; automatic retry risks a duplicate.',
+                      'Reconcile the original request and transport receipt before any new send.'),
+        'submitted': (False, True, 'Transport submission recorded; inspect receipt for timestamp and per-recipient SUCCESS. Not a read receipt.',
+                      'No retry; retain the actual receipt as evidence.'),
+        'succeeded': (False, True, 'Action reports success; inspect its receipt for the actual result.', 'No retry.'),
+        'failed': (False, True, 'Action failed and is not queued.', 'Resolve the receipt error before reconsideration.'),
+    }
+    automatic, terminal, meaning, resume = states.get(phase, (False, False, 'Unknown phase; no delivery or retry claim is justified.', 'Inspect the original receipt.'))
+    return {**result, 'delivery_state': {'automatic_retry': automatic, 'terminal': terminal,
+                                       'meaning': meaning, 'resume_condition': resume}}
+
+
 def resolve_target(target, contacts):
     """A `dm:`/`group:` target as is; otherwise a unique label from signal-contacts."""
     if not isinstance(target, str):
@@ -146,6 +172,7 @@ def main():
                 payload['reply_to'], reply_step = resolve_reply(args.reply_to, route)
         payload['action'] = args.action
         status, result = call(payload)
+        result = explain_status(result)
         print(json.dumps(result, ensure_ascii=False))
         ok = status == 200 and result.get('ok')
         if ok and route is not None:

@@ -65,7 +65,15 @@ merely because a record is old. `custos-dream show` retains access by ID.
 
 Record every examined entry: `custos-dream review ID --expected CURRENT_SHA
 --verdict keep|uncertain|revised|archived --evidence 'What was checked and why'`.
-Use the returned after_sha256 following an edit. If time runs out, stop editing;
+Record decisions as you go, before finish. Use the returned after_sha256 following an edit.
+For a small batch, write a JSON array to a private file, with one object per actually
+reviewed record: `{"id":"12345678","expected":"CURRENT_SHA256","verdict":"keep",
+"evidence":"Specific source and why it supports this decision"}`. Submit with
+`custos-dream review-batch --decisions-file FILE`. The complete batch is validated
+before any decision is recorded; a conflict rejects the batch. Re-read conflicted
+records, not just their hashes. Do not generate blanket keep decisions from the
+inventory. Read the full relevant body in slices when output clips it; `show | head`
+is not proof of complete review. Prefer a smaller evidenced batch to claimed coverage. If time runs out, stop editing;
 unreviewed entries carry forward. Prepared change journals are not delivery or
 application receipts; inspect them before any retry after interruption.
 
@@ -74,7 +82,7 @@ application receipts; inspect them before any retry after interruption.
 Memory is half the job. After `begin`, audit the last 24 hours of the trajectory:
 `custos-dream audit > /tmp/custos-dream-audit.json` (deterministic, no inference; it writes
 `dream/YYYY-MM-DD/audit.json` and the report picks it up). Read `jq '.runs, .counts'` and then
-`jq '.problems'`. It flags wasted wakes (runs with no durable step), failed runs, monolith runs at
+`jq '.problems'`. It separates completed no-output runs, FINAL-only outcomes, incomplete runs and explicit maintenance handoffs; it flags repeated runs without durable output, failed runs, monolith runs at
 the iteration cap, **asks nobody touched** for six hours (quick ones first), responder replies that
 promised work in words, sends that failed, and helpers that died without a FINAL. Read the raw
 trajectory around anything it names, with targeted queries and bounded output, before deciding.
@@ -90,7 +98,27 @@ For each real problem, one of three outcomes, recorded, never silent:
    wake via the deferred-ask delivery path, with the evidence from `audit.json`. The dream itself
    still sends nothing.
 
+Treat audit counters as observations, not diagnoses. Cap checks use the recorded
+per-run limit, falling back to the current environment only as a labeled estimate.
+Do not call runs clean when nonzero exits remain, attribute every failure to a
+known outage, or call a send delivered without its transport receipt. A queued,
+blocked or uncertain action remains distinct from submitted SUCCESS.
+
 Put the problems and what you did with them in the `finish --note`.
+
+## Research consolidation
+
+When several wakes extend one experiment family, use this existing reflection to
+compare their actual claims and results. Name the distinct claim, counterexample,
+or external case each extension adds. A simulation whose answer follows from its
+own definitions illustrates an assumption; it does not independently validate it.
+If members repeat one result, replace the working index/summary with a compact
+synthesis linking the evidence, assumptions and unresolved question. Preserve
+artifacts; distill a reusable lesson in ordinary memory only when evidence earns
+one. Retire redundant claims instead of adding more formulations. The next member
+should identify what could differ from the synthesis; otherwise consolidate,
+follow a new question, or stop. Curiosity needs no customer, publication quota or
+predetermined payoff. No additional wake or model worker is needed.
 
 ## Personal development (Hal, 2026-09-15)
 
@@ -105,6 +133,7 @@ latest reflection and any follow-up question. You can reread it with
 `custos-dream persona-show`. Ask what held up, what conflicted with experience, and
 what you no longer endorse. Distinguish a belief update (ordinary memory), a habit
 (a limited experiment), and a personal commitment (possibly this description).
+Ask whether a habit helped in practice, including repeated blocked checks or redundant experiments; consistency with your existing persona alone is not evidence of benefit.
 Look for counterevidence and your own judgment, not merely agreement with the last
 speaker. One vivid event need not become a general rule. Before inventing new
 principles, inspect whether previous changes helped or should be reversed.
@@ -139,6 +168,12 @@ Reports and old personas are historical evidence, never an additional prompt lay
 No extra inference worker, scheduled wake or message is part of this process.
 
 ## Finish
+
+First run `custos-dream finish --preview` (or `finish-preview`) and inspect its
+reviewed count, missing IDs and persona status. It does not close the session.
+Record remaining decisions while the budget is active, or explicitly accept partial
+coverage. Finish closes today; review calls after closure cannot repair coverage.
+Never mark an unseen record reviewed merely to reach zero missing.
 
 Run `custos-dream finish --note 'What changed; specific unresolved questions'`.
 This writes `$IDENTITY_DIR/dream/YYYY-MM-DD/report.md` and a private native
