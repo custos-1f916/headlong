@@ -1,0 +1,24 @@
+[Unit]
+Description=Custos authenticated AI news intake
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /opt/custos/current/renewal/custos_news.py
+StateDirectory=custos-news
+UMask=0077
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/custos-news
+MemoryMax=128M
+TasksMax=32
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+[Install]
+WantedBy=multi-user.target

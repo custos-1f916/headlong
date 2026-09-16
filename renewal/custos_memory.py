@@ -507,7 +507,7 @@ class Store:
         return self.commit(record_label(record) + summary + MARKER + encode(record),
                            memory_type="goal" if is_task(record) else "memory", existing=item)
 
-    def capture(self, payload, trigger_step=None):
+    def capture(self, payload, trigger_step=None, deferred=False):
         keys(payload, {"request_id", "sender", "source_url", "content", "authority"},
              {"outcome", "next_action", "completion", "ambient", "allow_reaction", "images", "signal_routing"})
         origin = {key: text(payload[key], key, MAX_CONTENT if key == "content" else 2048,
@@ -553,10 +553,13 @@ class Store:
             record = {"version": 1, "origin": origin, "received_at": now(), "goal": goal,
                       "status": "active", "events": [], "response": None,
                       "trigger_step": trigger_step}
+            if deferred:
+                record["response"] = {"state":"no-reply", "plan":{"reply":"", "decision":"defer", "goal":dict(goal), "memories":[]}}
+                record["events"].append({"at":now(), "deferred_by":"deterministic intake; no model or outbound message"})
             # Captured as conversation memory. It turns into a `goal` only when
             # the responder defers real work (save() re-types it then).
             body = record_label(record) + goal["outcome"].splitlines()[0][:160] + MARKER + encode(record)
-            goal_id = self.commit(body, memory_type="memory")
+            goal_id = self.commit(body, memory_type="goal" if deferred else "memory")
             return {"goal_id": goal_id, "request_id": origin["request_id"], "created": True}
 
     def update(self, payload):
