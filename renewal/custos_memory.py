@@ -1065,6 +1065,14 @@ class People:
             return None
         return max(found, key=lambda f: (str(f[1].get("updated") or ""), f[0][0].name))
 
+    def context(self):
+        keys = {p[1]['person_key'] for item in self.store.files()
+                if (p := self.parse(item)) and p[1].get('person_key')}
+        notes = [p for key in keys if (p := self.find(key))]
+        notes.sort(key=lambda p: (str(p[1].get('updated') or ''), p[0][0].name), reverse=True)
+        return '\n\n'.join('### %s (%s)\n%s' % (p[1].get('display', '?'), p[0][3]['id'], p[2][:600])
+                            for p in notes[:8])
+
     def merge(self, source_id, target_id, notes=None):
         """Fold person note SOURCE into TARGET (same person_key), keep TARGET's
         display, union aliases and routes, archive SOURCE and both preimages under
@@ -2340,7 +2348,7 @@ Examples (replace the sample ID and evidence with actual values):
 An acknowledgment alone is not completion. Valid dispositions: completed, declined, abandoned.''')
     parser.add_argument("command", choices=["capture", "capture-envelope", "context", "pending", "show", "update", "complete", "respond",
                                             "replay-unanswered", "archive-conversations", "expire-asks", "note", "check",
-                                            "validate", "person-merge", "person-alias-remove", "person-normalize"])
+                                            "validate", "person-merge", "person-alias-remove", "person-normalize", "people-context"])
     parser.add_argument("goal_id", nargs="?", help="Goal ID for show, update and complete (writes also take JSON on stdin)")
     parser.add_argument("words", nargs="*", help="complete: [completed|declined|abandoned] evidence…; update: the next action")
     parser.add_argument("--json", action="store_true")
@@ -2355,6 +2363,10 @@ An acknowledgment alone is not completion. Valid dispositions: completed, declin
         parser.error("Only show, update, complete, note, check, validate and person repair commands take positional arguments; see --help for examples.")
     try:
         store = Store()
+        if args.command == "people-context":
+            with store.lock():
+                print(People(store).context())
+            return
         if args.command in {"context", "pending"}:
             result = store.context(args.offset, args.limit, directed_only=args.command == "pending")
             if args.quick:

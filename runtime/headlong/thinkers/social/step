@@ -185,20 +185,8 @@ new_inbound=$(_root_traj_raw_tail 2>/dev/null | jq -Rrn --arg me "$IDENTITY_NAME
               and (((.content // "") | test("Signal reaction \\(ambient event")) | not))] | length' 2>/dev/null) || new_inbound=1
 [[ "$new_inbound" =~ ^[0-9]+$ ]] || new_inbound=1
 
-# `mem list -s` prints "YYYY-MM-DD HH:MM  <id>  [type]  <summary>"; the id is
-# what `mem show`/`mem edit` take.
-people=$(mem list --type person -s 2>/dev/null | head -n 8) || people=""
-people_notes=""
-if [[ -n "$people" ]]; then
-    while IFS= read -r pid; do
-        [[ -n "$pid" ]] || continue
-        note=$(mem show "$pid" 2>/dev/null | sed -n '/^---$/,/^---$/!p' | grep -v '^Custos person note v1:' | head -c 600) || note=""
-        people_notes="${people_notes}
-### ${pid}
-${note}
-"
-    done <<<"$(printf '%s\n' "$people" | awk '{print $3}')"
-fi
+# Canonical person notes only; bounded excerpts keep social routing small.
+people_notes=$(custos-memory people-context 2>/dev/null) || people_notes=""
 
 sent_today=$(_root_traj_raw_tail 2>/dev/null | jq -Rr --arg since "$(date -u -d '24 hours ago' +%FT%T 2>/dev/null || date -u -v-24H +%FT%T)" '
     fromjson? // empty | select(.type == "observation" and .source == "social" and (.ts // "") >= $since) | .content' 2>/dev/null | wc -l | tr -d ' ') || sent_today=0

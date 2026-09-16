@@ -107,6 +107,8 @@ class SchedulingTests(MemoryFixture):
         stub = self.store.commit(body, memory_type='person')
         self.assertNotEqual(stub, target)
         self.assertEqual(people.find('kim')[0][3]['id'], target)
+        self.assertIn('Detailed canonical facts.', people.context())
+        self.assertNotIn('Superseded duplicate', people.context())
 
     def test_merge_preserves_legacy_headingless_and_long_prose(self):
         people = cm.People(self.store)
