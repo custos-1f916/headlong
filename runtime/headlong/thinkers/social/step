@@ -252,7 +252,7 @@ if ! _inference_admitted; then
     next_delay=300
     exit 0
 fi
-system_prompt=$(_build_system_prompt)
+system_prompt=$(_build_system_prompt) || exit 1
 prompt_body=$(load_prompt "$SCRIPT_DIR/prompt.md" "$IDENTITY_NAME" "")
 
 trigger_line="A conversation turn just finished (responder decision: ${trigger_decision:-?})."

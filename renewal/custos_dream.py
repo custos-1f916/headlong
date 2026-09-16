@@ -129,7 +129,8 @@ class Dream:
                     "Choose dream before discretionary explore/make; urgent directed work may take priority. "
                     "Run skills show custos-dream, then custos-dream begin. Review at most " + str(len(session["selected"])) +
                     " selected records, at most " + str(session["max_edits"]) + " edits, " + str(session["minutes"]) +
-                    " minutes. Use existing serial inference. No messages, deployment, or new authority are part of this review.")
+                    " minutes. Include a brief persona reflection; keeping it unchanged is valid. "
+                    "Use existing serial inference. No messages, deployment, or new authority are part of this review.")
 
     def begin(self):
         if not self.window(): raise ValueError("outside early-morning dream window")
@@ -142,7 +143,11 @@ class Dream:
                 end = dt.datetime.combine(self.clock().astimezone(self.zone).date(), self.end, self.zone).astimezone(UTC)
                 s["deadline"] = min(self.clock().astimezone(UTC) + dt.timedelta(minutes=s["minutes"]), end).isoformat()
                 s["status"] = "running"; write_json(self.session_path(), s)
-            return s
+            result = dict(s)
+            if (self.store.directory.parent / 'core_identity_prompt.md').exists():
+                from custos_persona import Persona
+                result['persona'] = Persona(self).show()
+            return result
 
     def active(self):
         s = read_json(self.session_path())
@@ -344,6 +349,16 @@ class Dream:
                  "Change journals (prepared is not proof of application): " + ", ".join(s["edits"]), "",
                  "Unreviewed (carry forward): " + (", ".join(missing) or "none"), ""]
         for key, r in s["reviews"].items(): lines.append(f"- {key}: {r['verdict']} — {r['evidence']}")
+        reflection = s.get('persona_reflection')
+        lines += ['', '## Persona reflection', '',
+                  json.dumps(reflection, ensure_ascii=False) if reflection else 'Not reviewed; no conclusion implied.']
+        for path in s['edits']:
+            change = read_json(Path(path))
+            if change.get('operation') == 'persona':
+                candidate = read_json(Path(change['candidate']))
+                lines += ['', f"Revision {change['id']} ({change['status']}): {change['evidence']}",
+                          'Replaced/retired: ' + change['replaces'],
+                          'Revisit: ' + json.dumps(candidate['follow_up'], ensure_ascii=False)]
         audit = read_json(report_dir / "audit.json")
         if audit:
             lines += ["", f"## Trajectory audit (last {audit.get('hours')} h)", "",
@@ -365,14 +380,29 @@ class Dream:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command', choices=['due','begin','inventory','status','show','revise','archive','review','finish','audit'])
+    p.add_argument('command', choices=['due','begin','inventory','status','show','revise','archive','review','finish','audit',
+                                    'persona-show','persona-reflect','persona-revise','persona-render'])
     p.add_argument('id', nargs='?'); p.add_argument('--expected'); p.add_argument('--body-file'); p.add_argument('--evidence', default='')
     p.add_argument('--replacement'); p.add_argument('--verdict'); p.add_argument('--note', default='')
     p.add_argument('--hours', type=int, default=24); p.add_argument('--trajectory')
-    a = p.parse_args(); d = Dream()
+    p.add_argument('--replaces'); p.add_argument('--follow-up'); p.add_argument('--identity-dir')
+    a = p.parse_args()
     try:
+        if a.command == 'persona-render':
+            from custos_persona import render
+            identity = a.identity_dir or os.environ.get('IDENTITY_DIR')
+            if not identity: raise ValueError('identity directory required')
+            print(render(identity), end=''); return 0
+        d = Dream()
         if a.command == 'due': print(d.due()); return 0
         if a.command == 'begin': result=d.begin()
+        elif a.command.startswith('persona-'):
+            from custos_persona import Persona
+            persona = Persona(d)
+            if a.command == 'persona-show': result=persona.show()
+            elif a.command == 'persona-reflect': result=persona.reflect(a.expected,a.verdict,a.evidence)
+            else: result=persona.revise(a.expected,Path(a.body_file).read_text() if a.body_file else None,
+                                       a.evidence,a.replaces,a.follow_up)
         elif a.command == 'audit': result=d.audit(hours=max(1, min(a.hours, 72)), path=a.trajectory)
         elif a.command == 'inventory': result=d.inventory()
         elif a.command == 'show':

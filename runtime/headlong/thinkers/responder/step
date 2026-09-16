@@ -76,7 +76,7 @@ fi
 # ---------------------------------------------------------------------------
 # Compose and send the reply
 # ---------------------------------------------------------------------------
-system_prompt=$(_build_system_prompt)
+system_prompt=$(_build_system_prompt) || exit 1
 recent_context=""
 if traj exists 2>/dev/null; then
     recent_context=$(_recent_stream "$THINK_CONTEXT_TAIL") || recent_context=""

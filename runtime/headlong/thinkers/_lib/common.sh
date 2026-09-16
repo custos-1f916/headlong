@@ -226,7 +226,11 @@ _workspace_section() {  # _workspace_section <workdir>
 # Calls `identity prompt` and `skills prompt` to assemble identity context.
 _build_system_prompt() {
     local identity_text skills_text
-    identity_text=$(_prompt_section identity identity prompt) || identity_text=""
+    identity_text=$(_prompt_section identity identity prompt) || {
+        # Custos must never think without its operator charter after a render error.
+        [[ "${IDENTITY_NAME:-}" == "custos" ]] && return 1
+        identity_text=""
+    }
     skills_text=$(_prompt_section skills skills prompt) || skills_text=""
 
     printf 'You are an unconscious thought process of an AI person named %s.\n' "$IDENTITY_NAME"

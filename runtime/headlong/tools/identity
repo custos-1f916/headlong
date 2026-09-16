@@ -1500,6 +1500,12 @@ cmd_prompt() {
 
     # Core identity — personality/self-description
     if [[ -f "$identity_dir/core_identity_prompt.md" ]]; then
+        if [[ "$identity_name" == "custos" ]]; then
+            # One active personal description, followed by untouched operator lines.
+            # Renderer failures must surface, not silently select an old persona.
+            custos-dream persona-render --identity-dir "$identity_dir"
+            return $?
+        fi
         sed "s/{{identity_name}}/$identity_name/g" "$identity_dir/core_identity_prompt.md"
     else
         printf '%s' "I am $identity_name, I am an AI with an identity, life context (e.g., memory), and skills. I am concise, smart, ambitious, and empathetic. I can take action in the world around me by using the shell.
