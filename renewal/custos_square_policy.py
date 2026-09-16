@@ -55,11 +55,19 @@ def recent_writes(store, now):
     return result
 
 
-def admission(store, payload, remaining, now):
+def admission(store, payload, remaining, now, daily_comments=20):
     """Return eligibility and exact next check time; caller holds reservation lock."""
     priority = directed(store, payload, now)
+    # Concurrent callers can both have fetched the same live remaining count.
+    # Include reservations already committed by the other caller before spending
+    # the final discretionary slot. Uncertain writes remain reservations.
+    reserved_today = store.db.execute("SELECT count(*) FROM outbound WHERE verb='comment' AND status!='rejected' AND started>=?",
+                                     ((int(now) // 86400) * 86400,)).fetchone()[0]
+    remaining = min(remaining, max(0, daily_comments - reserved_today))
     writes = recent_writes(store, now)
     waits = []
+    if remaining < 1:
+        waits.append((int(now) // 86400 + 1) * 86400)
     for rows, limit, window in [([t for t, _ in writes if t > now - BURST_WINDOW], 2, BURST_WINDOW),
                                 ([t for t, _ in writes], COMMENT_LIMIT, WINDOW)]:
         if len(rows) >= limit:

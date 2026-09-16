@@ -61,6 +61,16 @@ class PolicyTests(unittest.TestCase):
         with self.store.db: self.store.db.execute("UPDATE outbound SET status='rejected' WHERE id='two'")
         self.assertTrue(policy.admission(self.store, self.payload, 20, self.now)['allowed'])
 
+    def test_stale_live_sample_cannot_spend_reserved_daily_slots(self):
+        # Eleven earlier comments plus another caller's newly reserved twelfth;
+        # the stale platform sample still says nine remain, but only eight do.
+        self.now += 20*3600
+        for n in range(11): self.spend('earlier'+str(n), 7*3600+n)
+        self.spend('concurrent', 1)
+        self.assertFalse(policy.admission(self.store,self.payload,9,self.now)['allowed'])
+        self.store.put('square:directed:10:22',{'at':self.now})
+        self.assertTrue(policy.admission(self.store,self.payload,9,self.now)['allowed'])
+
     def test_age_survives_whitespace_copy_request_and_parent_changes(self):
         old = self.now - 13*3600
         policy.remember_candidate(self.store, self.payload['body'], old, self.now)

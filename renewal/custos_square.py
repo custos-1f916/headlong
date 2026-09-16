@@ -284,7 +284,7 @@ class Square:
             else:
                 duplicate_id = None
                 if verb == 'comment':
-                    gate = policy.admission(self.store, payload, me['today']['comments_remaining'], now)
+                    gate = policy.admission(self.store, payload, me['today']['comments_remaining'], now, DAILY_COMMENTS)
                     if not gate['allowed']:
                         raise APIError('square_pacing_deferred', max(1, int(gate['next_at'] - now) + 1))
                     self.store.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',
