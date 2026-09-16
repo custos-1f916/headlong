@@ -403,6 +403,10 @@ class Spool:
           CREATE TABLE IF NOT EXISTS routing_counts (category TEXT PRIMARY KEY, count INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS cursor (
             route TEXT PRIMARY KEY, trajectory TEXT NOT NULL, offset INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS bot_error_claims (
+            send_id TEXT PRIMARY KEY, conversation TEXT NOT NULL,
+            episode TEXT NOT NULL, request_id TEXT NOT NULL, created REAL NOT NULL,
+            UNIQUE(conversation,episode,request_id));
         ''')
         if 'reaction' not in {row[1] for row in self.db.execute('PRAGMA table_info(outbox)')}:
             self.db.execute('ALTER TABLE outbox ADD COLUMN reaction TEXT')
@@ -607,6 +611,70 @@ class Bridge:
                     item['body'] += '\nProactive message target: ' + json.loads(row[0])['message'][:1600]
             self.spool.receive(item)
 
+    def claim_bot_error(self, conversation, send_id, request_id=None, actions_db=None):
+        """One reply per error input, two sends per uninterrupted bot outage.
+
+        All sending paths reserve here before RPC. An uncertain reservation
+        stays spent across restarts. Changing error text/costs and reactions do
+        not reset an episode; a substantive non-error message does.
+        """
+        db = self.spool.db
+        if not conversation.startswith('dm:') or not is_bot(self.policy, conversation[3:]):
+            return None
+        rows = db.execute("SELECT id,payload FROM inbox WHERE json_extract(payload,'$.conversation')=? "
+                          "ORDER BY json_extract(payload,'$.timestamp') DESC,id DESC", (conversation,)).fetchall()
+        episode = []
+        for row in rows:
+            item = json.loads(row['payload'])
+            body = str(item.get('body') or '').strip()
+            if item.get('reaction') or not body or not re.search(r'[A-Za-z0-9]', body):
+                continue
+            if not service_error_signature(body):
+                break
+            episode.append((row['id'], item))
+        ids = {row[0] for row in episode}
+        if request_id and request_id not in ids:
+            old = db.execute('SELECT payload FROM inbox WHERE id=?', (request_id,)).fetchone()
+            if old and service_error_signature(json.loads(old[0]).get('body')):
+                return 'stale bot-error reply'
+        if not episode:
+            return None
+        request_id = request_id if request_id in ids else episode[0][0]
+        episode_id = episode[-1][0]
+        # Include sends made before installation, so deployment cannot refill
+        # the budget of an already active incident.
+        spent = {}
+        for row in db.execute("SELECT id,request_id FROM outbox WHERE phase IN ('sending','submitted','uncertain')"):
+            if row['request_id'] in ids:
+                spent['outbox:' + row['id']] = row['request_id']
+        owned = None
+        if actions_db is None and Path(self.actions_state).exists():
+            owned = sqlite3.connect('file:' + str(self.actions_state) + '?mode=ro', uri=True)
+            owned.row_factory = sqlite3.Row
+            actions_db = owned
+        try:
+            if actions_db is not None:
+                for row in actions_db.execute("SELECT id,payload,created FROM actions WHERE phase IN ('sending','submitted','uncertain') "
+                                              "AND json_extract(payload,'$.target')=?", (conversation,)):
+                    payload = json.loads(row['payload'])
+                    if payload.get('reply_to') in ids or row['created'] >= episode[-1][1]['timestamp'] / 1000:
+                        spent['action:' + row['id']] = payload.get('reply_to') or request_id
+        finally:
+            if owned is not None:
+                owned.close()
+        with db:
+            db.execute('BEGIN IMMEDIATE')
+            for row in db.execute('SELECT send_id,request_id FROM bot_error_claims WHERE conversation=? AND episode=?',
+                                  (conversation, episode_id)):
+                spent[row['send_id']] = row['request_id']
+            if send_id in spent or request_id in spent.values():
+                return 'bot-error input already claimed'
+            if len(spent) >= 2:
+                return 'bot-error episode outgoing budget exhausted'
+            db.execute('INSERT INTO bot_error_claims VALUES(?,?,?,?,?)',
+                       (send_id, conversation, episode_id, request_id, time.time()))
+        return None
+
     def proactive(self):
         """Consume explicit proactive requests, with current host policy at send time."""
         if not Path(self.actions_state).exists():
@@ -648,6 +716,12 @@ class Bridge:
                                    (encoded({'error':'attachment snapshot unavailable or corrupt'}), row['id']))
                         db.commit(); continue
                 params.update({'groupId':group} if group else {'recipient':[target[3:]]})
+                blocked = self.claim_bot_error(target, 'action:' + row['id'], p.get('reply_to'), db)
+                if blocked:
+                    db.execute("UPDATE actions SET phase='blocked',receipt=? WHERE id=?",
+                               (encoded({'error': blocked}), row['id']))
+                    db.execute('DELETE FROM attachments WHERE request_id=?', (row['id'],))
+                    db.commit(); continue
                 db.execute("UPDATE actions SET phase='sending' WHERE id=? AND phase='queued'",(row['id'],))
                 db.commit()
                 try:
@@ -1053,6 +1127,12 @@ class Bridge:
                 params.update({'quoteTimestamp': item['timestamp'], 'quoteAuthor': item['sender_aci'],
                                'quoteMessage': quote_text(item['body'])})
             params.update(self.signal_target(item))
+            blocked = self.claim_bot_error(item['conversation'], 'outbox:' + row['id'], row['request_id'])
+            if blocked:
+                with db:
+                    db.execute("UPDATE outbox SET phase='suppressed',receipt=? WHERE id=?",
+                               (encoded({'suppressed': blocked}), row['id']))
+                continue
             with db:
                 db.execute("UPDATE outbox SET phase='sending' WHERE id=?", (row['id'],))
             try:

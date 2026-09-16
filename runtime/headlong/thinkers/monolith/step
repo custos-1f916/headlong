@@ -195,6 +195,10 @@ esac
 # appended step, is what keeps the trigger_self:false loop alive). The proper
 # decision at the end overrides next_delay before a clean exit.
 next_delay=$(_delay_for_level "$level")
+if ! _inference_admitted; then
+    next_delay=300
+    exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # ROUTER path — one agentic run over the function menu

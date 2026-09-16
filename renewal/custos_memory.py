@@ -73,6 +73,16 @@ def now():
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+def gate_time(value):
+    try:
+        result = dt.datetime.fromisoformat(value)
+        if result.tzinfo is None:
+            raise ValueError("timezone required")
+        return result
+    except (ValueError, TypeError):
+        raise InvalidInput("not_before requires an ISO timestamp with timezone")
+
+
 def encode(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -178,6 +188,8 @@ def validate_record(record):
     if "allow_reaction" in record["origin"] and record["origin"]["allow_reaction"] is not True:
         raise MemoryError("invalid reaction provenance")
     keys(record.get("goal"), {"outcome", "next_action", "completion"})
+    if record.get("not_before"):
+        gate_time(record["not_before"])
     if record["status"] != "active":
         resolution = record.get("resolution")
         keys(resolution, {"disposition", "evidence"})
@@ -540,8 +552,10 @@ class Store:
             return {"goal_id": goal_id, "request_id": origin["request_id"], "created": True}
 
     def update(self, payload):
-        keys(payload, {"goal_id"}, {"outcome", "next_action", "completion", "evidence"})
+        keys(payload, {"goal_id"}, {"outcome", "next_action", "completion", "evidence", "not_before"})
         changes = {key: text(value, key, 4096) for key, value in payload.items() if key != "goal_id"}
+        if "not_before" in changes:
+            gate_time(changes["not_before"])
         if not changes:
             raise MemoryError("empty update")
         with self.lock():
@@ -549,7 +563,9 @@ class Store:
             record = item[4]
             if not record or record["status"] != "active":
                 raise MemoryError("only active directed goals may be updated")
-            record["goal"].update({key: value for key, value in changes.items() if key != "evidence"})
+            record["goal"].update({key: value for key, value in changes.items() if key not in {"evidence", "not_before"}})
+            if "not_before" in changes:
+                record["not_before"] = changes["not_before"]
             record["events"].append({"at": now(), "update": changes})
             self.save(item, record)
             return {"goal_id": payload["goal_id"], "status": "active"}
@@ -719,11 +735,17 @@ class Store:
             raise MemoryError("invalid context page")
         self.reconcile()
         goals = []
+        deferred = []
+        context_now = dt.datetime.now(dt.timezone.utc)
         today = dt.datetime.now(dt.timezone.utc).date().isoformat()
         with self.lock():
             for path, header, body, fields, record in self.files():
                 if record:
                     if record["status"] != "active" or not needs_mind(record):
+                        continue
+                    if record.get("not_before") and gate_time(record["not_before"]) > context_now:
+                        deferred.append({"goal_id": fields["id"], "not_before": record["not_before"],
+                                         "summary": record["goal"]["outcome"][:160]})
                         continue
                     origin = record["origin"]
                     response = record.get("response")
@@ -747,7 +769,7 @@ class Store:
                                   "authority": origin["authority"], "status": record["status"],
                                   "next_action": next_action[:240],
                                   "completion": record["goal"]["completion"][:240],
-                                  "received_at": record["received_at"],
+                                  "received_at": record["received_at"], "not_before": record.get("not_before"),
                                   "trigger_step": (record.get("trigger_step") or "")[:256],
                                   "response_state": response["state"] if response else "unprocessed"})
                 elif not directed_only and fields.get("type") in GOAL_TYPES and not (fields.get("until") and fields["until"] < today):
@@ -773,7 +795,10 @@ class Store:
             if not row["directed"] or row.get("kind") != "task":
                 continue
             try:
-                age = (now_dt - dt.datetime.fromisoformat(row["received_at"])).total_seconds() / 3600
+                since = dt.datetime.fromisoformat(row["received_at"])
+                if row.get("not_before"):
+                    since = max(since, gate_time(row["not_before"]))
+                age = (now_dt - since).total_seconds() / 3600
             except ValueError:
                 continue
             row["age_hours"] = round(age, 1)
@@ -792,7 +817,7 @@ class Store:
         page = goals[offset:offset + limit]
         return {"total": len(goals), "active_directed": sum(row["directed"] for row in goals),
                 "offset": offset, "next_offset": offset + limit if offset + limit < len(goals) else None,
-                "goals": page}
+                "goals": page, "deferred": deferred}
 
 
 def is_task(record):
@@ -1014,6 +1039,18 @@ class People:
         instead of editing (Jack, 2026-09-11), and the responder was reading the
         oldest file while the social thinker maintained the newest."""
         found = self.find_all(key)
+        # A newer superseded stub must never displace its detailed canonical
+        # note. Only honor a resolvable same-person target, not arbitrary prose.
+        ids = {f[0][3].get("id") for f in found}
+        eligible = []
+        for f in found:
+            target = f[1].get("superseded_by")
+            if not target and f[2].lower().startswith("superseded duplicate"):
+                targets = [i for i in ids if i != f[0][3].get("id") and i in f[2]]
+                target = targets[0] if len(targets) == 1 else None
+            if target not in ids or target == f[0][3].get("id"):
+                eligible.append(f)
+        found = eligible
         if not found:
             return None
         return max(found, key=lambda f: (str(f[1].get("updated") or ""), f[0][0].name))
@@ -2042,6 +2079,11 @@ def expire_asks(store, older_than_hours=24, limit=10):
             if record["origin"].get("authority") != "agent":
                 continue
             touched = record["received_at"]
+            if record.get("not_before"):
+                gate = gate_time(record["not_before"])
+                if gate > now_dt:
+                    continue
+                touched = max(gate, dt.datetime.fromisoformat(touched)).isoformat()
             for event in record.get("events", []):
                 if isinstance(event, dict) and event.get("at", "") > touched:
                     touched = event["at"]
@@ -2180,6 +2222,9 @@ def context_text(result):
              f"{tasks} deferred tasks, {unanswered} unanswered messages"
              + (f"; {own} your own" if own else "") + "). "
              f"Showing offset {result['offset']}, {len(result['goals'])} records, people's asks first."]
+    for goal in result.get("deferred", []):
+        lines.append("Scheduled, not actionable before %s: %s — %s" %
+                     (goal["not_before"], goal["goal_id"], goal["summary"]))
     # One line per goal. The full record (request id, trigger step, completion
     # criteria) is one `custos-memory show ID` away; printing it here for every
     # goal cost ~1 KB each and, pinned inside the wake prompt, starved the run's

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""ask-agent — ask a peer agent (Kim, Jack's Kimi-K3 bot) a research question over Signal and
+"""ask-agent — ask a peer agent (Kim, Jack's bot) a research question over Signal and
 wait for the answer inside this step. Approved by Hal, Jack and Kim on 2026-09-10.
 
-  ask-agent "question"                    ask Kim, wait (default 600 s), print her answer
-  ask-agent --to Kim --timeout 300 "…"    another approved bot / a shorter wait
+  ask-agent ask "question"                    ask Kim, wait (default 600 s), print her answer
+  ask-agent --to Kim --timeout 300 ask "…"    another approved bot / a shorter wait
+  ask-agent list                        inspect recent asks; sends nothing
+  ask-agent status ASK_ID                inspect one receipt; sends nothing
   ask-agent wait ASK_ID [--timeout 300]   keep waiting on an ask that timed out here
-  ask-kim "question"                      the same, Kim by default
+  ask-kim ask "question"                      the same, Kim by default
 
 The host sends the DM, holds that conversation so the reply comes back HERE instead of as a
 separate wake, and releases the hold when the answer is in (or when the wait ends). The answer
@@ -107,13 +109,23 @@ def main():
     p.add_argument('words', nargs='*'); p.add_argument('--to', default='Kim'); p.add_argument('--timeout', type=int, default=600)
     p.add_argument('--hold', type=int, default=900, help='seconds the host keeps the conversation for this ask (max 900)')
     a = p.parse_args()
+    if a.words and a.words[0] in {'list', 'status'}:
+        verb = a.words[0]
+        if len(a.words) != (1 if verb == 'list' else 2):
+            p.error('usage: ask-agent list | ask-agent status ASK_ID')
+        payload = {'action': 'signal-asks'} if verb == 'list' else {'action': 'status', 'request_id': a.words[1]}
+        status, result = call(payload)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if status == 200 and result.get('ok') else 1
     if a.words and a.words[0] == 'wait':
         if len(a.words) != 2:
             sys.exit('usage: ask-agent wait ASK_ID')
         return wait(a.words[1], a.to, a.timeout, time.time())
-    question = ' '.join(a.words).strip()
+    if not a.words or a.words[0] != 'ask':
+        p.error('choose an explicit verb: ask QUESTION | status ASK_ID | list | wait ASK_ID; nothing sent')
+    question = ' '.join(a.words[1:]).strip()
     if not question:
-        sys.exit('usage: ask-agent "question"')
+        sys.exit('usage: ask-agent ask "question"')
     leak = PRIVATE.search(question)
     if leak:
         sys.exit('ask-agent: not sent — the question contains something that stays inside the house (%r). Rephrase without it.' % leak.group(0))

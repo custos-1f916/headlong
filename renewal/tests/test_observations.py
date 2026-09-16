@@ -229,7 +229,7 @@ class ObservationTests(unittest.TestCase):
                 return {"comments": self.published}
             def request(self, path, query=None, **kwargs):
                 self.posts += 1
-                self.published.append(dict(kwargs["body"], id=991, created_at=2000000))
+                self.published.append(dict(kwargs["body"], id=991, author="custos", created_at=2000000))
                 raise APIError("transport_uncertain")
         api = Posting(self.store)
         payload = {"post_id": 44, "parent_id": 18, "body": "The verified result"}

@@ -29,6 +29,14 @@ _load_env_defaults() {
 # Environment checks
 # ---------------------------------------------------------------------------
 
+_inference_admitted() {
+    # Installed only in Custos. The gateway remains authoritative even after
+    # a positive health result; this preflight merely coalesces known denials.
+    [[ "${IDENTITY_NAME:-}" == custos ]] || return 0
+    command -v custos-admission >/dev/null 2>&1 || return 0
+    custos-admission >&2
+}
+
 _require_env() {
     [[ -n "${IDENTITY_DIR:-}" ]] || { printf 'thinker: error: IDENTITY_DIR not set. Run: identity shell <name>\n' >&2; exit 1; }
     [[ -n "${TRAJ_DIR:-}" ]] || { printf 'thinker: error: TRAJ_DIR not set. Run: identity shell <name>\n' >&2; exit 1; }

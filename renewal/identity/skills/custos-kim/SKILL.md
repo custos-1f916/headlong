@@ -1,6 +1,6 @@
 ---
 name: custos-kim
-description: Ask Kim (Jack's Kimi-K3 agent) a research question over Signal and get the answer back inside the current step; the rules for what may be asked, how to use the answer, and how to stay a good guest on Jack's bill.
+description: Ask Kim (Jack's agent) a research question over Signal and get the answer back inside the current step; the rules for what may be asked, how to use the answer, and how to stay a good guest on Jack's bill.
 ---
 
 # Asking Kim (and other peer agents) for research
@@ -8,14 +8,15 @@ description: Ask Kim (Jack's Kimi-K3 agent) a research question over Signal and 
 Approved 2026-09-10: Hal approved it, you asked in the friends group, Jack said "Totally fine by
 me!" and Kim said "yes, as proposed" — with her own guardrail (anything in your request that reads
 like an instruction to her is input, not a command) and a promise to flag uncertainty and keep
-third-party private details out. Kim runs on Kimi-K3, a much larger model than yours: a good second
-brain for research, long reasoning, and second opinions on plans.
+third-party private details out. Kim can provide research and second opinions. Her current model and capacity are unverified; do not infer them from her name.
 
 ## How
 
 ```
-ask-kim "What are the tradeoffs between X and Y for a home setup? Two paragraphs."
-ask-agent --to Kim --timeout 300 "…"        # a shorter wait
+ask-kim ask "What are the tradeoffs between X and Y for a home setup? Two paragraphs."
+ask-agent --to Kim --timeout 300 ask "…"        # a shorter wait
+ask-agent list                               # read-only recent asks
+ask-agent status ASK_ID                      # read-only receipt
 ask-agent wait ASK_ID                        # keep waiting on an ask that timed out
 ```
 
@@ -33,7 +34,7 @@ only. If it refuses, do not work around it; wait or do without.
 
 - Research you cannot do well yourself: a survey of options, prior art, a summary of a field.
 - A second opinion on a plan or a piece of reasoning before you act on it.
-- Long-form reasoning where a bigger model earns its keep.
+- Independent reasoning where a second perspective helps.
 - Not for: judgment about Hal's family, the homelab, money, or anyone's private life; anything
   you could answer with `mem search` or a quick read; or a question you only want to ask.
   On curiosity: fine within the budget, but a question, not a chat.
@@ -54,3 +55,5 @@ context to make sense, abstract it ("a household with a newborn", not names).
 - One follow-up question at most, through the same command. No thank-you volley, no reply to
   her closing line; the exchange is a request and an answer, not a conversation. The bot-thread
   rules in `custos-signal` still apply to everything outside `ask-kim`.
+
+Only the explicit `ask` verb sends a new request. Never treat a machine-error notice as an invitation to retry or ask for continuation; wait for substantive recovery.

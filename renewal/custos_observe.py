@@ -758,22 +758,19 @@ class Observer:
         self.store.put(key, snapshot)
 
     def admission(self):
-        url = os.environ.get("CUSTOS_INFERENCE_URL", "http://192.168.86.69:18080").rstrip("/") + "/health"
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        try:
-            with opener.open(url, timeout=5) as response:
-                value = json.loads(response.read(8192))
-            if value.get("status") != "ok":
-                raise ValueError("invalid admission health response")
-            state = "admitted"
-            message = "Inference admitted. Custos is Johan's primary user; there is no daily or rolling usage quota. Operator pause and backend concurrency still apply."
-        except urllib.error.HTTPError as error:
-            value = json.loads(error.read(8192))["error"]
-            code = value["code"]
-            if code in {"custos_request_in_flight", "backend_busy_or_unavailable"}:
-                return  # Expected short-lived self-use/drain, not a new duty.
-            state = "deferred:" + code
-            message = "Inference deferred by the external gateway: " + code + ". Preserve goals and respect this boundary; it is not permission to bypass it. Retry guidance: " + str(value.get("retry_after_seconds", 0)) + " seconds."
+        from custos_admission import check
+        identity = os.environ.get("IDENTITY_DIR", "/var/lib/custos-harness/identities/custos")
+        result = check(identity)
+        url = result["url"] + "/health"
+        state = result["state"]
+        if state in {"custos_request_in_flight", "backend_busy_or_unavailable"}:
+            return  # shared short retry, not a lasting incident
+        message = ("Inference admitted again by gateway health; normal work may resume."
+                   if state == "admitted" else
+                   "Inference deferred by gateway health: " + state +
+                   ". Known denial is shared across wakes; no model calls until the next health probe. "
+                   "This is an observed gateway result, not evidence of an operator pause unless the code explicitly says so. "
+                   "Preserve goals and respect the boundary.")
         previous = self.store.get("admission:status", {"state": None, "sequence": 0})
         if previous["state"] != state:
             sequence = previous["sequence"] + 1

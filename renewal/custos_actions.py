@@ -178,6 +178,13 @@ class Channel:
             raise ValueError('object required')
         if payload == {'action': 'signal-contacts'}:
             return {'ok': True, 'contacts': destinations(load_policy(self.policy))}
+        if payload == {'action': 'signal-asks'}:
+            with connect(self.state) as db:
+                rows = db.execute("SELECT a.id,a.phase,a.created,h.expires,h.released FROM actions a "
+                                  "LEFT JOIN holds h ON h.request_id=a.id "
+                                  "WHERE json_extract(a.payload,'$.action')='signal-ask' "
+                                  "ORDER BY a.created DESC LIMIT 50").fetchall()
+            return {'ok': True, 'asks': [dict(row) for row in rows]}
         if payload.get('action') == 'signal-await' and set(payload) == {'action', 'request_id'}:
             return self.await_(payload)
         if payload.get('action') == 'signal-release' and set(payload) == {'action', 'request_id'}:

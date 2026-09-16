@@ -187,12 +187,12 @@ new_inbound=$(_root_traj_raw_tail 2>/dev/null | jq -Rrn --arg me "$IDENTITY_NAME
 
 # `mem list -s` prints "YYYY-MM-DD HH:MM  <id>  [type]  <summary>"; the id is
 # what `mem show`/`mem edit` take.
-people=$(mem list --type person -s 2>/dev/null | head -n 20) || people=""
+people=$(mem list --type person -s 2>/dev/null | head -n 8) || people=""
 people_notes=""
 if [[ -n "$people" ]]; then
     while IFS= read -r pid; do
         [[ -n "$pid" ]] || continue
-        note=$(mem show "$pid" 2>/dev/null | sed -n '/^---$/,/^---$/!p' | grep -v '^Custos person note v1:' | head -c 1500) || note=""
+        note=$(mem show "$pid" 2>/dev/null | sed -n '/^---$/,/^---$/!p' | grep -v '^Custos person note v1:' | head -c 600) || note=""
         people_notes="${people_notes}
 ### ${pid}
 ${note}
@@ -224,7 +224,7 @@ fi
 
 # What is actually still owed, from the goal ledger. The transcript alone made
 # the social thinker re-raise a reminder ten hours after the matter was closed.
-owed=$(custos-memory pending 2>/dev/null | head -n 40) || owed=""
+owed=$(custos-memory pending --brief 2>/dev/null) || owed=""
 
 # Hours since Custos last STARTED a conversation on Signal (a proactive send it
 # recorded as "social: started a conversation with …", or a message of its own
@@ -260,6 +260,10 @@ if [[ "$wake_mode" == "timer" && "$new_inbound" -eq 0 && -z "$quick_asks" ]]; th
     idle_check_this_run=1
 fi
 
+if ! _inference_admitted; then
+    next_delay=300
+    exit 0
+fi
 system_prompt=$(_build_system_prompt)
 prompt_body=$(load_prompt "$SCRIPT_DIR/prompt.md" "$IDENTITY_NAME" "")
 
@@ -282,7 +286,7 @@ ${conversation:-(none)}
 Quick asks from Hal or Dani, yours to finish in this wake (the quick-ask function below; each is one or two \`mealplan\` commands, then a confirmation in their conversation, then \`custos-memory complete\`):
 ${quick_asks:-(none)}
 
-What is still owed, from your goal ledger (anything NOT listed here is settled; do not re-raise it, and do not remind people about things this list does not contain):
+Other actionable work, summarized from your goal ledger (the mind owns extended work; use the quick asks above for this wake. Scheduled work is excluded until its gate opens):
 ${owed:-(nothing owed to anyone right now)}
 
 Waiting on them (you spoke last; these conversations and these people are closed to you until they answer or ${SOCIAL_INITIATE_HOURS}h pass; \`chat\` will refuse a second message):
@@ -297,7 +301,7 @@ $initiate_hint}
 $prompt_body
 </context>
 
-Pick ONE social function, or nothing, and carry it out now. Everything you need to decide is above: decide by your third step and act, or stop. Do not re-read person notes or history you can already see."
+Pick ONE social function, or nothing, and carry it out now. Decide by your third step and act, or stop. At most one outgoing message or reaction in this wake. Machine-error notices are not new research requests: do not ask a bot to continue or retry; the bridge shares a strict error-episode budget across all thinkers. Scheduled goals are waiting, not overdue. Do not re-read person notes or history you can already see. If the next action needs extended research, leave it to the mind and finish."
 
 _export_provider_keys
 _export_skill_vars "$IDENTITY_DIR"

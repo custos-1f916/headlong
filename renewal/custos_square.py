@@ -207,13 +207,21 @@ class Square:
                 candidates = self.get("/api/citizen/custos")[kind + "s"]
                 direct = False
             for candidate in candidates:
-                matches = candidate.get("body") == payload["body"] and (not direct or candidate.get("author") == "custos")
+                # The platform removes terminal LF characters. Preserve the
+                # submitted payload in the ledger; normalize only this known
+                # transformation, never spaces or internal whitespace.
+                matches = (isinstance(candidate.get("body"), str)
+                           and candidate["body"].rstrip("\n") == payload["body"].rstrip("\n")
+                           and candidate.get("author") == "custos")
                 if kind == "post":
                     matches = matches and candidate.get("title") == payload["title"]
                 else:
                     matches = matches and candidate.get("post_id") == payload["post_id"] and (candidate.get("intended_parent_id") or candidate.get("parent_id")) == payload.get("parent_id")
                 if matches and candidate.get("created_at", 0) >= (row["started"] - 5) * 1000:
                     receipt = {"request_id": identity, "status": "delivered", "readback": ORIGIN + "/api/" + kind + "/" + str(candidate["id"]), "reconciled": True}
+                    receipt["write_response"] = write_receipt.get("write_response")
+                    receipt["body_normalization"] = "terminal-LF-only"
+                    receipt["original_body_sha256"] = hashlib.sha256(payload["body"].encode()).hexdigest()
                     with self.store.db:
                         self.store.db.execute("UPDATE outbound SET status='delivered',receipt=? WHERE id=?", (canonical(receipt), identity))
                     return receipt
@@ -262,7 +270,10 @@ class Square:
         if duplicate_id is not None:
             return self.receipt(duplicate_id)
         try:
-            result = self.request("/api/" + verb, method="POST", body=payload, auth=True)[0]
+            wire = dict(payload)
+            if verb in {"post", "comment"}:
+                wire["body"] = wire["body"].rstrip("\n")
+            result = self.request("/api/" + verb, method="POST", body=wire, auth=True)[0]
         except APIError as exc:
             if exc.code in {"http_400", "http_401", "http_403", "http_404", "http_429"}:
                 with self.store.db:
