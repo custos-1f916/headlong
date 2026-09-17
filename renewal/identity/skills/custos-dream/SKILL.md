@@ -182,3 +182,16 @@ post or Signal notification is part of the workflow. A later wake records an
 expired/partial report if the review was interrupted; never claim full coverage
 when only the batch or part of it was examined. Backups and per-change journals
 remain beside the report for operator inspection and reversal.
+
+## Challenge the claim before keeping it
+
+Selection reserves at most half the batch for lifecycle risks, corrections and
+contested/causal claims; the rest rotates by oldest review. `challenge-claim` is a
+lexical review hint, not evidence that the memory is false. For each such entry,
+check what observation would contradict it, compare the actual artifact or source,
+and separate a failure receipt from a diagnosis of its cause. Add optional
+`counterevidence` text to its review-batch decision: cite what you checked, or state
+that contrary evidence was unavailable and why the verdict remains uncertain.
+“Consistent with my values” alone does not verify a causal claim. Prefer replacing
+an overstatement with a qualified claim to adding another principle. Keep is valid;
+there is no edit quota or pressure to change persona.

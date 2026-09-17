@@ -298,7 +298,7 @@ To keep a note for yourself, append a thought step instead of a message."
 }
 
 cmd_reply() {
-    local reply_to="" follow_up=0
+    local reply_to="" follow_up=0 delivery_kind="completion" correction_of=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --reply-to) reply_to="${2:?--reply-to requires a step id}"; shift 2 ;;
@@ -308,9 +308,15 @@ cmd_reply() {
             # but skips the answered guard below, which exists for races,
             # not for follow-ups (design/conversation_memory.md, part 5).
             --follow-up) follow_up=1; shift ;;
+            --delivery-kind) delivery_kind="${2:?delivery kind required}"; shift 2 ;;
+            --correction-of) correction_of="${2:?original receipt required}"; shift 2 ;;
             *) break ;;
         esac
     done
+    case "$delivery_kind" in acknowledgment|completion|correction) ;; *) die "invalid delivery kind" ;; esac
+    if [[ "$delivery_kind" == correction && -z "$correction_of" ]] || [[ "$delivery_kind" != correction && -n "$correction_of" ]]; then
+        die "correction requires --delivery-kind correction --correction-of outbox:STEP or action:ID"
+    fi
     local to_name="${1:-}"
     [[ -z "$to_name" ]] && die "Usage: chat reply [--reply-to <step_id>] <to_name> [message]"
     shift
@@ -408,12 +414,14 @@ Use the name of the person you mean to reach: chat reply <their-name> <message>"
         --arg to "$to_name" \
         --arg reply_to "$reply_to" \
         --argjson follow_up "$follow_up" \
-        '{type:"message", content:., from:$from, to:$to, source:"chat"}
+        --arg delivery_kind "$delivery_kind" --arg correction_of "$correction_of" \
+        '{type:"message", content:., from:$from, to:$to, source:"chat", delivery_kind:$delivery_kind}
+         + (if $correction_of == "" then {} else {correction_of:$correction_of} end)
          + (if $reply_to == "" then {} else {reply_to:$reply_to} end)
          + (if $follow_up == 1 then {follow_up:true} else {} end)' \
         | _chat_append
 
-    printf 'Reply sent%s.\n' "${OUTBOUND_NOTE:+ ($OUTBOUND_NOTE)}" >&2
+    printf 'Reply recorded for delivery%s; transport receipt confirms submission.\n' "${OUTBOUND_NOTE:+ ($OUTBOUND_NOTE)}" >&2
 }
 
 cmd_send_file() {

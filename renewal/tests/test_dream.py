@@ -256,3 +256,18 @@ class AuditAccountingTests(MemoryFixture):
         details={r['run_id']:r for r in result['run_details']}
         self.assertEqual(details['fallback']['cap_source'],'current-environment-estimate')
         self.assertIsNone(details['unknown-cap']['cap'])
+
+class CriticalSelectionTests(unittest.TestCase):
+    setUp = DreamTests.setUp
+    put = DreamTests.put
+    digest = DreamTests.digest
+    def test_critical_claim_gets_reserved_space_without_starving_rotation(self):
+        self.d.config['batch_size']=2
+        self.put('ffffffff','Correction: causal mechanism is uncertain; compare source B')
+        selected=self.d.begin()['selected']
+        self.assertEqual(selected[0]['id'],'ffffffff')
+        self.assertEqual(selected[1]['id'],'11111111')
+        self.d.review_batch([{'id':'ffffffff','expected':self.digest('ffffffff'),'verdict':'uncertain',
+                              'evidence':'Source A is associative','counterevidence':'Source B tests the mechanism and fails'}])
+        review=d.read_json(self.d.session_path())['reviews']['ffffffff']
+        self.assertIn('Source B',review['counterevidence'])

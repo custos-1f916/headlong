@@ -77,6 +77,10 @@ class Dream:
             if record and record.get("status") == "completed" and cm.is_task(record):
                 evidence = record.get("resolution", {}).get("evidence", "").lower()
                 if "queued" in evidence or "readback pending" in evidence: flags.append("verify-completion-receipt")
+            # Selection hints, not factual verdicts. Reserve review space for
+            # claims where a correction/counterexample could change behavior.
+            if not record and re.search(r"\b(?:correction|counterevidence|contradict\w*|refuted|nonsignificant|not statistically significant|uncertain|causal|inference.layer|repeated failure)\b", body, re.I):
+                flags.append("challenge-claim")
             prior = reviewed.get(key, {})
             rows.append({"id": key, "type": fields.get("type"), "sha256": digest, "bytes": path.stat().st_size,
                          "summary": fields.get("summary", "")[:160], "status": record.get("status") if record else None,
@@ -112,7 +116,12 @@ class Dream:
                 # lifecycle flags; rotate the substantive store fairly by last review.
                 candidates = [r for r in rows if not r["conversation"] or r["flags"]]
                 candidates.sort(key=lambda r: (r["reviewed_at"], not bool(r["flags"]), r["type"] == "memory", r["id"]))
-                selected = candidates[:self.config["batch_size"]]
+                budget = self.config["batch_size"]
+                # At most half the batch is reserved for risk; the rest follows
+                # oldest-review rotation so flags cannot starve ordinary memory.
+                critical = [r for r in candidates if r["flags"]][:max(1, budget // 2)]
+                picked = {r["id"] for r in critical}
+                selected = critical + [r for r in candidates if r["id"] not in picked][:budget - len(critical)]
                 session = {"version": 1, "day": self.day(), "created": self.stamp(), "status": "pending",
                            "inventory_count": len(rows), "selected": selected, "reviews": {}, "edits": [],
                            "max_edits": self.config["max_edits"], "minutes": self.config["minutes"]}
@@ -234,7 +243,7 @@ class Dream:
             entries = [read_json(Path(p)) for p in s["edits"]]
             updates = {}
             for decision in decisions:
-                if not isinstance(decision, dict) or set(decision) != {'id', 'expected', 'verdict', 'evidence'}:
+                if not isinstance(decision, dict) or not {'id', 'expected', 'verdict', 'evidence'} <= set(decision) or set(decision) - {'id', 'expected', 'verdict', 'evidence', 'counterevidence'}:
                     raise ValueError("each review requires id, expected, verdict and evidence")
                 key, expected, verdict, evidence = (decision[k] for k in ('id', 'expected', 'verdict', 'evidence'))
                 if not isinstance(key, str) or key not in {r['id'] for r in s['selected']}:
@@ -253,7 +262,10 @@ class Dream:
                 if actual != expected: raise ValueError("reviewed bytes changed: " + key)
                 if verdict == 'revised' and not any(e['operation'] == 'revise' and e['after_sha256'] == actual for e in matches):
                     raise ValueError("no revision receipt for reviewed bytes")
-                updates[key] = {'verdict': verdict, 'sha256': actual, 'evidence': evidence, 'at': self.stamp()}
+                contrary = decision.get('counterevidence', '')
+                if not isinstance(contrary, str) or len(contrary) > 4096:
+                    raise ValueError('bounded counterevidence text required')
+                updates[key] = {'counterevidence': contrary, 'verdict': verdict, 'sha256': actual, 'evidence': evidence, 'at': self.stamp()}
             s['reviews'].update(updates)
             write_json(self.session_path(), s)
             # Session is authoritative. If interrupted before this index write,

@@ -403,6 +403,10 @@ class Spool:
           CREATE TABLE IF NOT EXISTS routing_counts (category TEXT PRIMARY KEY, count INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS cursor (
             route TEXT PRIMARY KEY, trajectory TEXT NOT NULL, offset INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS delivery_claims (
+            conversation TEXT NOT NULL, request_id TEXT NOT NULL, kind TEXT NOT NULL,
+            correction_of TEXT NOT NULL, send_id TEXT NOT NULL UNIQUE, created REAL NOT NULL,
+            PRIMARY KEY(conversation,request_id,kind,correction_of));
           CREATE TABLE IF NOT EXISTS bot_error_claims (
             send_id TEXT PRIMARY KEY, conversation TEXT NOT NULL,
             episode TEXT NOT NULL, request_id TEXT NOT NULL, created REAL NOT NULL,
@@ -410,6 +414,9 @@ class Spool:
         ''')
         if 'reaction' not in {row[1] for row in self.db.execute('PRAGMA table_info(outbox)')}:
             self.db.execute('ALTER TABLE outbox ADD COLUMN reaction TEXT')
+        for column in ('delivery_kind', 'correction_of'):
+            if column not in {row[1] for row in self.db.execute('PRAGMA table_info(outbox)')}:
+                self.db.execute('ALTER TABLE outbox ADD COLUMN ' + column + ' TEXT')
         if 'prepared' not in {row[1] for row in self.db.execute('PRAGMA table_info(inbox)')}:
             self.db.execute('ALTER TABLE inbox ADD COLUMN prepared TEXT')
         if 'arrived' not in {row[1] for row in self.db.execute('PRAGMA table_info(inbox)')}:
@@ -497,10 +504,50 @@ class Spool:
                     continue
                 if len(content.encode()) > MAX_TEXT:
                     continue  # never spill a long reply into a file attachment
-                self.db.execute('INSERT OR IGNORE INTO outbox(id,request_id,content,created,reaction) VALUES(?,?,?,?,?)',
-                                (event['step_id'], event['request_id'], content, time.time(), reaction))
+                self.db.execute('INSERT OR IGNORE INTO outbox(id,request_id,content,created,reaction,delivery_kind,correction_of) VALUES(?,?,?,?,?,?,?)',
+                                (event['step_id'], event['request_id'], content, time.time(), reaction,
+                                 event.get('delivery_kind', 'completion'), event.get('correction_of')))
             self.db.execute('INSERT OR REPLACE INTO cursor VALUES(?,?,?)',
                             (route, result['trajectory'], result['offset']))
+
+    def claim_delivery(self, conversation, request_id, send_id, kind='completion', correction_of=None, actions_db=None):
+        if not isinstance(kind, str) or kind not in {'acknowledgment', 'completion', 'correction'}:
+            return 'invalid delivery kind'
+        reference = correction_of or ''
+        if not isinstance(reference, str) or len(reference) > 160:
+            return 'invalid correction reference'
+        if not request_id and kind != 'correction':
+            return None
+        if (kind == 'correction') != bool(reference):
+            return 'correction requires an original submitted delivery reference'
+        if reference:
+            original = None
+            if reference.startswith('outbox:'):
+                row = self.db.execute("SELECT o.request_id,i.payload FROM outbox o JOIN inbox i ON i.id=o.request_id WHERE o.id=? AND o.phase='submitted'",
+                                      (reference[7:],)).fetchone()
+                if row:
+                    original = (row['request_id'], json.loads(row['payload'])['conversation'])
+            elif reference.startswith('action:') and actions_db is not None:
+                row = actions_db.execute("SELECT payload FROM actions WHERE id=? AND phase='submitted'", (reference[7:],)).fetchone()
+                if row:
+                    payload = json.loads(row['payload'])
+                    original = (payload.get('reply_to'), payload.get('target'))
+            if original is None or original[1] != conversation or original[0] != request_id:
+                return 'original delivery is not submitted for this request and conversation'
+            # Proactive notifications have no inbound request to quote. Their
+            # verified original send is the owner, not a fabricated inbound ID.
+            request_id = request_id or 'delivery:' + reference
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            if kind == 'acknowledgment' and self.db.execute("SELECT 1 FROM delivery_claims WHERE conversation=? AND request_id=? AND kind='completion'", (conversation, request_id)).fetchone():
+                return 'completion already claimed; late acknowledgment suppressed'
+            try:
+                self.db.execute('INSERT INTO delivery_claims VALUES(?,?,?,?,?,?)',
+                                (conversation, request_id, kind, reference, send_id, time.time()))
+            except sqlite3.IntegrityError:
+                return 'delivery already claimed for this request and kind; inspect original receipt'
+        # Reservations remain spent on uncertain RPC outcomes; no new ID retry.
+        return None
 
 
 class RPC:
@@ -576,6 +623,87 @@ def paused():
     return result.returncode != 0
 
 
+def bot_error_block(db, policy, actions_state, conversation, send_id, request_id=None, actions_db=None, reserve=True):
+    """One reply per error input, two sends per uninterrupted bot outage.
+
+    All sending paths reserve here before RPC. An uncertain reservation
+    stays spent across restarts. Changing error text/costs and reactions do
+    not reset an episode; a substantive non-error message does.
+    """
+    if not conversation.startswith('dm:') or not is_bot(policy, conversation[3:]):
+        return None
+    rows = db.execute("SELECT id,payload FROM inbox WHERE json_extract(payload,'$.conversation')=? "
+                      "ORDER BY json_extract(payload,'$.timestamp') DESC,id DESC", (conversation,)).fetchall()
+    episode = []
+    for row in rows:
+        item = json.loads(row['payload'])
+        body = str(item.get('body') or '').strip()
+        if item.get('reaction') or not body or not re.search(r'[A-Za-z0-9]', body):
+            continue
+        if not service_error_signature(body):
+            break
+        episode.append((row['id'], item))
+    ids = {row[0] for row in episode}
+    if request_id and request_id not in ids:
+        old = db.execute('SELECT payload FROM inbox WHERE id=?', (request_id,)).fetchone()
+        if old and service_error_signature(json.loads(old[0]).get('body')):
+            return 'stale bot-error reply'
+    if not episode:
+        return None
+    request_id = request_id if request_id in ids else episode[0][0]
+    episode_id = episode[-1][0]
+    # Include sends made before installation, so deployment cannot refill
+    # the budget of an already active incident.
+    spent = {}
+    for row in db.execute("SELECT id,request_id FROM outbox WHERE phase IN ('sending','submitted','uncertain')"):
+        if row['request_id'] in ids:
+            spent['outbox:' + row['id']] = row['request_id']
+    owned = None
+    if actions_db is None and Path(actions_state).exists():
+        owned = sqlite3.connect('file:' + str(actions_state) + '?mode=ro', uri=True)
+        owned.row_factory = sqlite3.Row
+        actions_db = owned
+    try:
+        if actions_db is not None:
+            for row in actions_db.execute("SELECT id,payload,created FROM actions WHERE phase IN ('sending','submitted','uncertain') "
+                                          "AND json_extract(payload,'$.target')=?", (conversation,)):
+                payload = json.loads(row['payload'])
+                if payload.get('reply_to') in ids or row['created'] >= episode[-1][1]['timestamp'] / 1000:
+                    spent['action:' + row['id']] = payload.get('reply_to') or request_id
+    finally:
+        if owned is not None:
+            owned.close()
+    with db:
+        if reserve:
+            db.execute('BEGIN IMMEDIATE')
+        for row in db.execute('SELECT send_id,request_id FROM bot_error_claims WHERE conversation=? AND episode=?',
+                              (conversation, episode_id)):
+            spent[row['send_id']] = row['request_id']
+        if send_id in spent or request_id in spent.values():
+            return 'bot-error input already claimed'
+        if len(spent) >= 2:
+            return 'bot-error episode outgoing budget exhausted'
+        if reserve:
+            db.execute('INSERT INTO bot_error_claims VALUES(?,?,?,?,?)',
+                       (send_id, conversation, episode_id, request_id, time.time()))
+    return None
+
+
+def lane_status(spool, policy, actions_state, conversation, request_id=None):
+    # Read-only preflight: never construct Spool/Bridge here (their recovery
+    # constructors mutate sending rows). The send-time claim still closes races.
+    if not Path(spool).exists():
+        return {'blocked': False, 'reason': None}
+    db = sqlite3.connect('file:' + str(spool) + '?mode=ro', uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        reason = bot_error_block(db, policy, actions_state, conversation, '', request_id, reserve=False)
+    finally:
+        db.close()
+    return {'blocked': bool(reason), 'reason': reason,
+            'resume_when': 'A new eligible bot input arrives; reactions and renamed requests do not reset an outage.' if reason else None}
+
+
 class Bridge:
     def __init__(self, policy_file, spool, actions_state='/var/lib/custos-actions/actions.sqlite'):
         self.policy_file, self.spool = policy_file, spool
@@ -612,68 +740,8 @@ class Bridge:
             self.spool.receive(item)
 
     def claim_bot_error(self, conversation, send_id, request_id=None, actions_db=None):
-        """One reply per error input, two sends per uninterrupted bot outage.
-
-        All sending paths reserve here before RPC. An uncertain reservation
-        stays spent across restarts. Changing error text/costs and reactions do
-        not reset an episode; a substantive non-error message does.
-        """
-        db = self.spool.db
-        if not conversation.startswith('dm:') or not is_bot(self.policy, conversation[3:]):
-            return None
-        rows = db.execute("SELECT id,payload FROM inbox WHERE json_extract(payload,'$.conversation')=? "
-                          "ORDER BY json_extract(payload,'$.timestamp') DESC,id DESC", (conversation,)).fetchall()
-        episode = []
-        for row in rows:
-            item = json.loads(row['payload'])
-            body = str(item.get('body') or '').strip()
-            if item.get('reaction') or not body or not re.search(r'[A-Za-z0-9]', body):
-                continue
-            if not service_error_signature(body):
-                break
-            episode.append((row['id'], item))
-        ids = {row[0] for row in episode}
-        if request_id and request_id not in ids:
-            old = db.execute('SELECT payload FROM inbox WHERE id=?', (request_id,)).fetchone()
-            if old and service_error_signature(json.loads(old[0]).get('body')):
-                return 'stale bot-error reply'
-        if not episode:
-            return None
-        request_id = request_id if request_id in ids else episode[0][0]
-        episode_id = episode[-1][0]
-        # Include sends made before installation, so deployment cannot refill
-        # the budget of an already active incident.
-        spent = {}
-        for row in db.execute("SELECT id,request_id FROM outbox WHERE phase IN ('sending','submitted','uncertain')"):
-            if row['request_id'] in ids:
-                spent['outbox:' + row['id']] = row['request_id']
-        owned = None
-        if actions_db is None and Path(self.actions_state).exists():
-            owned = sqlite3.connect('file:' + str(self.actions_state) + '?mode=ro', uri=True)
-            owned.row_factory = sqlite3.Row
-            actions_db = owned
-        try:
-            if actions_db is not None:
-                for row in actions_db.execute("SELECT id,payload,created FROM actions WHERE phase IN ('sending','submitted','uncertain') "
-                                              "AND json_extract(payload,'$.target')=?", (conversation,)):
-                    payload = json.loads(row['payload'])
-                    if payload.get('reply_to') in ids or row['created'] >= episode[-1][1]['timestamp'] / 1000:
-                        spent['action:' + row['id']] = payload.get('reply_to') or request_id
-        finally:
-            if owned is not None:
-                owned.close()
-        with db:
-            db.execute('BEGIN IMMEDIATE')
-            for row in db.execute('SELECT send_id,request_id FROM bot_error_claims WHERE conversation=? AND episode=?',
-                                  (conversation, episode_id)):
-                spent[row['send_id']] = row['request_id']
-            if send_id in spent or request_id in spent.values():
-                return 'bot-error input already claimed'
-            if len(spent) >= 2:
-                return 'bot-error episode outgoing budget exhausted'
-            db.execute('INSERT INTO bot_error_claims VALUES(?,?,?,?,?)',
-                       (send_id, conversation, episode_id, request_id, time.time()))
-        return None
+        return bot_error_block(self.spool.db, self.policy, self.actions_state,
+                               conversation, send_id, request_id, actions_db)
 
     def proactive(self):
         """Consume explicit proactive requests, with current host policy at send time."""
@@ -717,6 +785,9 @@ class Bridge:
                         db.commit(); continue
                 params.update({'groupId':group} if group else {'recipient':[target[3:]]})
                 blocked = self.claim_bot_error(target, 'action:' + row['id'], p.get('reply_to'), db)
+                if not blocked:
+                    blocked = self.spool.claim_delivery(target, p.get('reply_to'), 'action:' + row['id'],
+                        p.get('delivery_kind', 'completion'), p.get('correction_of'), db)
                 if blocked:
                     db.execute("UPDATE actions SET phase='blocked',receipt=? WHERE id=?",
                                (encoded({'error': blocked}), row['id']))
@@ -1128,6 +1199,15 @@ class Bridge:
                                'quoteMessage': quote_text(item['body'])})
             params.update(self.signal_target(item))
             blocked = self.claim_bot_error(item['conversation'], 'outbox:' + row['id'], row['request_id'])
+            if not blocked and not reaction:
+                # Action references are resolved in the same host-owned database.
+                owned = sqlite3.connect('file:' + str(self.actions_state) + '?mode=ro', uri=True) if Path(self.actions_state).exists() else None
+                try:
+                    if owned is not None: owned.row_factory = sqlite3.Row
+                    blocked = self.spool.claim_delivery(item['conversation'], row['request_id'], 'outbox:' + row['id'],
+                        row['delivery_kind'] or 'completion', row['correction_of'], owned)
+                finally:
+                    if owned is not None: owned.close()
             if blocked:
                 with db:
                     db.execute("UPDATE outbox SET phase='suppressed',receipt=? WHERE id=?",

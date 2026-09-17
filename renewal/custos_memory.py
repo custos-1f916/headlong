@@ -191,6 +191,14 @@ def validate_record(record):
     keys(record.get("goal"), {"outcome", "next_action", "completion"})
     if record.get("not_before"):
         gate_time(record["not_before"])
+    if record.get("waiting"):
+        wait = record["waiting"]
+        keys(wait, {"reason", "since", "resume_sender"}, {"check_at"})
+        text(wait["reason"], "waiting reason", 2000)
+        text(wait["resume_sender"], "resume sender", 2048, empty=True)
+        gate_time(wait["since"])
+        if wait.get("check_at"):
+            gate_time(wait["check_at"])
     if record["status"] != "active":
         resolution = record.get("resolution")
         keys(resolution, {"disposition", "evidence"})
@@ -562,6 +570,64 @@ class Store:
             goal_id = self.commit(body, memory_type="goal" if deferred else "memory")
             return {"goal_id": goal_id, "request_id": origin["request_id"], "created": True}
 
+    def wait(self, payload):
+        keys(payload, {"goal_id", "reason"}, {"resume_sender", "check_at", "expected_sha256"})
+        reason = text(payload["reason"], "reason", 2000)
+        with self.lock():
+            item = self.find(payload["goal_id"]); record = item[4]
+            if not record or record["status"] != "active" or not is_task(record):
+                raise MemoryError("only active deferred tasks can wait")
+            if payload.get("expected_sha256") and hashlib.sha256(item[0].read_bytes()).hexdigest() != payload["expected_sha256"]:
+                raise MemoryError("goal changed since inspection; re-read before waiting")
+            wait = {"reason": reason, "since": now(),
+                    "resume_sender": text(payload.get("resume_sender", record["origin"]["sender"]), "resume_sender", 2048, empty=True)}
+            if payload.get("check_at"):
+                if gate_time(payload["check_at"]) <= dt.datetime.now(dt.timezone.utc):
+                    raise MemoryError("check_at must be in the future")
+                wait["check_at"] = payload["check_at"]
+            if record.get("not_before"):
+                record["events"].append({"at": now(), "replaced_not_before": record.pop("not_before")})
+            record["waiting"] = wait
+            record["events"].append({"at": now(), "waiting": dict(wait)})
+            self.save(item, record)
+            return {"goal_id": payload["goal_id"], "waiting": wait}
+
+    def _resume(self, item, evidence):
+        record = item[4]
+        previous = record.pop("waiting")
+        record["resumed_at"] = now()
+        record["events"].append({"at": now(), "resumed": evidence, "previous_wait": previous})
+        self.save(item, record)
+
+    def resume(self, payload):
+        keys(payload, {"goal_id", "evidence"})
+        evidence = text(payload["evidence"], "evidence", 2000)
+        with self.lock():
+            item = self.find(payload["goal_id"])
+            if not item[4] or item[4]["status"] != "active" or not item[4].get("waiting"):
+                raise MemoryError("goal is not waiting")
+            self._resume(item, evidence)
+        return {"goal_id": payload["goal_id"], "status": "active"}
+
+    def correction(self, payload):
+        keys(payload, {"goal_id", "receipt", "evidence"})
+        receipt = text(payload["receipt"], "original delivery receipt", 2048)
+        evidence = text(payload["evidence"], "correction evidence", 4096)
+        with self.lock():
+            original = self.find(payload["goal_id"])[4]
+            if not original:
+                raise MemoryError("correction requires a captured original request")
+            origin = dict(original["origin"])
+        # A new task preserves the original record and cannot silently reopen or
+        # rewrite its completion receipt. Repeating the same correction is safe.
+        key = hashlib.sha256((origin["request_id"] + "\n" + receipt + "\n" + evidence).encode()).hexdigest()[:24]
+        return self.capture({"request_id": "correction:" + key, "sender": origin["sender"],
+            "authority": origin["authority"], "source_url": origin["source_url"],
+            "content": "Material correction to goal " + payload["goal_id"] + ". Original receipt: " + receipt + ". Evidence: " + evidence,
+            "outcome": "Review and deliver a material correction to " + payload["goal_id"],
+            "next_action": "Verify original receipt " + receipt + ", qualify the changed claim, then send with --delivery-kind correction --correction-of " + receipt + ". " + evidence[:1800],
+            "completion": "Correction has a successful transport receipt, or an evidence-backed decision that no correction is needed"}, deferred=True)
+
     def update(self, payload):
         keys(payload, {"goal_id"}, {"outcome", "next_action", "completion", "evidence", "not_before"})
         changes = {key: text(value, key, 4096) for key, value in payload.items() if key != "goal_id"}
@@ -747,13 +813,31 @@ class Store:
         self.reconcile()
         goals = []
         deferred = []
+        waiting = []
         context_now = dt.datetime.now(dt.timezone.utc)
         today = dt.datetime.now(dt.timezone.utc).date().isoformat()
         with self.lock():
-            for path, header, body, fields, record in self.files():
+            items = list(self.files())
+            # Intake captures before appending the native trigger. Evaluate here
+            # after reconciliation, including recovery from either interrupted
+            # write, rather than relying on a one-shot capture side effect.
+            inbound = [r for _, _, _, _, r in items if r and r.get("trigger_step")
+                       and not r["origin"].get("ambient") and not is_reaction_event(r["origin"]["content"])]
+            for path, header, body, fields, record in items:
                 if record:
                     if record["status"] != "active" or not needs_mind(record):
                         continue
+                    wait = record.get("waiting")
+                    if wait:
+                        event = next((r for r in inbound if r["origin"]["sender"] == wait["resume_sender"]
+                                      and gate_time(r["received_at"]) > gate_time(wait["since"])), None)
+                        if event:
+                            self._resume((path, header, body, fields, record), "New inbound request " + event["origin"]["request_id"] + "; check whether the gate is satisfied")
+                        elif wait.get("check_at") and gate_time(wait["check_at"]) <= context_now:
+                            self._resume((path, header, body, fields, record), "Scheduled check time reached; inspect once, then wait again if still gated")
+                        else:
+                            waiting.append({"goal_id": fields["id"], "summary": record["goal"]["outcome"][:160], **wait})
+                            continue
                     if record.get("not_before") and gate_time(record["not_before"]) > context_now:
                         deferred.append({"goal_id": fields["id"], "not_before": record["not_before"],
                                          "summary": record["goal"]["outcome"][:160]})
@@ -780,7 +864,7 @@ class Store:
                                   "authority": origin["authority"], "status": record["status"],
                                   "next_action": next_action[:240],
                                   "completion": record["goal"]["completion"][:240],
-                                  "received_at": record["received_at"], "not_before": record.get("not_before"),
+                                  "received_at": record["received_at"], "not_before": record.get("not_before"), "resumed_at": record.get("resumed_at"),
                                   "trigger_step": (record.get("trigger_step") or "")[:256],
                                   "response_state": response["state"] if response else "unprocessed"})
                 elif not directed_only and fields.get("type") in GOAL_TYPES and not (fields.get("until") and fields["until"] < today):
@@ -809,6 +893,8 @@ class Store:
                 since = dt.datetime.fromisoformat(row["received_at"])
                 if row.get("not_before"):
                     since = max(since, gate_time(row["not_before"]))
+                if row.get("resumed_at"):
+                    since = max(since, gate_time(row["resumed_at"]))
                 age = (now_dt - since).total_seconds() / 3600
             except ValueError:
                 continue
@@ -828,7 +914,7 @@ class Store:
         page = goals[offset:offset + limit]
         return {"total": len(goals), "active_directed": sum(row["directed"] for row in goals),
                 "offset": offset, "next_offset": offset + limit if offset + limit < len(goals) else None,
-                "goals": page, "deferred": deferred}
+                "goals": page, "deferred": deferred, "waiting": waiting}
 
 
 def is_task(record):
@@ -2040,7 +2126,7 @@ def response(store, payload):
                                  "reply_to": trigger, "content": plan["reply"],
                                  "reaction": plan["reply"], "source": "responder"})
                 else:
-                    run(["chat", "reply", "--reply-to", trigger, incoming["sender"]], plan["reply"])
+                    run(["chat", "reply", "--delivery-kind", "acknowledgment" if plan["decision"] == "defer" else "completion", "--reply-to", trigger, incoming["sender"]], plan["reply"])
                 if not any(step.get("type") == "message" and step.get("from") == me and
                            step.get("to") == incoming["sender"] and step.get("reply_to") == trigger
                            for step in trajectory(store)):
@@ -2102,6 +2188,8 @@ def expire_asks(store, older_than_hours=24, limit=10):
             if not record or record["status"] != "active" or not is_task(record):
                 continue
             if record["origin"].get("authority") != "agent":
+                continue
+            if record.get("waiting"):
                 continue
             touched = record["received_at"]
             if record.get("not_before"):
@@ -2250,6 +2338,10 @@ def context_text(result):
     for goal in result.get("deferred", []):
         lines.append("Scheduled, not actionable before %s: %s — %s" %
                      (goal["not_before"], goal["goal_id"], goal["summary"]))
+    for goal in result.get("waiting", []):
+        lines.append("WAITING %s: %s. Resume on %s%s; do not poll unchanged state." %
+                     (goal["goal_id"], goal["reason"], "new inbound from " + goal["resume_sender"] if goal["resume_sender"] else "explicit evidenced resume",
+                      " or check at " + goal["check_at"] if goal.get("check_at") else ""))
     # One line per goal. The full record (request id, trigger step, completion
     # criteria) is one `custos-memory show ID` away; printing it here for every
     # goal cost ~1 KB each and, pinned inside the wake prompt, starved the run's
@@ -2357,7 +2449,7 @@ Examples (replace the sample ID and evidence with actual values):
   custos-memory person-alias-remove PERSON_ID ALIAS [ALIAS ...] # atomically remove exact aliases; preimage archived
 An acknowledgment alone is not completion. Valid dispositions: completed, declined, abandoned.''')
     parser.add_argument("command", choices=["capture", "capture-envelope", "context", "pending", "show", "update", "complete", "respond",
-                                            "replay-unanswered", "archive-conversations", "expire-asks", "note", "check",
+                                            "replay-unanswered", "archive-conversations", "expire-asks", "note", "check", "wait", "resume", "correction",
                                             "validate", "person-merge", "person-alias-remove", "person-normalize", "people-context"])
     parser.add_argument("goal_id", nargs="?", help="Goal ID for show, update and complete (writes also take JSON on stdin)")
     parser.add_argument("words", nargs="*", help="complete: [completed|declined|abandoned] evidence…; update: the next action")

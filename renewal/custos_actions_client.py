@@ -125,15 +125,17 @@ def resolve_reply(step, route):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('action', choices=['signal-contacts', 'signal-send', 'signal-ask', 'signal-await', 'signal-release', 'automata-status', 'automata-deploy', 'automata-rollback', 'status'])
+    p.add_argument('action', choices=['signal-lane-status', 'signal-contacts', 'signal-send', 'signal-ask', 'signal-await', 'signal-release', 'automata-status', 'automata-deploy', 'automata-rollback', 'status'])
     p.add_argument('request_id', nargs='?')
     p.add_argument('--attach', action='append', default=[], metavar='FILE', help='attach a guest file (repeat up to four; 8 MiB total)')
     p.add_argument('--reply-to', metavar='STEP', help='quote a delivered native Signal message (unique step ID/prefix)')
+    p.add_argument('--delivery-kind', choices=['acknowledgment', 'completion', 'correction'])
+    p.add_argument('--correction-of', help='original submitted outbox:STEP or action:ID')
     args = p.parse_args()
     try:
-        if (args.attach or args.reply_to) and args.action != 'signal-send':
+        if (args.attach or args.reply_to or args.delivery_kind or args.correction_of) and args.action != 'signal-send':
             raise ValueError('--attach and --reply-to are for signal-send')
-        if args.action in ('signal-send', 'signal-ask', 'automata-deploy', 'automata-rollback'):
+        if args.action in ('signal-lane-status', 'signal-send', 'signal-ask', 'automata-deploy', 'automata-rollback'):
             raw = sys.stdin.buffer.read(32769)
             if len(raw) > 32768: raise ValueError('request too large')
             payload = json.loads(raw)
@@ -145,6 +147,11 @@ def main():
             payload['request_id'] = args.request_id
         elif args.request_id:
             raise ValueError('unexpected request ID argument')
+        for field in ('delivery_kind', 'correction_of'):
+            value = getattr(args, field)
+            if value is not None:
+                if field in payload: raise ValueError('use flag or JSON ' + field + ', not both')
+                payload[field] = value
         route = None
         reply_step = None
         if args.action == 'signal-send':
@@ -156,7 +163,8 @@ def main():
                 target = resolve_target(target, contacts.get('destinations') or contacts.get('contacts') or (contacts if isinstance(contacts, list) else []))
             route = route_for(target)
             try:
-                guard(route)
+                if payload.get('delivery_kind') != 'correction':
+                    guard(route)
             except ValueError as refusal:
                 print(json.dumps({'ok': False, 'error': 'not sent: ' + str(refusal), 'request_id': payload['request_id']}))
                 return 1

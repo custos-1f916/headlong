@@ -82,3 +82,41 @@ tasks and attempted replies do not expire this way. Oversized person updates kee
 the previous complete note and preserve an unverified candidate for later review.
 
 Future-gated directed work: pipe `{"goal_id":"0123abcd","not_before":"2026-09-16T17:00:00-06:00","evidence":"Verified planning window"}` into `custos-memory update`. Use an explicit timezone. The record stays active and visible as scheduled, but stays outside actionable/stale/expiry rotation until that timestamp; age starts at the gate. Set a past timestamp to reopen early. This gate is not a new timer: retain the existing scheduled observation or reminder that wakes you at the intended time.
+
+## Waiting and correcting a delivered result
+
+When the next action needs a human or external event, use structured waiting;
+writing “blocked” in a note does not suspend QUICK/OVERDUE scheduling. Pipe JSON
+to `custos-memory wait`:
+
+```json
+{"goal_id":"actual-id","reason":"Cart prepared; awaiting the person's confirmation","resume_sender":"exact-original-route"}
+```
+
+The default resume_sender is the original route. A new directed non-reaction
+message from that route makes the task actionable for a gate check; it grants no
+new authority and does not establish that the gate was satisfied.
+Replayed messages do not. An empty resume_sender requires explicit resume. An
+optional `check_at` is an ISO timestamp with timezone for one deliberate check;
+do not add frequent check times to an unchanged human gate. Use
+`custos-memory resume` with `{goal_id,evidence}` when another verified event
+satisfies the gate. Waiting keeps the task and its evidence, without urgency or
+automatic expiry. If a new message does not satisfy the gate, wait again.
+
+If later evidence materially changes a result already sent, create a correction
+immediately, before FINAL, with `custos-memory correction`:
+
+```json
+{"goal_id":"original-goal-id","receipt":"action:original-request-id","evidence":"What changed, with source or memory ID"}
+```
+
+This creates an idempotent deferred task and preserves the completed original.
+Read the original request and delivery receipt, check the claim, and send a concise
+correction through its original conversation. Use `--delivery-kind correction
+--correction-of action:ID` (or `outbox:FULL_STEP_ID`) on `chat reply --follow-up`
+or `custos-actions signal-send`; reply-to must still identify the original inbound
+request. For proactive notifications with no inbound request, use the original
+submitted action receipt with custos-actions signal-send without reply-to. Close
+only against a successful correction receipt or an evidenced
+judgment that no correction is needed. Recording the new caveat in a fact alone
+is not delivery.

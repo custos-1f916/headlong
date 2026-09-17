@@ -2320,35 +2320,9 @@ ${combined}"
     printf '%s' "$summary_json" | traj append --traj_dir "$traj_dir" "$traj_id" >/dev/null 2>/dev/null || true
 }
 
-# Stream lines past $2 from $1 to stderr (redacted), then print the new
-# total line count on stdout so the caller can update its cursor.
+# Byte cursor, bounded formatting before Bash ever sees command output.
 _stream_new_output() {
-    local output_file="$1" lines_read="$2"
-    local total_lines
-    total_lines=$(wc -l < "$output_file" 2>/dev/null || echo 0)
-    total_lines=$(echo "$total_lines" | tr -d ' ')
-    if [[ "$total_lines" -gt "$lines_read" ]]; then
-        local new_count=$((total_lines - lines_read))
-        local skip_n=$((lines_read + 1))
-        # Use tail + head to get new lines (bash 3.2 safe). pipefail OFF in a
-        # subshell: the output file is written CONCURRENTLY by the running
-        # command, so `head` can close after $new_count lines while `tail` is
-        # still reading freshly-appended lines → SIGPIPE to tail. Under the
-        # global `set -o pipefail` that made the whole run exit rc=141 (on macOS
-        # every streaming run died this way). See design/monolith_run_health.md.
-        ( set +o pipefail; tail -n +"$skip_n" "$output_file" | head -n "$new_count" ) | while IFS= read -r line; do
-            local redacted_line
-            redacted_line=$(redact_sensitive "$line")
-            if [[ "$QUIET" -eq 0 ]]; then
-                if [[ "$redacted_line" == +* ]]; then
-                    printf '\033[36m  $ %s\033[0m\n' "${redacted_line#+ }" >&2
-                else
-                    printf '\033[90m  │ %s\033[0m\n' "$redacted_line" >&2
-                fi
-            fi
-        done
-    fi
-    printf '%s\n' "$total_lines"
+    python3 "$(dirname "$_SHELLM_SCRIPT_PATH")/shellm-output" stream "$1" "$2" "$QUIET"
 }
 
 # ---------------------------------------------------------------------------
@@ -3131,7 +3105,7 @@ exit \$__shellm_rc
         [[ -s "$activity_file" ]] && had_nested=1
 
         local output
-        output=$(cat "$output_file")
+        output=$(python3 "$(dirname "$_SHELLM_SCRIPT_PATH")/shellm-output" capture "$output_file" "$rundir/output-${iteration:-0}-$(date +%s).txt")
         rm -f "$output_file" "$exec_pid_file" "$watchdog_pid_file" "$timeout_marker" "$activity_file"
         local _exec_s=$(( $(date +%s) - _exec_t0 ))
 

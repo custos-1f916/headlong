@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 import selectors
-from custos_signal import load_policy, encoded, MAX_TEXT
+from custos_signal import load_policy, encoded, MAX_TEXT, lane_status
 import custos_attachments as attachments
 
 STATE = '/var/lib/custos-actions/actions.sqlite'
@@ -92,7 +92,7 @@ def validate(payload, policy):
     action = payload.get('action')
     fields = {'signal-send': {'target', 'message'}, 'signal-ask': {'target', 'message', 'wait_seconds'},
               'automata-deploy': {'commit', 'goal_id'}, 'automata-rollback': {'goal_id'}}
-    optional = {'attachments', 'reply_to'} if action == 'signal-send' else set()
+    optional = {'attachments', 'reply_to', 'delivery_kind', 'correction_of'} if action == 'signal-send' else set()
     if (action not in fields or not fields[action] | {'action', 'request_id'} <= set(payload) or
             set(payload) - (fields[action] | {'action', 'request_id'} | optional)):
         raise ValueError('invalid action fields')
@@ -109,6 +109,12 @@ def validate(payload, policy):
         if 'reply_to' in p and (not isinstance(p['reply_to'], str) or
                                 not re.fullmatch(r'[A-Za-z0-9:._-]{1,128}', p['reply_to'])):
             raise ValueError('reply_to must be an inbound Signal request ID')
+        if not isinstance(p.get('delivery_kind', 'completion'), str) or p.get('delivery_kind', 'completion') not in {'acknowledgment', 'completion', 'correction'}:
+            raise ValueError('invalid delivery_kind')
+        if (p.get('delivery_kind') == 'correction') != bool(p.get('correction_of')):
+            raise ValueError('correction needs delivery_kind and correction_of')
+        if p.get('correction_of') and (not isinstance(p['correction_of'], str) or not re.fullmatch(r'(?:outbox|action):[A-Za-z0-9:._-]{1,128}', p['correction_of'])):
+            raise ValueError('correction requires a valid original receipt reference')
         if action == 'signal-ask':
             if not p['target'].startswith('dm:'):
                 raise ValueError('an inline ask goes to one person or bot by DM, never a group')
@@ -178,6 +184,10 @@ class Channel:
             raise ValueError('object required')
         if payload == {'action': 'signal-contacts'}:
             return {'ok': True, 'contacts': destinations(load_policy(self.policy))}
+        if payload.get('action') == 'signal-lane-status' and set(payload) == {'action', 'target'}:
+            policy = load_policy(self.policy)
+            target = resolve(payload['target'], policy)
+            return {'ok': True, 'target': target, **lane_status(self.spool, policy, self.state, target)}
         if payload == {'action': 'signal-asks'}:
             with connect(self.state) as db:
                 rows = db.execute("SELECT a.id,a.phase,a.created,h.expires,h.released FROM actions a "
@@ -209,6 +219,10 @@ class Channel:
             if old:
                 if old['payload'] != encoded(p): raise ValueError('request_id belongs to different content')
                 return receipt(old)
+            if p['action'] in ('signal-send', 'signal-ask'):
+                lane = lane_status(self.spool, load_policy(self.policy), self.state, p['target'], p.get('reply_to'))
+                if lane['blocked']:
+                    return {'ok': False, 'error': 'lane_blocked', 'request_id': p['request_id'], **lane}
             if files:
                 size = sum(f['size'] for f in files)
                 pending = db.execute('SELECT COALESCE(SUM(size),0) FROM attachments').fetchone()[0]

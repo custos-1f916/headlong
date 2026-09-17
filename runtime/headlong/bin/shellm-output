@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Bound file reads before Bash formatting; no model, network or identity access."""
+import os
+from pathlib import Path
+import re
+import sys
+
+STREAM_BYTES = 16384
+CAPTURE_BYTES = 262144
+
+
+def redact(data):
+    for name in ('ANTHROPIC_API_KEY', 'LLM_API_KEY', 'OPENAI_API_KEY',
+                 'OPENROUTER_API_KEY', 'GEMINI_API_KEY', 'OPENCODE_API_KEY'):
+        value = os.environ.get(name)
+        if value:
+            data = data.replace(value.encode(), b'<redacted-api-key>')
+    return re.sub(rb'sk-ant-[A-Za-z0-9._-]+', b'<redacted-anthropic-key>', data)
+
+
+def main():
+    mode, path = sys.argv[1:3]
+    with open(path, 'rb') as stream:
+        size = os.fstat(stream.fileno()).st_size
+        if mode == 'stream':
+            offset = min(max(0, int(sys.argv[3])), size)
+            # Advance by the snapshot byte size, regardless of display volume.
+            # Silent mode performs no scans/redaction/formatting at all.
+            if sys.argv[4] != '1' and size > offset:
+                stream.seek(offset)
+                data = stream.read(min(STREAM_BYTES, size - offset))
+                # Drop edge fragments; exact-value redaction must never see
+                # just half of a key split by a live write or display cap.
+                if offset:
+                    data = data.split(b'\n', 1)[-1] if b'\n' in data else b''
+                data = data.rsplit(b'\n', 1)[0] if b'\n' in data else b''
+                if size - offset > STREAM_BYTES:
+                    data += b'\n[terminal output omitted; bounded command result follows]\n'
+                sys.stderr.buffer.write(redact(data))
+            print(size)
+        elif mode == 'capture':
+            if size <= CAPTURE_BYTES:
+                data = stream.read(CAPTURE_BYTES)
+            else:
+                head = stream.read(CAPTURE_BYTES // 2)
+                stream.seek(size - CAPTURE_BYTES // 2)
+                tail = stream.read(CAPTURE_BYTES // 2)
+                # Drop cut lines; a partial credential at a cut is never shown.
+                head = head.rsplit(b'\n', 1)[0] if b'\n' in head else b''
+                tail = tail.split(b'\n', 1)[-1] if b'\n' in tail else b''
+                retained = Path(sys.argv[3])
+                marker = ('\n[output truncated from %d bytes; bounded head/tail retained at %s; omitted middle was not retained]\n' % (size, retained)).encode()
+                data = head + marker + tail
+                fd = os.open(retained, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, 'wb') as saved:
+                    saved.write(redact(data))
+            sys.stdout.buffer.write(redact(data))
+        else:
+            raise ValueError('invalid output mode')
+
+
+if __name__ == '__main__':
+    main()

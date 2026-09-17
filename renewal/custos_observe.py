@@ -349,7 +349,12 @@ class Observer:
             cursor = page.get("ack_cursor")
             if page.get("cursor_mode") != "id" or buckets.get("contract") != "1f916.inbox.since_last_visit.v3":
                 raise APIError("inbox_contract_changed")
-            if not isinstance(cursor, dict) or set(cursor) != {"version", "timestamp", "comments", "mentions"} or cursor["version"] != 1 or any(type(cursor[k]) is not int or cursor[k] < 0 for k in cursor):
+            cursor_fields = {"version", "timestamp", "comments", "mentions"}
+            if (not isinstance(cursor, dict) or not cursor_fields <= set(cursor)
+                    or set(cursor) - cursor_fields - {"seal"} or cursor["version"] != 1
+                    or any(type(cursor[k]) is not int or cursor[k] < 0 for k in cursor_fields)
+                    or ("seal" in cursor and (not isinstance(cursor["seal"], str)
+                        or not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", cursor["seal"])))):
                 raise APIError("invalid_ack_cursor")
             if any(not isinstance(buckets.get(bucket), list) or len(buckets[bucket]) > 50 for bucket in BUCKETS):
                 raise APIError("inbox_bucket_contract")

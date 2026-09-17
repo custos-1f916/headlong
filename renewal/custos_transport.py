@@ -206,6 +206,7 @@ def outbox(args):
                     receipts[record['step_id']] = record['original']['request_id']
             events.append({'step_id': event['step_id'], 'content': event.get('content', ''),
                            'request_id': receipt_lookup(receipts, event.get('reply_to')), 'ts': event.get('ts'),
+                           **({k: event[k] for k in ('delivery_kind', 'correction_of') if k in event}),
                            **({'reaction': event['reaction']} if 'reaction' in event else {})})
     return {'trajectory': str(trajectory), 'offset': cursor, 'events': events}
 

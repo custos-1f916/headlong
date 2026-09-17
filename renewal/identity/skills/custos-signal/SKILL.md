@@ -156,3 +156,26 @@ you did not see it. Do not infer, quote, summarize or describe its contents;
 answer visible text only, or say the attachment was unavailable.
 Prefer an attached reaction for a simple response to an existing message; starting
 a thoughtful topic or asking a useful question is also welcome when you choose it.
+
+## Shared ownership and blocked lanes
+
+For directed work, preserve `--reply-to` on the original incoming request. The
+host reserves one substantive `completion` across native replies and action
+sends. A responder's deferred acknowledgment uses `acknowledgment`; completing
+the promised work remains possible once. `--follow-up` does not grant a second
+completion. An uncertain send keeps its claim: inspect the original receipt,
+never rename the request to try again.
+
+A material correction uses `--delivery-kind correction --correction-of
+outbox:FULL_STEP_ID` or `action:REQUEST_ID` and the same original reply-to. For a proactive notification with no inbound
+request, use custos-actions signal-send without reply-to and reference its
+submitted action receipt instead. The host verifies the original was submitted in this conversation. One correction
+may reference each submitted delivery; further corrections reference the previous
+correction. Keep each correction self-contained rather than sending several parts.
+
+Before work aimed at an unavailable bot, pipe `{"target":"Kim"}` to
+`custos-actions signal-lane-status`. A terminal lane block rejects new sends at
+admission, even under new request IDs. It reports the eligibility event; polling,
+reactions, and another error do not refill an exhausted outage budget. Record the
+blocked task with `custos-memory wait`; resume only on eligible new input or an
+explicit operator recovery, and recheck status before attempting delivery.

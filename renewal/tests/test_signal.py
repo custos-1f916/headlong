@@ -476,7 +476,9 @@ class SignalSpoolTests(unittest.TestCase):
 
     def test_replies_quote_the_original_in_groups_and_for_superseded_dms(self):
         calls = []; bridge = self.bridge_with_rpc(calls)
-        self.queue()  # Hal's latest DM: a plain reply, no quote
+        self.queue()  # Deferred acknowledgment; later completion quotes this ask.
+        with self.spool.db:
+            self.spool.db.execute("UPDATE outbox SET delivery_kind='acknowledgment'")
         with mock.patch.object(cs, 'paused', return_value=False), mock.patch.object(cs, 'transport',
                 return_value={'events': [], 'trajectory': 'one', 'offset': 50}):
             bridge.tick()
