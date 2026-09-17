@@ -2212,6 +2212,14 @@ _stream_new_output() {
 # ---------------------------------------------------------------------------
 
 run_loop() {
+
+    # A spurious SIGHUP (e.g. the process-group side-effect of the
+    # watchdog killing a nested exec tree on macOS bash 3.2) must not
+    # take the run down before it lands its timeout feedback. shellm is
+    # a non-interactive CLI (stdin=/dev/null); its intended stop signal
+    # is TERM. Ignore HUP in the main shell; the supervisor traps live
+    # in the backgrounded execute_code subshell and are unaffected.
+    trap '' HUP
     local prompt="$1"
     shift || true
     local context_files=("$@")
