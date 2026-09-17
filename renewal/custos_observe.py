@@ -837,6 +837,9 @@ class Observer:
         self.source("square-outbox", 60, self.outbox)
         from custos_news import drain as drain_news
         self.source("ai-news-review", 60, lambda: drain_news(self))
+        if self.config.get("github_prs", {}).get("enabled"):
+            from custos_github_prs import poll as poll_prs
+            self.source("github-prs", 300, lambda: poll_prs(self))
         self.source("ask-expiry", 3600, self.expire_asks)
         self.source("self-metrics", 86400, self.daily_metrics)
         self.source("square-inbox", 300, self.inbox)
