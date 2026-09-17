@@ -189,6 +189,8 @@ class ChatOutboundTests(ChatFixture):
             plain = self.chat("reply", "--reply-to", UUID_A, self.alice, "just checking in again")
             self.assertNotEqual(plain.returncode, 0)
             self.assertIn("you spoke last", plain.stderr)
+            self.assertRegex(plain.stderr, r"reopens at \d\d:\d\dZ \(in \d+[mh]\)")
+            self.assertIn("do not sleep, loop or poll", plain.stderr)
             self.assertEqual([s["content"] for s in self.outgoing()], ["still there?"])
             delivery = self.chat("reply", "--follow-up", "--reply-to", UUID_A, self.alice, "Built. Here it is.")
             self.assertEqual(delivery.returncode, 0, delivery.stderr)

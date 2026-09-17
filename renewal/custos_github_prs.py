@@ -188,10 +188,16 @@ class Monitor:
                         (before and after and before.get("reactions") != after.get("reactions"))):
                     changes.append(event + (" deleted" if after is None else " added/edited"))
                     evidence.append({"event": event, "before": before, "after": after})
-        review = "review" in entry["roles"] and (old is None or
+        # A review is work only while the PR is open, and an authored PR that is already
+        # closed or merged at initial inventory is a quiet baseline, not a task: on
+        # 2026-09-17 eight of the first eighteen goals were for settled PRs (one merged a
+        # week earlier), costing a third of the day's review inference. After the baseline,
+        # any external change on an authored PR (a comment on a merged one) is feedback.
+        open_pr = latest["state"] == "open"
+        review = "review" in entry["roles"] and open_pr and (old is None or
             (old["pr"]["head"], old["pr"]["base_ref"], old["pr"]["draft"], old["pr"]["body_hash"]) !=
             (latest["head"], latest["base_ref"], latest["draft"], latest["body_hash"]))
-        feedback = "authored" in entry["roles"] and (old is None or bool(changes))
+        feedback = "authored" in entry["roles"] and ((old is None and open_pr) or (old is not None and bool(changes)))
         state.pop("scan", None)
         state["snapshot"] = snapshot
         state["last_success"] = self.now

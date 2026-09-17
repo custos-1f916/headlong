@@ -8,7 +8,7 @@ from unittest.mock import patch
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from custos_observe import Observer, classify_opportunity, import_continuity, record_result
+from custos_observe import Observer, classify_opportunity, housekeep, import_continuity, record_result
 from custos_square import APIError, Square, Store
 
 
@@ -63,6 +63,47 @@ class InboxFixture:
             raise APIError("transport_uncertain")
         self.acks.append(kwargs["body"]["up_to"])
         return {}, None
+
+
+class HousekeepingTests(unittest.TestCase):
+    def test_only_stale_scratch_is_removed_and_big_logs_rotate_by_copy_truncate(self):
+        import os
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); now = 10_000_000
+            tmp, jobs, logs = root / "tmp", root / "jobs", root / "logs"
+            for d in (tmp, jobs, logs):
+                d.mkdir()
+            def make(path, age, content=b"x" * 10, git=False):
+                if path.suffix == ".txt" or path.name.endswith(".log"):
+                    path.write_bytes(content)
+                else:
+                    path.mkdir()
+                    (path / "file").write_bytes(content)
+                    if git:
+                        (path / ".git").mkdir()
+                for p in [path] + list(path.rglob("*")) if path.is_dir() else [path]:
+                    os.utime(p, (now - age, now - age))
+            make(tmp / "pr172", 3 * 86400, git=True)            # stale clone: removed
+            make(tmp / "pr262", 3600, git=True)                 # young clone: kept
+            make(tmp / "notes", 30 * 86400)                     # not a clone: kept
+            make(tmp / "subrun-old.txt", 8 * 86400)             # old report: removed
+            make(tmp / "subrun-new.txt", 60)                    # young report: kept
+            make(jobs / "20260901T000000Z-aaaa", 8 * 86400)     # old sandbox: removed
+            make(jobs / "20260917T000000Z-bbbb", 3600)          # young sandbox: kept
+            make(logs / "monolith.log", 0, content=b"m" * 200)
+            make(logs / "small.log", 0, content=b"s" * 10)
+            report = housekeep(now, tmp=tmp, jobs=jobs, logs=logs, log_bytes=100)
+            self.assertFalse((tmp / "pr172").exists()); self.assertTrue((tmp / "pr262").exists())
+            self.assertTrue((tmp / "notes").exists())
+            self.assertFalse((tmp / "subrun-old.txt").exists()); self.assertTrue((tmp / "subrun-new.txt").exists())
+            self.assertFalse((jobs / "20260901T000000Z-aaaa").exists()); self.assertTrue((jobs / "20260917T000000Z-bbbb").exists())
+            self.assertEqual((logs / "monolith.log").stat().st_size, 0)
+            self.assertEqual((logs / "monolith.log.1").read_bytes(), b"m" * 200)
+            self.assertEqual((logs / "small.log").stat().st_size, 10)
+            self.assertEqual(sorted(Path(p).name for p in report["removed"]), ["20260901T000000Z-aaaa", "pr172", "subrun-old.txt"])
+            self.assertEqual([Path(p).name for p in report["rotated"]], ["monolith.log"])
+            # Missing roots are not an error.
+            self.assertEqual(housekeep(now, tmp=root / "none", jobs=root / "none", logs=None)["removed"], [])
 
 
 class ObservationTests(unittest.TestCase):

@@ -243,6 +243,67 @@ def metrics_text(m, previous=None):
     )
     return line
 
+HOUSEKEEPING_TMP = Path("/tmp")
+HOUSEKEEPING_JOBS = Path("/var/lib/custos-harness/jobs")
+
+
+def housekeep(now, tmp=HOUSEKEEPING_TMP, jobs=HOUSEKEEPING_JOBS, logs=None,
+              clone_age=48 * 3600, job_age=7 * 86400, log_bytes=512 << 20):
+    """Reclaim the disk the mind's own scratch leaves behind, touching nothing young and
+    nothing that is not obviously scratch (2026-09-17: 5 GB gone in nine hours; /tmp held
+    4.7 GB of PR checkouts, 446 sealed job sandboxes held 2 GB, monolith.log was 1.5 GB).
+    Only git checkouts and subrun reports under tmp, sealed job directories older than a
+    week, and oversized run logs are handled. Logs rotate copy-truncate style: the
+    thinkers append with `tee -a`, so a truncated file keeps receiving new lines and the
+    previous contents survive once as NAME.log.1."""
+    import shutil
+    report = {"at": now, "removed": [], "rotated": [], "bytes": 0}
+
+    def size(path):
+        try:
+            return sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) if path.is_dir() else path.stat().st_size
+        except OSError:
+            return 0
+
+    def stale(path, age):
+        try:
+            latest = max([path.stat().st_mtime] + [c.stat().st_mtime for c in path.iterdir()] if path.is_dir() else [path.stat().st_mtime])
+        except OSError:
+            return False
+        return now - latest > age
+
+    for child in sorted(tmp.iterdir()) if tmp.is_dir() else []:
+        try:
+            is_clone = child.is_dir() and not child.is_symlink() and (child / ".git").exists()
+            is_report = child.is_file() and child.name.startswith("subrun-") and child.suffix == ".txt"
+            if (is_clone and stale(child, clone_age)) or (is_report and stale(child, job_age)):
+                report["bytes"] += size(child)
+                shutil.rmtree(child) if child.is_dir() else child.unlink()
+                report["removed"].append(str(child))
+        except OSError:
+            continue
+    for child in sorted(jobs.iterdir()) if jobs.is_dir() else []:
+        try:
+            if child.is_dir() and not child.is_symlink() and stale(child, job_age):
+                report["bytes"] += size(child)
+                shutil.rmtree(child)
+                report["removed"].append(str(child))
+        except OSError:
+            continue
+    for log in sorted(logs.glob("*.log")) if logs and logs.is_dir() else []:
+        try:
+            if log.is_file() and log.stat().st_size > log_bytes:
+                previous = log.with_name(log.name + ".1")
+                report["bytes"] += size(previous) if previous.exists() else 0
+                shutil.copyfile(log, previous)
+                with open(log, "r+b") as handle:
+                    handle.truncate(0)
+                report["rotated"].append(str(log))
+        except OSError:
+            continue
+    return report
+
+
 class Observer:
     def __init__(self, config, store, square, native, now=None):
         self.config, self.store, self.square, self.native = config, store, square, native
@@ -570,6 +631,12 @@ class Observer:
         self.store.put("metrics:latest", metrics)
         self.native.append("metrics:" + day, {"type": "observation", "source": "metrics", "content": metrics_text(metrics, previous)})
 
+    def housekeeping(self):
+        """Every six hours, the bounded scratch cleanup above; the report is a state key
+        (housekeeping:latest), never an observation, so it can never wake the mind."""
+        logs = Path(self.native.path).resolve().parents[2] / "run/logs" if getattr(self.native, "path", None) else None
+        self.store.put("housekeeping:latest", housekeep(self.now, logs=logs))
+
     def expire_asks(self):
         """Deferred asks from other agents that nobody touched for a day are
         declined with evidence and announced to the mind (custos-memory expire-asks)."""
@@ -842,6 +909,7 @@ class Observer:
             self.source("github-prs", 300, lambda: poll_prs(self))
         self.source("ask-expiry", 3600, self.expire_asks)
         self.source("self-metrics", 86400, self.daily_metrics)
+        self.source("housekeeping", 21600, self.housekeeping)
         self.source("square-inbox", 300, self.inbox)
         if self.config.get("forum", {}).get("enabled"):
             self.source("forum-inbox", 300, lambda: self.forum_poll("inbox"))

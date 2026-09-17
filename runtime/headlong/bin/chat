@@ -68,7 +68,7 @@ _DOUBLE_TEXT_JQ='
   | [$m[] | select(((.from == $me and .to == $to) or (.from == $to and .to == $me)) and (reaction | not))] as $conv
   | ($conv | last) as $last
   | if $last != null and $last.from == $me and ($now - ($last | secs)) < ($h * 3600) then
-      "you spoke last in this conversation (\(ago($last | secs; $now)) ago) and nobody has answered. Do not add a second message and do not move the ask to another channel; wait for a reply or \($h)h, or leave it."
+      "you spoke last in this conversation (\(ago($last | secs; $now)) ago) and nobody has answered. The guard reopens at \((($last | secs) + $h * 3600) | todate | .[11:16])Z (in \(ago($now; ($last | secs) + $h * 3600))) unless they answer first. Stage the text in a file and note it on the goal; do not sleep, loop or poll in a wake to wait for it, and do not move the ask to another channel."
     elif $cross != 1 then empty
     else
       ([$m[] | select(.from == $to and .to == $me) | aci | select(. != "")] | last // "") as $to_aci

@@ -904,7 +904,7 @@ class Store:
                 if crecord and crecord["status"] != "active":
                     try:
                         if (now_dt - dt.datetime.fromisoformat(crecord["received_at"])).total_seconds() < 48 * 3600:
-                            completed.append((cfields.get("id"), set(re.findall(r"[a-z0-9]{4,}", crecord["goal"]["outcome"].lower()))))
+                            completed.append((cfields.get("id"),) + duplicate_signature(crecord["goal"]["outcome"]))
                     except ValueError:
                         continue
         for row in goals:
@@ -922,9 +922,9 @@ class Store:
             row["age_hours"] = round(age, 1)
             if age >= stale_hours:
                 row["stale"] = True
-            words = set(re.findall(r"[a-z0-9]{4,}", row["summary"].lower()))
-            for cid, cwords in completed:
-                if words and cwords and len(words & cwords) / len(words | cwords) >= 0.5:
+            words, ids = duplicate_signature(row["summary"])
+            for cid, cwords, cids in completed:
+                if words and cwords and ids == cids and len(words & cwords) / len(words | cwords) >= 0.5:
                     row["possible_duplicate_of"] = cid
                     break
         authority_order = {"operator": 0, "agent": 1, "external": 2}
@@ -941,6 +941,20 @@ class Store:
 def standing_request(origin):
     # These are immutable producer identities, not text supplied by a feed/PR.
     return origin.get('sender') in {'operator:ai-news-review', 'operator:github-pr-review', 'operator:github-pr-feedback'}
+
+
+def duplicate_signature(text):
+    """The tokens that decide whether two asks are the same ask. Operator sources template
+    their outcomes ("Review GitHub PR activity: OWNER/REPO#262", "Review AI news for Hal:
+    TITLE"), so the shared template is dropped and every identifier (#262, v0.34.2-rc3)
+    must match exactly: on 2026-09-17 the prefix alone flagged eleven PR reviews as
+    duplicates of one another and cost three reconciliation wakes."""
+    t = (text or "").lower()
+    t = re.sub(r"^\s*directed request:\s*", "", t)
+    t = re.sub(r"^review [a-z0-9 -]{3,40}:\s*", "", t)
+    words = set(re.findall(r"[a-z0-9]{4,}", t))
+    ids = set(re.findall(r"#\d+|\bv?\d+(?:\.\d+)+(?:-[a-z0-9]+)?\b", t))
+    return words, ids
 
 
 def personal_operator_ask(origin):
@@ -996,6 +1010,13 @@ def message_body(content):
         if tail in body:
             body = body.split(tail, 1)[0]
     return body.strip()
+
+
+def batched_speakers(content):
+    """How many distinct people spoke in this envelope. The bridge batches close-together
+    lines under one verified carrier; each line carries its own {"speaker": ...} tag."""
+    body = content.split("\nMessage:\n", 1)[1] if "\nMessage:\n" in content else ""
+    return len(set(re.findall(r'"speaker":"([^"]+)"', body))) or 1
 
 
 def speaker_of(sender, content):
@@ -1448,7 +1469,9 @@ like to be talked to, what you have discussed, what they asked of you, how they
 relate to Hal. Facts and impressions, no secrets, under 1200 characters. Rewrite
 the full note, keeping what still holds."} The note is about the person you are
 replying to, never about someone they mention; the display name is fixed after
-creation. Do not infer an alias from a later conflicting display proposal:
+creation. When several people's messages arrived together, only the verified
+carrier's own words belong in it; the harness keeps the previous note untouched
+whenever more than one person spoke. Do not infer an alias from a later conflicting display proposal:
 only aliases explicitly supplied in `aliases` are accepted.
 Choosing react or no-reply does not mean there is nothing to remember. When the
 sender explicitly sets or corrects a lasting preference, consent boundary, or
@@ -2182,6 +2205,12 @@ def response(store, payload):
         # The person note is rewritten after delivery so a failed send never
         # records a conversation that did not happen. Idempotent on replay.
         person_id = None
+        if plan.get("person") and batched_speakers(incoming["content"]) > 1:
+            # Several people's lines arrived under one verified carrier: a rewrite would file
+            # everyone's words on the carrier (2026-09-17 01:03Z: Hal's note became Dani's
+            # meal profile, with "Dani" added as his alias). The previous note stands.
+            attempt["person_update_warning"] = "multi_speaker_batch_note_kept_previous"
+            plan = {**plan, "person": None}
         if plan.get("person"):
             try:
                 person_id = people.save(who_key, who, plan["person"], incoming["sender"])

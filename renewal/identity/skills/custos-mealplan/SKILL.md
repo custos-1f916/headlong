@@ -154,7 +154,11 @@ has replied, and how many dinners are drafted). Three scheduled wakes, all 17:00
 - **Staples and extras** (Hal, 2026-09-10: "We always need milk, etc."; that evening: "4 apples and
   5 bananas as staples each week… 2 containers of milk"). Two lists, opposite meanings: **pantry** =
   assumed on hand, skipped when a recipe calls for it (dried spices, seeds and cooking oils are
-  pantry by rule — fresh herbs are not); **staples** = bought every week no matter what is cooked,
+  pantry by rule — fresh herbs are not, and **meat, fish, dairy and fresh produce are never pantry
+  by rule**: they are bought unless this week's `list have` says otherwise. 2026-09-17: the cart
+  message told Dani ground beef, pork and sweet peppers were "already in the pantry" while it bought
+  the shallots and panko she had; if `list build` ever sets a fresh item aside, that is a bug to
+  report, not a fact to repeat); **staples** = bought every week no matter what is cooked,
   **with a count**: `mealplan learn staples "4 apples"`. "Make it 6 bananas" → remove the old line,
   add the new. `mealplan product "apples" ASIN` pins the exact product they want (Organic Honeycrisp,
   Organic Valley whole milk 64 oz…); pinned products are chosen for you every week. A one-off —

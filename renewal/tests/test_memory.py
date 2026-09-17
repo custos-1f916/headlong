@@ -750,6 +750,29 @@ class ResponderTests(MemoryFixture):
         self.assertEqual(len(person_files), 1)
         self.assertIn("good news", cm.People(self.store).find("hal")[2])
 
+    def test_batched_multi_speaker_envelope_keeps_the_carrier_note(self):
+        wrapper = ('Private Signal conversation. Reply only to this conversation.\n'
+                   '{"aci":"fb853ca9-959f-421e-8cbf-94592a2549bf","group":"Collette Haus","scope":"group","speaker":"Hal","timestamp":1}\n'
+                   'Message:\n2 messages arrived close together, oldest first.\n'
+                   '{"category":"to_custos","id":"signal:aa","speaker":"Hal","targets":[]} please provide links\n'
+                   '{"category":"ambient","id":"signal:bb","speaker":"Dani","targets":[]} No cauliflower curry. I do not like it.\n')
+        self.envelope["content"] = wrapper
+        steps = self.steps(); steps[-1] = self.envelope
+        self.log.write_text("\n".join(cm.encode(step) for step in steps) + "\n")
+        self.request["messages"] = [{"role": "user", "content": wrapper}]
+        self.plan = {"reply": "Links coming, curry dropped.", "decision": "reply", "goal": None, "memories": [],
+                     "person": {"aliases": ["Dani"], "notes": "Dislikes cauliflower curry; wants meat in the rotation."}}
+        with mock.patch.object(cm, "run", side_effect=self.model):
+            cm.response(self.store, self.request)
+        self.assertEqual(len(self.outgoing()), 1)
+        self.assertIsNone(cm.People(self.store).find("hal"))
+        self.assertIsNone(cm.People(self.store).find("Dani"))
+        observation = [s for s in self.steps() if s.get("type") == "observation" and s.get("source") == "responder"][-1]
+        self.assertEqual(observation.get("person_update_warning"), "multi_speaker_batch_note_kept_previous")
+        # A single speaker still updates the note as before.
+        self.assertEqual(cm.batched_speakers('x\nMessage:\n{"category":"ambient","id":"signal:cc","speaker":"Dani","targets":[]} hi'), 1)
+        self.assertEqual(cm.batched_speakers("plain text"), 1)
+
     def test_person_key_follows_signal_aci_across_dm_and_group(self):
         dm = ('Private Signal conversation. Reply only to this conversation.\n'
               '{"aci":"FB853CA9-959F-421E-8CBF-94592A2549BF","scope":"direct","speaker":"Hal"}\n'
@@ -1030,6 +1053,28 @@ class ResponderTests(MemoryFixture):
         text_out = cm.context_text(result)
         self.assertIn("Stale asks", text_out); self.assertIn(gid, text_out)
         self.assertIn("Possible duplicates", text_out); self.assertIn(did, text_out)
+
+    def test_templated_operator_asks_are_duplicates_only_when_their_identifiers_match(self):
+        def ask(n, request, text):
+            env = {**self.envelope, "step_id": "trigger-%d" % n, "request_id": request, "content": text}
+            gid = self.store.capture(*cm.envelope_payload(env))["goal_id"]
+            item = self.store.find(gid); rec = item[4]
+            rec["response"] = {"state": "sent", "plan": {"reply": "on it", "decision": "defer", "goal": rec["goal"], "memories": []}}
+            self.store.save(item, rec)
+            return gid
+        done = ask(20, "github-pr:1f916-ai/1f916#172:1", "Review GitHub PR activity: 1f916-ai/1f916#172")
+        self.store.complete({"goal_id": done, "disposition": "completed", "evidence": "reviewed"})
+        other = ask(21, "github-pr:1f916-ai/1f916#262:1", "Review GitHub PR activity: 1f916-ai/1f916#262")
+        same = ask(22, "github-pr:1f916-ai/1f916#172:2", "Review GitHub PR activity: 1f916-ai/1f916#172")
+        news_done = ask(23, "ai-news:1", "Review AI news for Hal: v0.34.2-rc2")
+        self.store.complete({"goal_id": news_done, "disposition": "completed", "evidence": "sent"})
+        news_other = ask(24, "ai-news:2", "Review AI news for Hal: Introducing Astra for Law")
+        news_next = ask(25, "ai-news:3", "Review AI news for Hal: v0.34.2-rc3")
+        rows = {g["goal_id"]: g for g in self.store.context()["goals"]}
+        self.assertNotIn("possible_duplicate_of", rows[other])
+        self.assertEqual(rows[same].get("possible_duplicate_of"), done)
+        self.assertNotIn("possible_duplicate_of", rows[news_other])
+        self.assertNotIn("possible_duplicate_of", rows[news_next])
 
     def test_context_renders_compact_goal_lines_not_records(self):
         gid = self.store.capture(*cm.envelope_payload(self.envelope))["goal_id"]

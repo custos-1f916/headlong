@@ -171,6 +171,23 @@ class PRTests(MemoryFixture):
         self.assertIn("discovery:github_pr_discovery_incomplete", self.state.get(gp.PREFIX+"health")["failures"])
         self.assertNotIn("last_success", self.state.get(gp.PREFIX+"discovery"))
 
+    def test_settled_pr_at_initial_inventory_is_baseline_not_work(self):
+        # Merged authored PR: no goal at inventory; a later external comment is feedback.
+        self.api.pr["state"] = "closed"; self.api.pr["merged"] = True
+        self.scan(); self.assertFalse(self.deliver())
+        self.assertIn("snapshot", self.record()); self.assertNotIn("pending", self.record())
+        self.assertEqual(len(list(self.store.files())), 0)
+        self.api.events["repos/1f916-ai/1f916/issues/1/comments"] = [{"id": 9, "body": "thanks", "user": {"login": "maintainer"}}]
+        self.scan(); self.assertTrue(self.deliver())
+        self.assertTrue(self.state.get(gp.PREFIX+"evidence:github-pr:"+self.key+":1")["summary"]["authored_feedback"])
+    def test_closed_review_only_pr_never_becomes_review_work(self):
+        entry = self.state.get(gp.PREFIX+"inventory")[self.key]
+        entry["roles"] = ["review"]
+        self.api.pr["state"] = "closed"
+        self.monitor.scan(self.key, entry); self.assertFalse(self.monitor.deliver(self.key, entry))
+        self.api.pr["head"]["sha"] = "c"*40
+        self.monitor.scan(self.key, entry); self.assertFalse(self.monitor.deliver(self.key, entry))
+        self.assertEqual(len(list(self.store.files())), 0)
     def test_reaction_on_custos_comment_is_external_feedback(self):
         endpoint = "repos/1f916-ai/1f916/issues/1/comments"
         self.api.events[endpoint] = [{"id": 8, "body": "my comment", "user": {"login": "custos-1f916"}, "reactions": {"total_count": 0}}]
