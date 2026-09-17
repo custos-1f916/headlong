@@ -8,6 +8,7 @@ second goals store. Native custos-memory remains the goals authority.
 """
 import argparse
 import custos_signal_targeting as targeting
+import custos_group_bots as group_bots
 import hashlib
 import json
 import os
@@ -41,8 +42,8 @@ BATCH_KNOBS = ('quiet_seconds', 'max_wait_seconds', 'dm_quiet_seconds', 'dm_max_
 # Bot-to-bot threads (Hal, 2026-09-10): after BOT_TURNS_WRAP text replies to a bot with no human in
 # the thread, Custos is told to wrap up; at BOT_TURNS_EMOJI his text becomes a single reaction; from
 # BOT_TURNS_DIGEST the bot's messages are held and delivered later as one ambient digest.
-BOT_TURNS_WRAP, BOT_TURNS_EMOJI, BOT_TURNS_DIGEST = 4, 5, 6
-BOT_GAP = 7200  # seconds of quiet (or any human message) that ends a bot thread's streak
+BOT_TURNS_WRAP, BOT_TURNS_EMOJI, BOT_TURNS_DIGEST = group_bots.WRAP, group_bots.EMOJI, group_bots.DIGEST
+BOT_GAP = group_bots.GAP  # seconds of quiet (or any human message) that ends a bot thread's streak
 DIGEST_QUIET, DIGEST_MAX_WAIT = 1800, 7200  # the held digest goes when the bot pauses, or at most this late
 ATTACHMENT_UNAVAILABLE = ('[Attachment unavailable to Custos. Do not infer, quote, or describe its contents; '
                           'say that it was unavailable if the answer depends on it.]')
@@ -100,10 +101,12 @@ def is_bot(policy, who):
     return bool(policy['people'].get(who, {}).get('bot'))
 
 
-def bot_turns(db, item, policy):
+def bot_turns(db, item, policy, actions_state=None):
     """How many text replies Custos has sent in this thread to a bot, counting back from now
     until a person speaks or the thread has been quiet for BOT_GAP. Reactions do not count;
     a batch counts once (its carrier holds the reply)."""
+    if item['conversation'].startswith('group:'):
+        return group_bots.state(db, policy, item['conversation'], actions_state)['turns']
     if not is_bot(policy, item['sender_aci']):
         return 0
     rows = db.execute("SELECT id,payload FROM inbox WHERE json_extract(payload,'$.conversation')=? "
@@ -412,6 +415,7 @@ class Spool:
             episode TEXT NOT NULL, request_id TEXT NOT NULL, created REAL NOT NULL,
             UNIQUE(conversation,episode,request_id));
         ''')
+        self.db.execute(group_bots.SCHEMA)
         if 'reaction' not in {row[1] for row in self.db.execute('PRAGMA table_info(outbox)')}:
             self.db.execute('ALTER TABLE outbox ADD COLUMN reaction TEXT')
         for column in ('delivery_kind', 'correction_of'):
@@ -630,7 +634,13 @@ def bot_error_block(db, policy, actions_state, conversation, send_id, request_id
     stays spent across restarts. Changing error text/costs and reactions do
     not reset an episode; a substantive non-error message does.
     """
-    if not conversation.startswith('dm:') or not is_bot(policy, conversation[3:]):
+    if conversation.startswith('dm:'):
+        if not is_bot(policy, conversation[3:]):
+            return None
+    elif conversation.startswith('group:'):
+        if group_bots.human_request(db, policy, conversation, request_id):
+            return None
+    else:
         return None
     rows = db.execute("SELECT id,payload FROM inbox WHERE json_extract(payload,'$.conversation')=? "
                       "ORDER BY json_extract(payload,'$.timestamp') DESC,id DESC", (conversation,)).fetchall()
@@ -640,7 +650,7 @@ def bot_error_block(db, policy, actions_state, conversation, send_id, request_id
         body = str(item.get('body') or '').strip()
         if item.get('reaction') or not body or not re.search(r'[A-Za-z0-9]', body):
             continue
-        if not service_error_signature(body):
+        if not is_bot(policy, item['sender_aci']) or not service_error_signature(body):
             break
         episode.append((row['id'], item))
     ids = {row[0] for row in episode}
@@ -698,10 +708,15 @@ def lane_status(spool, policy, actions_state, conversation, request_id=None):
     db.row_factory = sqlite3.Row
     try:
         reason = bot_error_block(db, policy, actions_state, conversation, '', request_id, reserve=False)
+        thread = group_bots.state(db, policy, conversation, actions_state)
+        if not reason and thread['mode'] in {'emoji_only', 'digest'} and not group_bots.human_request(db, policy, conversation, request_id):
+            reason = 'bot-only group text closed; wait for a human message or a quiet interval'
     finally:
         db.close()
-    return {'blocked': bool(reason), 'reason': reason,
-            'resume_when': 'A new eligible bot input arrives; reactions and renamed requests do not reset an outage.' if reason else None}
+    return {'blocked': bool(reason), 'reason': reason, 'bot_thread': thread,
+            'resume_when': ('A verified human message in this group or a real quiet interval; bot messages, quotes and reactions do not reopen text.'
+                            if reason and reason.startswith('bot-only group') else
+                            'A new eligible bot input arrives; reactions and renamed requests do not reset an outage.' if reason else None)}
 
 
 class Bridge:
@@ -788,6 +803,9 @@ class Bridge:
                 if not blocked:
                     blocked = self.spool.claim_delivery(target, p.get('reply_to'), 'action:' + row['id'],
                         p.get('delivery_kind', 'completion'), p.get('correction_of'), db)
+                if not blocked:
+                    _, blocked = group_bots.claim(self.spool.db, self.policy, target, 'action:' + row['id'],
+                        p.get('reply_to'), self.actions_state, db)
                 if blocked:
                     db.execute("UPDATE actions SET phase='blocked',receipt=? WHERE id=?",
                                (encoded({'error': blocked}), row['id']))
@@ -978,7 +996,11 @@ class Bridge:
                                        (encoded({'suppressed': 'identical bot service error circuit open; waits for non-error input'}),
                                         row['id']))
                 continue
-            turns = bot_turns(db, texts[-1][1], self.policy)
+            turns = bot_turns(db, texts[-1][1], self.policy, self.actions_state)
+            # A batch carrying a real human contribution is not bot-only. Never
+            # bury that human's ask because the carrier happens to be a bot.
+            if any(group_bots.human(self.policy, item['sender_aci']) for _, item in texts[:BATCH_MAX]):
+                turns = 0
             if turns >= BOT_TURNS_DIGEST:
                 arrived = [row['arrived'] or 0.0 for row, item in texts]
                 if now - max(arrived) >= DIGEST_QUIET or now - min(arrived) >= DIGEST_MAX_WAIT:
@@ -1208,6 +1230,15 @@ class Bridge:
                         row['delivery_kind'] or 'completion', row['correction_of'], owned)
                 finally:
                     if owned is not None: owned.close()
+            if not blocked:
+                decision, blocked = group_bots.claim(db, self.policy, item['conversation'],
+                    'outbox:' + row['id'], row['request_id'], self.actions_state,
+                    can_react=not bool(item.get('reaction')))
+                if decision == 'reaction' and not reaction:
+                    reaction, converted = first_emoji(row['content']), True
+                    method = 'sendReaction'
+                    params = {'emoji': reaction, 'targetAuthor': item['sender_aci'],
+                              'targetTimestamp': item['timestamp'], **self.signal_target(item)}
             if blocked:
                 with db:
                     db.execute("UPDATE outbox SET phase='suppressed',receipt=? WHERE id=?",

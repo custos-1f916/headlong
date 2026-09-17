@@ -198,6 +198,10 @@ fi
 # ---------------------------------------------------------------------------
 # ROUTER path — one agentic run over the function menu
 # ---------------------------------------------------------------------------
+# Snapshot BEFORE constructing the goal context so an ask arriving during prompt
+# construction cannot be silently treated as already seen. Empty/failing reads
+# disable checkpoints for this run; the next ordinary wake still sees the asks.
+attention_baseline=$(custos-memory attention 2>/dev/null) || attention_baseline=""
 system_prompt=$(_build_system_prompt) || exit 1
 
 recent_context=""
@@ -280,11 +284,16 @@ if [[ "$MONOLITH_CURIOSITY_EVERY" -gt 0 ]]; then
 ${hints}"
     fi
 fi
-if [[ "$SHARE_HINT_EVERY" -gt 0 && "$wake_mode" == "spontaneous" ]]; then
+_proactive=$(jq -r 'if .proactive == false then "false" else "true" end' "$IDENTITY_DIR/social-policy.json" 2>/dev/null) || _proactive=false
+if [[ "$_proactive" == false ]]; then
+    hints="${hints}- Proactive social contact is disabled in your policy. Requested replies and promised work remain eligible.
+"
+fi
+if [[ "$_proactive" == true && "$SHARE_HINT_EVERY" -gt 0 && "$wake_mode" == "spontaneous" ]]; then
     wakes_since_share_hint=$(( wakes_since_share_hint + 1 ))
     if (( wakes_since_share_hint >= SHARE_HINT_EVERY )); then
         wakes_since_share_hint=0
-        hints="${hints}- It has been a while since you shared anything outward. If recent work or thinking produced something a specific person would genuinely care about, consider **share**. If nothing qualifies, ignore this.
+        hints="${hints}- Optional social invitation: consider **act** to start a conversation, ask a real question, or follow up on something someone cares about; **share** can carry a useful result. Read the person note and recent conversation first. No artifact or progress report is required, no contact is owed, and silence is equally valid.
 "
     fi
 fi
@@ -473,6 +482,7 @@ run_rc=0
 # 2026-09-11 discarded a goal's working position and killed its sub-run).
 run_response=$(SHELLM_NO_BANNER=1 \
     CHAT_DOUBLE_TEXT_GUARD_HOURS="$_mind_guard_hours" \
+    SHELLM_ATTENTION_BASELINE="$attention_baseline" \
     SHELLM_MAINTENANCE_WARN="${SHELLM_MAINTENANCE_WARN:-1}" \
     SHELLM_TRIGGER_STEP_ID="$trigger_step_id" \
     SHELLM_WAKE="$wake_reason" \
@@ -593,3 +603,6 @@ _save_state
 if [[ -n "$run_response" ]]; then
     printf '  [monolith] %s\n' "$(printf '%s' "$run_response" | head -1)"
 fi
+
+# A saved attention handoff must promptly rebuild context.
+[[ "$run_response" != *"Yielded for a fresh human request"* ]] || next_delay=0

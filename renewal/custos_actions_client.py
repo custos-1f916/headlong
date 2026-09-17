@@ -18,6 +18,7 @@ twice. On 2026-09-09 a send that `chat` had refused went out through here
 unrecorded.
 """
 import argparse
+import datetime as dt
 import hashlib
 import http.client
 import json
@@ -84,6 +85,48 @@ def route_for(target):
     return 'signal-' + hashlib.sha256(target.encode()).hexdigest()[:24]
 
 
+def social_guard(route):
+    """Explicit unsolicited intent: same-room + cross-room guard, own policy.
+
+    Requested completions keep their original correlation/guard path. This flag
+    never weakens delivery claims, membership checks, or host bot limits.
+    """
+    policy_path = Path(os.environ['IDENTITY_DIR']) / 'social-policy.json'
+    policy = json.loads(policy_path.read_text())
+    if policy.get('proactive', True) is False:
+        raise ValueError('proactive social contact is disabled in social-policy.json')
+    hours = policy.get('initiate_after_hours', 12)
+    ceiling = policy.get('unsolicited_per_day', 0)
+    if type(hours) is not int or hours < 0 or type(ceiling) is not int or ceiling < 0:
+        raise ValueError('invalid social policy; inspect it before sending')
+    previous = {k: os.environ.get(k) for k in ('CHAT_DOUBLE_TEXT_GUARD_HOURS', 'CHAT_GUARD_CROSS_ROOM')}
+    try:
+        os.environ['CHAT_DOUBLE_TEXT_GUARD_HOURS'] = str(hours)
+        os.environ['CHAT_GUARD_CROSS_ROOM'] = '1'
+        guard(route)
+        if ceiling:
+            root = os.environ.get('ROOT_TRAJ_ID') or os.environ.get('TRAJ_ID')
+            subprocess.run(['chat', 'history', '--with', route, '-n', '1', '--json'], capture_output=True, text=True, timeout=30, check=True)
+            lookup = subprocess.run(['traj', 'path', root or ''], capture_output=True, text=True, timeout=30, check=True)
+            index = Path(lookup.stdout.strip()).parent / 'messages.jsonl'
+            since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)).isoformat()[:19]
+            ids = set()
+            if index.exists():
+                with index.open() as stream:
+                    for line in stream:
+                        row = json.loads(line)
+                        if row.get('social_intent') and row.get('from') == os.environ.get('IDENTITY_NAME', 'custos') and row.get('ts', '')[:19] >= since:
+                            ids.add(row.get('request_id') or row.get('step_id'))
+            if len(ids) >= ceiling:
+                raise ValueError('unsolicited-message allowance reached; silence is available')
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def guard(route):
     """Refuse what `chat` would refuse: the day's allowance, or a double text."""
     blocked = os.environ.get('CHAT_SOCIAL_BLOCKED')
@@ -96,13 +139,15 @@ def guard(route):
             raise ValueError((result.stderr or result.stdout).strip().replace('chat: error: ', '') or 'refused by the conversation guard')
 
 
-def record(route, message, request_id, phase, files=None, reply_to=None):
+def record(route, message, request_id, phase, files=None, reply_to=None, social=False):
     """Append the accepted send to the root trajectory as a message step."""
     root = os.environ.get('ROOT_TRAJ_ID') or os.environ.get('TRAJ_ID')
     if not root:
         return
     step = {'type': 'message', 'from': os.environ.get('IDENTITY_NAME', 'custos'), 'to': route, 'content': message,
             'source': 'custos-actions', 'delivered_by': 'custos-actions', 'request_id': request_id, 'phase': phase}
+    if social:
+        step['social_intent'] = True
     if files:
         step['attachments'] = attachments.metadata(attachments.validate(files))
     if reply_to:
@@ -129,11 +174,12 @@ def main():
     p.add_argument('request_id', nargs='?')
     p.add_argument('--attach', action='append', default=[], metavar='FILE', help='attach a guest file (repeat up to four; 8 MiB total)')
     p.add_argument('--reply-to', metavar='STEP', help='quote a delivered native Signal message (unique step ID/prefix)')
+    p.add_argument('--social', action='store_true', help='unsolicited conversation: honor proactive policy and cross-room silence')
     p.add_argument('--delivery-kind', choices=['acknowledgment', 'completion', 'correction'])
     p.add_argument('--correction-of', help='original submitted outbox:STEP or action:ID')
     args = p.parse_args()
     try:
-        if (args.attach or args.reply_to or args.delivery_kind or args.correction_of) and args.action != 'signal-send':
+        if (args.social or args.attach or args.reply_to or args.delivery_kind or args.correction_of) and args.action != 'signal-send':
             raise ValueError('--attach and --reply-to are for signal-send')
         if args.action in ('signal-lane-status', 'signal-send', 'signal-ask', 'automata-deploy', 'automata-rollback'):
             raw = sys.stdin.buffer.read(32769)
@@ -163,7 +209,11 @@ def main():
                 target = resolve_target(target, contacts.get('destinations') or contacts.get('contacts') or (contacts if isinstance(contacts, list) else []))
             route = route_for(target)
             try:
-                if payload.get('delivery_kind') != 'correction':
+                if args.social:
+                    if args.reply_to or payload.get('reply_to') or payload.get('delivery_kind') or payload.get('correction_of'):
+                        raise ValueError('--social is for unsolicited contact, not a correlated completion or correction')
+                    social_guard(route)
+                elif payload.get('delivery_kind') != 'correction':
                     guard(route)
             except ValueError as refusal:
                 print(json.dumps({'ok': False, 'error': 'not sent: ' + str(refusal), 'request_id': payload['request_id']}))
@@ -186,9 +236,9 @@ def main():
         if ok and route is not None:
             if payload.get('attachments') or reply_step:
                 record(route, payload['message'], payload['request_id'], result.get('phase', 'queued'),
-                       payload.get('attachments'), reply_step)
+                       payload.get('attachments'), reply_step, **({'social': True} if args.social else {}))
             else:
-                record(route, payload['message'], payload['request_id'], result.get('phase', 'queued'))
+                record(route, payload['message'], payload['request_id'], result.get('phase', 'queued'), **({'social': True} if args.social else {}))
         return 0 if ok else 1
     except ValueError as error:
         print(json.dumps({'ok': False, 'error': str(error)[:200]}))

@@ -78,7 +78,7 @@ policy_json='{}'
 if [[ -f "$policy_file" ]]; then
     policy_json=$(jq -c . "$policy_file" 2>/dev/null) || policy_json='{}'
 fi
-if [[ "$(printf '%s' "$policy_json" | jq -r '.proactive // true')" == "false" ]]; then
+if [[ "$(printf '%s' "$policy_json" | jq -r 'if .proactive == false then false else true end')" == "false" ]]; then
     exit 0   # switched off; no re-arm — flipping it back on takes effect on the next responder wake
 fi
 # Cadence is Custos's to tune: the policy file overrides the environment defaults.

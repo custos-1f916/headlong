@@ -807,6 +807,27 @@ class Store:
             with self.lock():
                 self.record_rejections(rejections)
 
+    def attention(self):
+        """Read-only eligibility snapshot; never reconcile, resume, or call a model.
+
+        Only accepted operator conversation asks interrupt a running action. A
+        feed claiming to be urgent in its body cannot gain this priority. Friends'
+        accepted asks still sort ahead of standing feeds at the next wake.
+        """
+        result = []
+        at = dt.datetime.now(dt.timezone.utc)
+        with self.lock():
+            for _, _, _, fields, record in self.files():
+                if not record or record['status'] != 'active' or not is_task(record):
+                    continue
+                origin = record['origin']
+                if not personal_operator_ask(origin) or record.get('waiting'):
+                    continue
+                if record.get('not_before') and gate_time(record['not_before']) > at:
+                    continue
+                result.append(fields['id'])
+        return sorted(result)
+
     def context(self, offset=0, limit=32, directed_only=False):
         if not 0 <= offset or not 1 <= limit <= 100:
             raise MemoryError("invalid context page")
@@ -853,7 +874,7 @@ class Store:
                     pad = record.get("scratchpad") or []
                     checklist = record.get("checklist") or []
                     goals.append({"goal_id": fields["id"], "summary": record["goal"]["outcome"][:240],
-                                  "directed": True, "kind": "task" if is_task(record) else "unanswered",
+                                  "directed": True, "standing": standing_request(origin), "kind": "task" if is_task(record) else "unanswered",
                                   "quick": bool(is_task(record) and is_quick_ask(origin["authority"], message_body(origin.get("content") or ""),
                                                                                   record["goal"]["outcome"], next_action)),
                                   "who": speaker_of(origin["sender"], origin.get("content", "")),
@@ -909,12 +930,24 @@ class Store:
         authority_order = {"operator": 0, "agent": 1, "external": 2}
         # Quick asks (one or two commands) come before long work from the same person: 2026-09-12, four
         # of Dani's grocery asks waited all day behind Hal's research goals.
-        goals.sort(key=lambda row: (not row["directed"], authority_order.get(row.get("authority"), 3),
+        goals.sort(key=lambda row: (not row["directed"], bool(row.get("standing")), authority_order.get(row.get("authority"), 3),
                                     not row.get("quick"), row["received_at"], row["goal_id"]))
         page = goals[offset:offset + limit]
         return {"total": len(goals), "active_directed": sum(row["directed"] for row in goals),
                 "offset": offset, "next_offset": offset + limit if offset + limit < len(goals) else None,
                 "goals": page, "deferred": deferred, "waiting": waiting}
+
+
+def standing_request(origin):
+    # These are immutable producer identities, not text supplied by a feed/PR.
+    return origin.get('sender') in {'operator:ai-news-review', 'operator:github-pr-review', 'operator:github-pr-feedback'}
+
+
+def personal_operator_ask(origin):
+    sender = origin.get('sender', '')
+    return (origin.get('authority') == 'operator' and not origin.get('ambient')
+            and not is_reaction_event(origin.get('content', ''))
+            and (sender.startswith('signal-') or sender.casefold() in {'hal', 'dani', 'operator'}))
 
 
 def is_task(record):
@@ -2305,6 +2338,8 @@ def goal_line(goal):
             tags.append("from " + clip(goal["who"], 32))
         if age is not None:
             tags.append(("%.0fh" % age) if age >= 1 else "new")
+        if goal.get("standing"):
+            tags.append("standing review")
         if goal.get("quick"):
             tags.append("QUICK")
         if goal.get("stale"):
@@ -2450,7 +2485,7 @@ Examples (replace the sample ID and evidence with actual values):
 An acknowledgment alone is not completion. Valid dispositions: completed, declined, abandoned.''')
     parser.add_argument("command", choices=["capture", "capture-envelope", "context", "pending", "show", "update", "complete", "respond",
                                             "replay-unanswered", "archive-conversations", "expire-asks", "note", "check", "wait", "resume", "correction",
-                                            "validate", "person-merge", "person-alias-remove", "person-normalize", "people-context"])
+                                            "validate", "person-merge", "person-alias-remove", "person-normalize", "people-context", "attention"])
     parser.add_argument("goal_id", nargs="?", help="Goal ID for show, update and complete (writes also take JSON on stdin)")
     parser.add_argument("words", nargs="*", help="complete: [completed|declined|abandoned] evidence…; update: the next action")
     parser.add_argument("--json", action="store_true")
@@ -2465,6 +2500,9 @@ An acknowledgment alone is not completion. Valid dispositions: completed, declin
         parser.error("Only show, update, complete, note, check, validate and person repair commands take positional arguments; see --help for examples.")
     try:
         store = Store()
+        if args.command == "attention":
+            print(encode(store.attention()))
+            return
         if args.command == "people-context":
             with store.lock():
                 print(People(store).context())

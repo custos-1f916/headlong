@@ -2696,7 +2696,11 @@ run_loop() {
     local iteration=0
     # Spin/stall guard state (see SHELLM_MAX_*_FAILURES).
     local _consec_fail=0 _repeat_fail=0 _prev_fail_code=""
-    local _maintenance_warned=0
+    local _maintenance_warned=0 _attention_warned=0
+    local _attention_baseline="${SHELLM_ATTENTION_BASELINE:-}" _attention_current="" _attention_new=""
+    # Only the parent consumes this opt-in snapshot. Child shellm/subruns must
+    # finish their atomic command; they do not independently interrupt themselves.
+    unset SHELLM_ATTENTION_BASELINE
     while [[ -z "$SHELLM_MAX_ITERATIONS" || "$iteration" -lt "$SHELLM_MAX_ITERATIONS" ]]; do
         if [[ -f "$SHELLM_MAINTENANCE_FLAG" && "${IDENTITY_NAME:-}" == custos ]]; then
             if [[ "$SHELLM_MAINTENANCE_WARN" == "1" && "$_maintenance_warned" -eq 0 && "$iteration" -gt 0 ]]; then
@@ -2723,6 +2727,29 @@ run_loop() {
                     | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
                 printf 'Yielded for harness maintenance; unfinished work remains active.\n'
                 return 0
+            fi
+        fi
+        if [[ "${IDENTITY_NAME:-}" == custos && -n "$_attention_baseline" && "$_maintenance_warned" -eq 0 && "$iteration" -gt 0 ]]; then
+            if [[ "$_attention_warned" -eq 1 ]]; then
+                # Do not kill detached work at a social checkpoint. Existing
+                # Custos policy forbids detached model helpers, but fail safely.
+                if [[ -z "$(_shellm_live_subruns)" ]]; then
+                    printf '%s' "$(jq -nc --arg run_id "$_run_step_id" --arg goals "$_attention_new" \
+                        '{type:"attention-handoff",source:"monolith",run_id:$run_id,content:("Saved-step handoff for fresh human request(s): " + $goals + ". Prior work remains active; consult this run and its scratchpad.")}')" \
+                        | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
+                    printf 'Yielded for a fresh human request; prior work remains active.\n'
+                    return 0
+                fi
+            else
+                _attention_current=$(custos-memory attention 2>/dev/null) || _attention_current=""
+                _attention_new=$(jq -nr --argjson before "$_attention_baseline" --argjson after "${_attention_current:-null}" \
+                    'if ($before|type)=="array" and ($after|type)=="array" then ($after-$before)|join(", ") else "" end' 2>/dev/null) || _attention_new=""
+                if [[ -n "$_attention_new" ]]; then
+                    _attention_warned=1
+                    printf '%s' "$(jq -nc --arg run_id "$_run_step_id" --arg goals "$_attention_new" \
+                        '{type:"feedback",run_id:$run_id,content:("[attention checkpoint] Fresh accepted human request(s): " + $goals + ". After this completed tool step, use your NEXT block only to save your active goal scratchpad with files, evidence and exact next command (custos-memory note GOAL_ID ...), or record a durable thought if no goal. Then finish. The run yields after that block so the next wake can choose the human ask. Do not begin another long operation or send a holding reply; the responder owns that. Prior work stays active.")}')" \
+                        | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
+                fi
             fi
         fi
         iteration=$((iteration + 1))
@@ -3208,6 +3235,7 @@ exit \$__shellm_rc
                 --arg run_id "$_run_step_id" \
                 '{type:"final", content:$content, run_id:$run_id}')" \
                 | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
+            [[ "$_attention_warned" -eq 0 ]] || printf 'Yielded for a fresh human request; checkpoint saved below.\n'
             redact_sensitive "$final_answer"
             _consec_fail=0; _repeat_fail=0; _prev_fail_code=""
             [[ "$QUIET" -eq 0 ]] && echo >&2
