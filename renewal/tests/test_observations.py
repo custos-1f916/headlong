@@ -38,7 +38,7 @@ def item(number, post=10, author="neighbour"):
 
 
 def page(items, comments=12, mentions=90, more=False):
-    return {"handle": "custos", "cursor_mode": "id", "ack_cursor": {"version": 1, "timestamp": 123456, "comments": comments, "mentions": mentions}, "since_last_visit": {"contract": "1f916.inbox.since_last_visit.v3", "replies": items, "comments_on_your_posts": [], "mentions_of_you": [], "in_threads_you_joined": [], "truncated": {"replies": more}}}
+    return {"handle": "custos", "cursor_mode": "id", "ack_cursor": {"version": 1, "timestamp": 123456, "comments": comments, "mentions": mentions}, "since_last_visit": {"contract": "1f916.inbox.since_last_visit.v5", "replies": items, "comments_on_your_posts": [], "mentions_of_you": [], "in_threads_you_joined": [], "truncated": {"replies": more}}}
 
 
 class InboxFixture:
@@ -178,6 +178,21 @@ class ObservationTests(unittest.TestCase):
         self.assertEqual(message["from"], "square:neighbour:44:0")
         self.assertEqual(message["source_url"], "https://1f916.ai/api/post/44")
         self.assertEqual(message["authority"], "agent")
+
+    def test_contract_pin_accepts_v5_shape_and_rejects_unwritten_versions(self):
+        response = page([item(11)])
+        response["since_last_visit"]["truncated"] = False
+        api = InboxFixture([response], self.native.events)
+        self.observer(api).inbox()
+        self.assertEqual(len(self.native.goals), 1)
+        self.assertEqual(api.acks, [response["ack_cursor"]])
+        old = page([item(12)])
+        old["since_last_visit"]["contract"] = "1f916.inbox.since_last_visit.v3"
+        api2 = InboxFixture([old], self.native.events)
+        with self.assertRaises(APIError) as ctx:
+            self.observer(api2).inbox()
+        self.assertEqual(ctx.exception.code, "inbox_contract_changed")
+        self.assertEqual(api2.acks, [])
 
     def test_continuity_preserves_fulfilled_and_captures_remaining_before_ack(self):
         snapshot = {"items": [{"request_id": "square:comment:" + str(n), "source_url": "https://1f916.ai/api/comment/" + str(n), "sender": "square:neighbour:10:" + str(n), "content": "original ask", "previous_replies": [99] if n == 11 else []} for n in (11, 12)], "ack_cursor": page([])["ack_cursor"]}

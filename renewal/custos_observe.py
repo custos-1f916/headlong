@@ -408,7 +408,7 @@ class Observer:
                 note_allowance(self.store, page)
             buckets = page["since_last_visit"]
             cursor = page.get("ack_cursor")
-            if page.get("cursor_mode") != "id" or buckets.get("contract") != "1f916.inbox.since_last_visit.v3":
+            if page.get("cursor_mode") != "id" or buckets.get("contract") != "1f916.inbox.since_last_visit.v5":
                 raise APIError("inbox_contract_changed")
             cursor_fields = {"version", "timestamp", "comments", "mentions"}
             if (not isinstance(cursor, dict) or not cursor_fields <= set(cursor)
