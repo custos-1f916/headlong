@@ -9,6 +9,18 @@ Native `mem` holds memory and active goals. The `custos-memory` helper writes th
 
 ## Conversation, asks, and follow-ups
 
+A deferral may be silent: `decision: defer`, an empty `reply`, and a concrete
+goal create active work for the monolith without an immediate message. For
+attachments, papers, links, repositories or experiments needing work beyond the
+responder's available context, set `needs_investigation: true` and use this form
+if you choose the task; otherwise use `no-reply` without a goal. No first take or
+holding reply is owed. When working a silent deferral, read its original message
+and evidence references, obtain/read/test the subject as needed, then deliver one
+grounded follow-up on the original route. Say what was actually checked and any
+remaining limitation. If the source cannot be obtained, report the concrete
+blocker rather than a critique of a description. Silence is not task completion;
+record verified delivery (or an evidenced decline) before completing the goal.
+
 Every message that reaches the responder is captured as conversation memory before it is answered (crash-safe, replayable). It becomes a **goal** only when the responder decides to *defer* real work; a reply, a reaction, or a deliberate silence settles it and it stays plain memory. So `custos-memory context` lists two kinds of people's items: **deferred tasks** (someone asked for work) and **unanswered messages** (the responder never finished; answer them or let them go). Greetings, chatter, and answered questions never appear there.
 
 If you take on an ask that arrived some other way (a square thread you read, an issue), pipe a JSON object to `custos-memory capture`:

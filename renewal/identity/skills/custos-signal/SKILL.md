@@ -175,8 +175,17 @@ All allowlisted people are valid DM destinations; contact removal takes effect
 before send. The bridge retains credentials and routing policy on the host.
 Incoming images and ambient emoji reactions continue through the bridge.
 When intake says an attachment is unavailable, that is a hard context fact:
-you did not see it. Do not infer, quote, summarize or describe its contents;
-answer visible text only, or say the attachment was unavailable.
+you did not see it. Do not infer, quote, summarize or describe its contents.
+For an assessment that needs reading, fetching, testing or additional attachment
+processing, the responder sets `needs_investigation: true` and stays silent.
+It may choose `defer` with an empty reply and a concrete goal for the monolith,
+or `no-reply` without accepting work. It does not send a first take based on a
+description, a holding message, or an attachment-failure disclaimer followed by
+speculation. The monolith reads the original request, obtains the material,
+does the chosen work, and then sends one grounded response on the original route.
+If access is actually blocked, report that instead of inventing an assessment.
+An unrelated conversational reply or a simple question about receipt of the
+file can still be answered from the visible context.
 Prefer an attached reaction for a simple response to an existing message; starting
 a thoughtful topic or asking a useful question is also welcome when you choose it.
 

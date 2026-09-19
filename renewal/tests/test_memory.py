@@ -418,6 +418,110 @@ class ResponderTests(MemoryFixture):
     def outgoing(self):
         return [step for step in self.steps() if step.get("type") == "message" and step.get("from") == "custos"]
 
+
+    def test_silent_defer_replays_once_and_delivers_only_the_later_result(self):
+        self.plan['reply']=''
+        with mock.patch.object(cm,'run',side_effect=self.model):
+            receipt=cm.response(self.store,self.request)
+            cm.response(self.store,self.request)
+        self.assertEqual(self.model_calls,1)
+        self.assertEqual(self.outgoing(),[])
+        self.assertEqual(receipt['decision'],'no-reply')
+        record=self.store.find(receipt['goal_id'])[4]
+        self.assertEqual(record['status'],'active')
+        self.assertTrue(cm.is_task(record))
+        self.assertEqual(self.store.context()['active_directed'],1)
+        self.assertEqual(sum(s.get('request_id','').startswith('custos-defer:') for s in self.steps()),1)
+        pending=json.loads(self.real_run(['chat','pending','--json']))
+        self.assertTrue(any(row.get('trigger_step')=='trigger-1' for row in pending))
+        self.real_run(['chat','reply','--follow-up','--reply-to','trigger-1','hal'],
+                      'Read the primary artifact and ran the check: result A, limitation B.')
+        self.assertEqual(len(self.outgoing()),1)
+        self.assertEqual(self.outgoing()[0]['reply_to'],'trigger-1')
+        self.assertEqual(self.outgoing()[0]['delivery_kind'],'completion')
+        self.store.complete({'goal_id':receipt['goal_id'],'disposition':'completed',
+                             'evidence':'Verified result delivered in the follow-up to trigger-1.'})
+        self.assertEqual(json.loads(self.real_run(['chat','pending','--json'])),[])
+        self.assertEqual(self.store.context()['active_directed'],0)
+
+    def test_investigation_flag_suppresses_preliminary_take_but_keeps_chosen_work(self):
+        self.envelope['content']='Please assess the paper. [Attachment unavailable to Custos. The HTML was not delivered.]'
+        self.log.write_text(cm.encode(self.envelope)+'\n')
+        self.request['messages']=[{'role':'user','content':self.envelope['content']}]
+        self.plan.update(needs_investigation=True,
+                         reply="Working from your description, the re-press result proves the drive; test comfort instead.")
+        self.plan['goal']['next_action']='Obtain the primary HTML, read the methods and inspect the experiment before assessing it.'
+        self.plan['memories']=[{'type':'fact','content':'The unread experiment proves the drive.'}]
+        with mock.patch.object(cm,'run',side_effect=self.model):
+            receipt=cm.response(self.store,self.request)
+        self.assertEqual(self.model_calls,1)
+        self.assertEqual(self.outgoing(),[])
+        self.assertTrue(cm.is_task(self.store.find(receipt['goal_id'])[4]))
+        self.assertIn('Obtain the primary HTML',self.store.find(receipt['goal_id'])[4]['goal']['next_action'])
+        self.assertFalse(any(f.get('type')=='fact' for _,_,_,f,_ in self.store.files()))
+        self.assertTrue(self.steps()[-1]['silent_defer'])
+        self.assertTrue(self.steps()[-1]['needs_investigation'])
+
+    def test_investigation_without_acceptance_is_silent_and_creates_no_task(self):
+        self.ambient()
+        self.plan={'reply':'An unread paper proves the result.','decision':'reply','goal':None,
+                   'needs_investigation':True,'memories':[]}
+        with mock.patch.object(cm,'run',side_effect=self.model):
+            cm.response(self.store,self.request);cm.response(self.store,self.request)
+        self.assertEqual(self.model_calls,1)
+        self.assertEqual(self.outgoing(),[])
+        self.assertEqual(self.store.context()['active_directed'],0)
+        self.assertFalse(any(s.get('request_id','').startswith('custos-defer:') for s in self.steps()))
+
+    def test_silent_defer_crash_after_action_recovers_without_duplicate_or_ack(self):
+        self.plan['reply']='';self.plan['needs_investigation']=True
+        real_append=cm.append_step
+        failed=False
+        def uncertain(step):
+            nonlocal failed
+            result=real_append(step)
+            if step.get('request_id','').startswith('custos-defer:') and not failed:
+                failed=True
+                raise cm.MemoryError('injected after durable handoff')
+            return result
+        with mock.patch.object(cm,'run',side_effect=self.model), mock.patch.object(cm,'append_step',side_effect=uncertain):
+            with self.assertRaises(cm.ResponseFailure):cm.response(self.store,self.request)
+        item=self.store.request('operator:42');item[4]['responder_attempt']['retry_at']=0
+        self.store.save(item,item[4])
+        with mock.patch.object(cm,'run',side_effect=self.model):cm.response(self.store,self.request)
+        self.assertEqual(self.model_calls,1)
+        self.assertEqual(self.outgoing(),[])
+        self.assertEqual(sum(s.get('request_id','').startswith('custos-defer:') for s in self.steps()),1)
+        self.assertEqual(self.store.context()['active_directed'],1)
+
+    def test_silent_scope_choice_preserves_signal_targeting_boundaries(self):
+        eligible='signal:'+'a'*64;other='signal:'+'b'*64
+        routing={'version':1,'items':[
+            {'id':eligible,'targets':[],'category':'ambient','unresolved':0},
+            {'id':other,'targets':[],'category':'to_others','unresolved':0}], 'eligible':[eligible]}
+        self.envelope['signal_routing']=routing
+        self.log.write_text(cm.encode(self.envelope)+'\n')
+        self.plan.update(needs_investigation=True,reply='',reply_to_items=[eligible])
+        with mock.patch.object(cm,'run',side_effect=self.model):cm.response(self.store,self.request)
+        rec=self.store.request('operator:42')[4]
+        self.assertEqual(rec['response']['plan']['reply_to_items'],[eligible])
+        self.assertEqual(rec['origin']['signal_routing'],routing)
+        self.assertEqual(self.outgoing(),[])
+        with self.assertRaises(cm.InvalidInput):
+            cm.validate_plan(cm.encode({**self.plan,'reply_to_items':[other]}),signal_routing=routing)
+        meta={}
+        plan=cm.validate_plan(cm.encode({**self.plan,'decision':'reply','reply':'An unsupported take.','goal':None}),
+                              signal_routing=routing,metadata=meta)
+        self.assertEqual(plan['decision'],'no-reply');self.assertEqual(meta['reply_to_items'],[])
+
+    def test_silence_does_not_relax_missing_goal_or_ordinary_reply_validation(self):
+        for plan in [dict(self.plan,reply='',goal=None),
+                     dict(self.plan,reply='',decision='reply',goal=None),
+                     dict(self.plan,needs_investigation='false')]:
+            with self.subTest(plan=plan), self.assertRaises(cm.MemoryError):cm.validate_plan(cm.encode(plan))
+        normal={'reply':'Glad it worked.','decision':'reply','goal':None,'needs_investigation':False,'memories':[]}
+        self.assertEqual(cm.validate_plan(cm.encode(normal))['reply'],normal['reply'])
+
     def test_responder_uses_medium_effort_by_default_and_outlives_inference_deadlines(self):
         def checked(argv, *args, **kwargs):
             if argv[0] == "llm":
