@@ -61,6 +61,15 @@ Deployment is asynchronous. Once accepted, finish the current atomic operation; 
 host supervisor can drain the mind. Do not poll forever inside a model tool call.
 Inspect status on the next wake. A repeated request returns the original operation.
 
+When that next wake finds the request committed, tell Hal on Signal, once, in his DM:
+what changed and why in two plain sentences, the new artifact's first eight characters,
+the request ID, and the previous artifact for rollback. Send it with
+`custos-actions signal-send` (target `Hal`, request ID `deploy-notice-` followed by the
+deploy request ID, so a retry can never send it twice), not through the operator chat
+channel (Hal, 2026-09-18: "he should text me on Signal"). A rollback gets the same
+text. It is a notice, not a request for approval: the authority above already covers
+the release.
+
 The supervisor retains the exact artifact externally, drains writers, checkpoints
 state, switches code, and checks fresh successful model/tool progress plus service health. It
 restores previous code after failure or interrupted promotion without rewinding

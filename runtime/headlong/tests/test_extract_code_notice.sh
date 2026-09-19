@@ -141,5 +141,24 @@ result=$(bash -c "$(SHELLM_AUTOCORRECT="costos=custos" extract_code $'```bash\ne
 [[ "$result" == "/opt/custos/x" ]] && grep -q 'autocorrected' /tmp/notice.$$ && ok "the corrected script runs and the notice lands on stderr" || bad "corrected script runs" "$result / $(cat /tmp/notice.$$)"
 rm -f /tmp/notice.$$
 
+# --- SHELLM_RUN_ALL_BLOCKS: every complete block runs, in order ------------------
+# Custos 2026-09-18: 85 of 2,172 steps carried a second block that the first-block
+# rule dropped. With run-all, complete blocks run in order as one script; a later
+# block cut off by the transport is dropped with a notice, never run half-way.
+two=$'first\n```bash\necho one\n```\nthen\n```bash\necho two\n```'
+out=$(SHELLM_RUN_ALL_BLOCKS=1 extract_code "$two")
+[[ "$(bash -c "$out" 2>/dev/null)" == $'one\ntwo' ]] && ok "run-all: both blocks run in order" || bad "run-all: both blocks run in order" "$out"
+grep -q 'truncated after first' <<<"$out" && bad "run-all: no truncation notice" "$out" || ok "run-all: no truncation notice"
+out=$(SHELLM_RUN_ALL_BLOCKS=0 extract_code "$two")
+[[ "$(bash -c "$out" 2>/dev/null)" == "one" ]] && grep -q 'truncated after first' <<<"$out" && ok "default: first block only, with the notice" || bad "default: first block only, with the notice" "$out"
+cut=$'```bash\necho one\n```\n```bash\necho partial'
+out=$(SHELLM_RUN_ALL_BLOCKS=1 extract_code "$cut")
+ran=$(bash -c "$out" 2>/tmp/notice.$$)
+[[ "$ran" == "one" ]] && grep -q 'cut off before its closing fence' /tmp/notice.$$ && ok "run-all: an unclosed later block is dropped with a notice" || bad "run-all: an unclosed later block is dropped with a notice" "$out / $(cat /tmp/notice.$$)"
+rm -f /tmp/notice.$$
+three=$'```bash\ncat <<\'EOT\'\n```\nEOT\n```\n```bash\necho after\n```'
+out=$(SHELLM_RUN_ALL_BLOCKS=1 extract_code "$three")
+[[ "$(bash -c "$out" 2>/dev/null)" == $'```\nafter' ]] && ok "run-all: heredoc fences inside a block do not split it" || bad "run-all: heredoc fences inside a block do not split it" "$out"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

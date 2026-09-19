@@ -77,3 +77,15 @@ uncertain, retain an explicit delivery blocker rather than sending again.
 Record the confirmed review/comment URL. Complete the native goal with report
 path, reviewed SHA, dispositions and any actual publication receipt. Notification
 to Hal is not required for every review; use normal relevance judgment.
+
+## Checkouts
+
+One clone per repository, reused across reviews: `/opt/custos/work/repos/OWNER/REPO`
+(`git fetch origin pull/NUMBER/head`). Put the PR head in a worktree named for the PR,
+`git worktree add /tmp/pr-NUMBER FETCH_HEAD`, and reuse it when it already exists
+(`git worktree list`). Do not clone the repository again for a review, and run a test
+suite once per head, not once per question. Before `custos-memory complete` on the
+review goal, remove the worktree:
+`git -C /opt/custos/work/repos/OWNER/REPO worktree remove --force /tmp/pr-NUMBER`.
+Housekeeping removes the checkouts of closed or merged PRs as a backstop (2026-09-18:
+2.4 GB of settled-PR checkouts under /tmp, a 509 MB worktree for a one-file fix).

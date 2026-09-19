@@ -23,6 +23,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 MAX_INPUT = 16384
 MAX_MESSAGE = 12000
 ACTIONS = os.environ.get("CUSTOS_ACTIONS", "custos-actions")
+MEMORY = os.environ.get("CUSTOS_MEMORY", "custos-memory")
+PARK_GRACE = 900  # seconds past the deadline before a parked goal is rechecked anyway
 
 
 class ReminderError(ValueError):
@@ -115,6 +117,43 @@ def actions_call(arguments, payload=None, timeout=50):
     return process.returncode, result
 
 
+def memory_call(arguments, payload, timeout=30):
+    """Best-effort native goal bookkeeping through custos-memory. A failure here never
+    fails a reminder: the reminder is the durable thing, the goal state is a courtesy."""
+    try:
+        process = subprocess.run([MEMORY, *arguments], input=json.dumps(payload, ensure_ascii=False),
+                                 text=True, capture_output=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, type(exc).__name__
+    if process.returncode:
+        return False, (process.stderr or process.stdout or "custos-memory failed")[:300]
+    return True, (process.stdout or "")[:300]
+
+
+def park_goal(goal_id, reminder_id, local_at, due):
+    """A scheduled reminder needs no wake until its receipt, so park the linked goal as
+    waiting: QUICK/OVERDUE routing then stops re-verifying it (2026-09-18: three wakes
+    re-checked one parked reminder). The wait ends on the person's reply, on the
+    dispatcher's resume at submission, or PARK_GRACE after the deadline as a fallback."""
+    check_at = datetime.fromtimestamp(due.timestamp() + PARK_GRACE, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ok, detail = memory_call(["wait"], {"goal_id": goal_id, "check_at": check_at,
+        "reason": "Reminder " + reminder_id + " is scheduled for " + local_at
+                  + "; delivery is deterministic (custos-reminders dispatch), nothing to verify until its receipt"})
+    return {"ok": ok, "detail": detail}
+
+
+def resume_goal(row, phase, result, stamp):
+    """Signal accepted the reminder: wake the parked goal once with the receipt so the
+    next wake can complete it. A goal that is not waiting is left alone."""
+    if phase != "submitted" or row["phase"] == "submitted" or not row["goal_id"]:
+        return
+    when = datetime.fromtimestamp(stamp, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    memory_call(["resume"], {"goal_id": row["goal_id"],
+        "evidence": "Reminder " + row["id"] + " submitted to " + row["target_label"] + " at " + when
+                    + " (request " + row["request_id"] + "); read custos-reminders status " + row["id"]
+                    + " for the receipt, then complete the goal"})
+
+
 def resolve_target(label):
     if not isinstance(label, str) or not label.strip() or len(label) > 128:
         raise ReminderError("target must be a Signal contact label")
@@ -161,7 +200,10 @@ def schedule(payload, path=None, now=None):
                 (reminder_id, due.timestamp(), local_at, payload.get("timezone"), target, target_label,
                  message, goal_id, request_id, created, created))
             row = db.execute("SELECT * FROM reminders WHERE id=?", (reminder_id,)).fetchone()
-        return public(row, created=True)
+        result = public(row, created=True)
+        if goal_id:
+            result["parked"] = park_goal(goal_id, reminder_id, local_at, due)
+        return result
     finally:
         db.close()
 
@@ -208,6 +250,7 @@ def dispatch(path=None, now=None, limit=16):
             if known:
                 with db:
                     set_result(db, row, known, status, now=stamp)
+                resume_goal(row, known, status, stamp)
                 report[known] += 1
                 continue
             if row["phase"] == "queued":
@@ -221,6 +264,7 @@ def dispatch(path=None, now=None, limit=16):
             phase = phase_from(result) if code == 0 and result.get("ok") else "retry"
             with db:
                 set_result(db, row, phase, result, attempted=True, now=stamp)
+            resume_goal(row, phase, result, stamp)
             report[phase] += 1
         return report
     finally:

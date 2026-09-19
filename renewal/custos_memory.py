@@ -2113,12 +2113,36 @@ def response(store, payload):
                 from custos_dream import write_json
                 proposal_dir = store.directory.parent / "dream" / "person-proposals"
                 proposal_id = hashlib.sha256((goal_id + attempt["person_candidate"]).encode()).hexdigest()[:24]
+                proposal_path = proposal_dir / (proposal_id + ".json")
                 try:
-                    write_json(proposal_dir / (proposal_id + ".json"), {
+                    write_json(proposal_path, {
                         "goal_id": goal_id, "trigger": trigger, "person_key": who_key,
                         "at": now(), "status": "unverified-candidate", "notes": attempt.pop("person_candidate")})
                 except OSError:
                     attempt["person_update_warning"] = "oversized_note_candidate_save_failed_previous_kept"
+                else:
+                    # The dream reviews proposals days later and edited none of them; the
+                    # facts in a dropped candidate (Dani's grocery rules, 2026-09-18) belong
+                    # in the note now. Hand the merge to the monolith as a small deferred
+                    # task: it has the full note, `mem edit`, and the cap.
+                    try:
+                        handoff = store.capture({
+                            "request_id": "person-note:" + proposal_id, "sender": "operator:person-note",
+                            "authority": "operator", "source_url": "",
+                            "content": "The responder's person-note update for " + who_key + " exceeded "
+                                       + str(PERSON_NOTE_MAX) + " characters and was kept as a proposal at "
+                                       + str(proposal_path) + "; the previous note is unchanged.",
+                            "outcome": "The person note for " + who_key + " carries the new facts from proposal " + proposal_id,
+                            "next_action": "Read " + str(proposal_path) + " and `mem show` the person note for " + who_key
+                                           + " (custos-memory people-context). `mem edit` the note so it keeps display, aliases and"
+                                           + " routes and includes the candidate's new facts within " + str(PERSON_NOTE_MAX)
+                                           + " characters: drop the oldest dated paragraph first, never the lead paragraph."
+                                           + " Then custos-memory complete with the note id.",
+                            "completion": "The note carries the candidate's new facts within the cap, or an evidence-backed"
+                                          " decision that the candidate held nothing new"}, deferred=True)
+                        attempt["person_task"] = handoff.get("goal_id")
+                    except (MemoryError, InvalidInput, OSError) as exc:
+                        attempt["person_task_warning"] = type(exc).__name__
             if incoming.get("ambient") and plan["goal"] is not None and plan["decision"] != "defer":
                 raise InvalidInput("ambient task requires explicit defer decision")
             attempt["stage"] = "prepare"
@@ -2129,7 +2153,8 @@ def response(store, payload):
                     raise MemoryError("goal retired during composition; reconcile before reply")
                 record["response"] = {"state": "prepared", "plan": plan, "at": now(),
                                       "format": attempt.get("format", "envelope"), "repaired": attempt.get("repaired", False),
-                                      "person_update_warning": attempt.get("person_update_warning")}
+                                      "person_update_warning": attempt.get("person_update_warning"),
+                                      "person_task": attempt.get("person_task")}
                 store.save(item, record)
         else:
             plan = saved["plan"]

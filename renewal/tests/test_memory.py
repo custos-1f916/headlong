@@ -852,6 +852,11 @@ class ResponderTests(MemoryFixture):
         self.assertEqual(len(proposals),1)
         self.assertEqual(json.loads(proposals[0].read_text())["notes"],notes)
         self.assertTrue(any(x.get("person_update_warning")=="oversized_note_kept_previous" for x in self.steps()))
+        # The candidate is also a deferred task for the monolith, pointing at the proposal file.
+        goals=[i for i in self.store.files() if i[3].get("type")=="goal"]
+        self.assertEqual(len(goals),1)
+        body=goals[0][0].read_text()
+        self.assertIn("person-proposals",body); self.assertIn("mem edit",body); self.assertIn("person-note:",body)
 
     def test_person_display_is_fixed_after_creation(self):
         self.plan = {"reply": "Hi.", "decision": "reply", "goal": None, "memories": [],

@@ -86,6 +86,42 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual(result["submitted"], 1)
         self.assertEqual(len([call for call in calls if call[0] == ["signal-send"]]), 1)
 
+    def test_schedule_parks_the_goal_and_dispatch_resumes_it(self):
+        memory = []
+        def mem(arguments, payload, timeout=30):
+            memory.append((arguments, payload)); return True, "ok"
+        with patch.object(cr, "actions_call", return_value=(0, CONTACTS)), patch.object(cr, "memory_call", side_effect=mem):
+            reminder = cr.schedule(self.payload(), self.state, self.now)
+        self.assertTrue(reminder["parked"]["ok"])
+        self.assertEqual(memory[0][0], ["wait"])
+        self.assertEqual(memory[0][1]["goal_id"], "0123abcd")
+        self.assertEqual(memory[0][1]["check_at"], "2026-09-15T12:30:00Z")
+        self.assertIn(reminder["id"], memory[0][1]["reason"])
+        # A reminder without a goal has nothing to park.
+        memory.clear()
+        bare = {k: v for k, v in self.payload().items() if k != "goal_id"}; bare["message"] = "other"
+        with patch.object(cr, "actions_call", return_value=(0, CONTACTS)), patch.object(cr, "memory_call", side_effect=mem):
+            self.assertNotIn("parked", cr.schedule(bare, self.state, self.now))
+        self.assertEqual(memory, [])
+        # Submission resumes the goal exactly once, with the request ID as evidence.
+        def action(arguments, payload=None, timeout=50):
+            if arguments == ["signal-contacts"]:
+                return 0, CONTACTS
+            if arguments[0] == "status":
+                return 1, {"ok": False, "error": "unknown request"}
+            return 0, {"ok": True, "phase": "submitted", "request_id": payload["request_id"]}
+        with patch.object(cr, "actions_call", side_effect=action), patch.object(cr, "memory_call", side_effect=mem):
+            cr.dispatch(self.state, datetime(2026, 9, 15, 12, 15, 0, tzinfo=timezone.utc).timestamp())
+            cr.dispatch(self.state, datetime(2026, 9, 15, 12, 16, 0, tzinfo=timezone.utc).timestamp())
+        resumes = [m for m in memory if m[0] == ["resume"]]
+        self.assertEqual(len(resumes), 1)
+        self.assertEqual(resumes[0][1]["goal_id"], "0123abcd")
+        self.assertIn(reminder["request_id"], resumes[0][1]["evidence"])
+        # A failing custos-memory never fails the schedule.
+        third = {**self.payload(), "message": "third"}
+        with patch.object(cr, "actions_call", return_value=(0, CONTACTS)), patch.object(cr, "memory_call", return_value=(False, "boom")):
+            self.assertFalse(cr.schedule(third, self.state, self.now)["parked"]["ok"])
+
     def test_cancel_stops_a_pending_reminder(self):
         with patch.object(cr, "actions_call", return_value=(0, CONTACTS)):
             reminder = cr.schedule(self.payload(), self.state, self.now)

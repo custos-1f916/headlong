@@ -92,18 +92,42 @@ class HousekeepingTests(unittest.TestCase):
             make(jobs / "20260917T000000Z-bbbb", 3600)          # young sandbox: kept
             make(logs / "monolith.log", 0, content=b"m" * 200)
             make(logs / "small.log", 0, content=b"s" * 10)
-            report = housekeep(now, tmp=tmp, jobs=jobs, logs=logs, log_bytes=100)
+            make(tmp / "pr300-wt", 3600, git=True)              # young, but its PR is settled: removed
+            (tmp / "pr301-wt").mkdir(); (tmp / "pr301-wt" / ".git").write_text("gitdir: elsewhere")  # a worktree: removed
+            (logs / "social.log.1").write_bytes(b"s" * 50)      # leftover plain rotation: compressed
+            report = housekeep(now, tmp=tmp, jobs=jobs, logs=logs, log_bytes=100, settled={"300", 301}, clones=root / "none")
+            import gzip
+            self.assertFalse((tmp / "pr300-wt").exists()); self.assertFalse((tmp / "pr301-wt").exists())
+            self.assertFalse((logs / "social.log.1").exists())
+            self.assertEqual(gzip.open(logs / "social.log.1.gz").read(), b"s" * 50)
+            self.assertEqual([Path(p).name for p in report["compressed"]], ["social.log.1"])
             self.assertFalse((tmp / "pr172").exists()); self.assertTrue((tmp / "pr262").exists())
             self.assertTrue((tmp / "notes").exists())
             self.assertFalse((tmp / "subrun-old.txt").exists()); self.assertTrue((tmp / "subrun-new.txt").exists())
             self.assertFalse((jobs / "20260901T000000Z-aaaa").exists()); self.assertTrue((jobs / "20260917T000000Z-bbbb").exists())
             self.assertEqual((logs / "monolith.log").stat().st_size, 0)
-            self.assertEqual((logs / "monolith.log.1").read_bytes(), b"m" * 200)
+            self.assertEqual(gzip.open(logs / "monolith.log.1.gz").read(), b"m" * 200)
+            self.assertFalse((logs / "monolith.log.1").exists())
             self.assertEqual((logs / "small.log").stat().st_size, 10)
-            self.assertEqual(sorted(Path(p).name for p in report["removed"]), ["20260901T000000Z-aaaa", "pr172", "subrun-old.txt"])
+            self.assertEqual(sorted(Path(p).name for p in report["removed"]), ["20260901T000000Z-aaaa", "pr172", "pr300-wt", "pr301-wt", "subrun-old.txt"])
             self.assertEqual([Path(p).name for p in report["rotated"]], ["monolith.log"])
             # Missing roots are not an error.
             self.assertEqual(housekeep(now, tmp=root / "none", jobs=root / "none", logs=None)["removed"], [])
+
+
+class SettledPullRequestTests(unittest.TestCase):
+    def test_settled_prs_come_from_the_github_prs_snapshots(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = Store(temp)
+            store.put("github-prs:inventory", {"1f916-ai/1f916#5": {"repo": "1f916-ai/1f916", "number": 5},
+                                               "1f916-ai/1f916#6": {"repo": "1f916-ai/1f916", "number": 6},
+                                               "laude-institute/headlong#7": {"repo": "laude-institute/headlong", "number": 7}})
+            store.put("github-prs:pr:1f916-ai/1f916#5", {"snapshot": {"pr": {"state": "closed"}}})
+            store.put("github-prs:pr:1f916-ai/1f916#6", {"snapshot": {"pr": {"state": "open"}}})
+            store.put("github-prs:pr:laude-institute/headlong#7", {"snapshot": {"pr": {"state": "merged"}}})
+            observer = Observer({}, store, None, NativeFixture(), now=1.0)
+            self.assertEqual(observer.settled_prs(), {"5", "7"})
+            store.db.close()
 
 
 class ObservationTests(unittest.TestCase):

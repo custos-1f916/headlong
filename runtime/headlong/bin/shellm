@@ -114,6 +114,12 @@ SHELLM_EFFORT="${SHELLM_EFFORT:-high}"
 # its command, or loops that way until the transfer times out, then costs
 # nothing past the block. 0 reads every response to the end as before.
 SHELLM_STOP_AFTER_CODE_BLOCK="${SHELLM_STOP_AFTER_CODE_BLOCK:-1}"
+# 1: run every COMPLETE fenced block of a reply, in order, as one script, instead
+# of the first block only (Custos, 2026-09-18: 85 of 2,172 steps lost a second
+# block to the first-block rule). Pair it with SHELLM_STOP_AFTER_CODE_BLOCK=0,
+# or later blocks arrive cut off; a block that never closes is dropped with a
+# notice. 0 keeps the first-block-only rule and its truncation notice.
+SHELLM_RUN_ALL_BLOCKS="${SHELLM_RUN_ALL_BLOCKS:-0}"
 # What the model sees of the trajectory on each call. "traj" (default): the
 # trajectory's head and tail, so a --traj/--resume run continues the earlier
 # conversation. "run": only this run's own steps, with its prompt pinned
@@ -1770,7 +1776,7 @@ extract_code() {
     local truncation_file
     truncation_file=$(mktemp)
     local code
-    code=$(printf '%s\n' "$response" | awk -v sq="'" '
+    code=$(printf '%s\n' "$response" | awk -v sq="'" -v run_all="${SHELLM_RUN_ALL_BLOCKS:-0}" '
         # ── try_open_heredocs: queue supported redirections in source order.
         # This is deliberately not a Bash parser: it does not distinguish
         # operators in shell strings/comments or parse every shell-word form.
@@ -1838,13 +1844,24 @@ extract_code() {
             }
         }
 
-        BEGIN { in_block = 0; hd_head = 1; hd_tail = 0; tab = sprintf("\t"); first_block_closed = 0 }
+        BEGIN { in_block = 0; hd_head = 1; hd_tail = 0; tab = sprintf("\t"); first_block_closed = 0; later = "" }
+
+        # The first block streams out line by line (an unclosed first block still
+        # runs, as before). With run_all, every later block is buffered and only
+        # flushed by its closing fence, so a block cut off by the transport never
+        # runs half-way; END reports it instead.
+        function emit(line) {
+            if (first_block_closed) later = later line "\n"
+            else print line
+        }
+        END { if (in_block && first_block_closed && run_all == "1") print "INCOMPLETE" > "/dev/stderr" }
 
         # After first block closed: look for another opening fence. A tagged
         # ```bash/```sh fence may be appended to the end of a prose line (see
         # opener note below); a bare ``` only counts at line start.
         first_block_closed && !in_block {
             if ($0 ~ /```(bash|shell|sh)[[:space:]]*$/ || $0 ~ /^```/) {
+                if (run_all == "1") { in_block = 1; later = ""; next }
                 print "TRUNCATED" > "/dev/stderr"
                 exit
             }
@@ -1886,20 +1903,21 @@ extract_code() {
                         hd_tail = 0
                     }
                 }
-                print
+                emit($0)
                 next
             }
 
             # A bare ``` only closes the fence when no heredoc is open.
             if ($0 ~ /^```[[:space:]]*$/) {
                 in_block = 0
+                if (first_block_closed) { printf "%s", later; later = "" }
                 first_block_closed = 1
                 next
             }
 
             # Queue every supported opener on a command line in source order.
             try_open_heredocs($0)
-            print
+            emit($0)
         }
     ' 2>"$truncation_file")
 
@@ -1951,6 +1969,9 @@ extract_code() {
     if [[ "$truncation_signal" == *TRUNCATED* ]]; then
         code=$'echo "[rest of model response truncated after first code block]" >&2\n'"$code"
     fi
+    if [[ "$truncation_signal" == *INCOMPLETE* ]]; then
+        code=$'echo "[shellm: a later code block was cut off before its closing fence and was not run; put everything in one block, or close every fence]" >&2\n'"$code"
+    fi
     if [[ "$toolcall_lifted" -eq 1 ]]; then
         local toolcall_notice
         toolcall_notice=$(cat <<'NOTICE'
@@ -1997,7 +2018,7 @@ build_system_prompt() {
     cat <<'SYSPROMPT'
 You are running in shellm, headlong's bash agent loop: you solve tasks by generating and executing bash code.
 
-IMPORTANT: End your response with exactly ONE ```bash code block. Your response is NOT streamed — code blocks are not executed until your entire response is complete. Combine multiple steps into a single script. Only the first code block is executed; all others are silently discarded.
+IMPORTANT: End your response with exactly ONE ```bash code block. Your response is NOT streamed — code blocks are not executed until your entire response is complete. Combine multiple steps into a single script. Several blocks in one reply are fragile: depending on configuration the later ones are dropped, or run in order only if every fence is closed.
 Never use <tool_call>, <function=bash>, <parameter=...> or <bash> tags: this runtime is not a tool-calling API and only reads ```bash fences.
 
 CRITICAL — the opening ```bash fence MUST start on its OWN new line. Put a

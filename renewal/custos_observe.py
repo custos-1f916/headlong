@@ -247,8 +247,12 @@ HOUSEKEEPING_TMP = Path("/tmp")
 HOUSEKEEPING_JOBS = Path("/var/lib/custos-harness/jobs")
 
 
+HOUSEKEEPING_CLONES = Path("/opt/custos/work/repos")
+
+
 def housekeep(now, tmp=HOUSEKEEPING_TMP, jobs=HOUSEKEEPING_JOBS, logs=None,
-              clone_age=48 * 3600, job_age=7 * 86400, log_bytes=512 << 20):
+              clone_age=48 * 3600, job_age=7 * 86400, log_bytes=512 << 20,
+              settled=(), clones=HOUSEKEEPING_CLONES):
     """Reclaim the disk the mind's own scratch leaves behind, touching nothing young and
     nothing that is not obviously scratch (2026-09-17: 5 GB gone in nine hours; /tmp held
     4.7 GB of PR checkouts, 446 sealed job sandboxes held 2 GB, monolith.log was 1.5 GB).
@@ -256,8 +260,16 @@ def housekeep(now, tmp=HOUSEKEEPING_TMP, jobs=HOUSEKEEPING_JOBS, logs=None,
     week, and oversized run logs are handled. Logs rotate copy-truncate style: the
     thinkers append with `tee -a`, so a truncated file keeps receiving new lines and the
     previous contents survive once as NAME.log.1."""
-    import shutil
-    report = {"at": now, "removed": [], "rotated": [], "bytes": 0}
+    import gzip, shutil, subprocess
+    report = {"at": now, "removed": [], "rotated": [], "compressed": [], "bytes": 0}
+    # A checkout named for a closed or merged PR is done the moment the review closes,
+    # whatever its age (2026-09-18: 2.4 GB of settled-PR worktrees under /tmp, all
+    # younger than the clone_age rule). `settled` is the PR numbers; a name token of
+    # two to five digits that matches one is the checkout for that PR.
+    settled_numbers = {str(n) for n in settled}
+
+    def settled_checkout(path):
+        return bool(settled_numbers) and any(tok in settled_numbers for tok in re.findall(r"(?<!\d)\d{2,5}(?!\d)", path.name))
 
     def size(path):
         try:
@@ -276,7 +288,7 @@ def housekeep(now, tmp=HOUSEKEEPING_TMP, jobs=HOUSEKEEPING_JOBS, logs=None,
         try:
             is_clone = child.is_dir() and not child.is_symlink() and (child / ".git").exists()
             is_report = child.is_file() and child.name.startswith("subrun-") and child.suffix == ".txt"
-            if (is_clone and stale(child, clone_age)) or (is_report and stale(child, job_age)):
+            if (is_clone and (stale(child, clone_age) or settled_checkout(child))) or (is_report and stale(child, job_age)):
                 report["bytes"] += size(child)
                 shutil.rmtree(child) if child.is_dir() else child.unlink()
                 report["removed"].append(str(child))
@@ -290,15 +302,39 @@ def housekeep(now, tmp=HOUSEKEEPING_TMP, jobs=HOUSEKEEPING_JOBS, logs=None,
                 report["removed"].append(str(child))
         except OSError:
             continue
+    # Removed worktrees leave stale registrations in the clone they belong to.
+    if report["removed"] and clones and clones.is_dir():
+        for repo in sorted(p for p in clones.glob("*/*") if (p / ".git").exists()):
+            try:
+                subprocess.run(["git", "-C", str(repo), "worktree", "prune"], capture_output=True, timeout=30, check=False)
+            except (OSError, subprocess.SubprocessError):
+                continue
+
+    # The rotated copy is gzipped (level 1: a 1.5 GB monolith.log.1 sat uncompressed on
+    # disk for a day, 2026-09-18); a leftover plain NAME.log.1 from the earlier scheme is
+    # compressed on the next pass.
+    def compress(source, target):
+        with open(source, "rb") as src, gzip.open(target, "wb", compresslevel=1) as dst:
+            shutil.copyfileobj(src, dst)
+
     for log in sorted(logs.glob("*.log")) if logs and logs.is_dir() else []:
         try:
             if log.is_file() and log.stat().st_size > log_bytes:
-                previous = log.with_name(log.name + ".1")
+                previous = log.with_name(log.name + ".1.gz")
                 report["bytes"] += size(previous) if previous.exists() else 0
-                shutil.copyfile(log, previous)
+                compress(log, previous)
                 with open(log, "r+b") as handle:
                     handle.truncate(0)
                 report["rotated"].append(str(log))
+        except OSError:
+            continue
+    for leftover in sorted(logs.glob("*.log.1")) if logs and logs.is_dir() else []:
+        try:
+            if leftover.is_file():
+                compress(leftover, leftover.with_name(leftover.name + ".gz"))
+                report["bytes"] += size(leftover)
+                leftover.unlink()
+                report["compressed"].append(str(leftover))
         except OSError:
             continue
     return report
@@ -635,7 +671,18 @@ class Observer:
         """Every six hours, the bounded scratch cleanup above; the report is a state key
         (housekeeping:latest), never an observation, so it can never wake the mind."""
         logs = Path(self.native.path).resolve().parents[2] / "run/logs" if getattr(self.native, "path", None) else None
-        self.store.put("housekeeping:latest", housekeep(self.now, logs=logs))
+        self.store.put("housekeeping:latest", housekeep(self.now, logs=logs, settled=self.settled_prs()))
+
+    def settled_prs(self):
+        """PR numbers whose last github-prs snapshot is closed or merged, so their
+        checkouts under /tmp can go as soon as the review goal closes."""
+        numbers = set()
+        for key, row in (self.store.get("github-prs:inventory", {}) or {}).items():
+            state = self.store.get("github-prs:pr:" + key, {}) or {}
+            pr = (state.get("snapshot") or {}).get("pr") or {}
+            if pr.get("state") and pr["state"] != "open":
+                numbers.add(str((row or {}).get("number") or key.rsplit("#", 1)[-1]))
+        return numbers
 
     def expire_asks(self):
         """Deferred asks from other agents that nobody touched for a day are
