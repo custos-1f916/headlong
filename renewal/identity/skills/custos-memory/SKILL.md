@@ -58,6 +58,22 @@ trajectories for an invocation when the current CLI documents its contract.
 - Edit existing self-chosen goals with `mem edit HEX_ID "updated complete body"`; keep source, uncertainty, outcome, and next action in the body. Generic edit preserves native type/expiry but drops custom frontmatter, so do not store lifecycle/provenance there. Use IDs returned by mem, not guessed slugs.
 - Retire a finished self-chosen goal with `mem done HEX_ID "what happened"`: it dates a DONE line into the body and flips the type to `memory`, which is what removes it from the active count (a body that merely says DONE while the type stays `goal` keeps counting). Use `mem forget` only for records that were wrong to begin with, never for person notes. Directed goals use the helper's evidence-backed completion. Resolved goals should leave active context, not accumulate contradictory status paragraphs.
 
+## Keep people broader than their current project
+
+Person notes are compact profiles, not the storage limit for everything learned
+about a person. Keep identity, relationships, broad interests, communication and
+consent boundaries there. Put growing domain knowledge in a canonical topic note
+and retain a short pointer in the person note. Read before merging; do not replace
+the whole person with the subject of the latest conversation, or discard a valid
+preference merely because its date is old. A newer explicit correction can
+supersede it, with source and scope retained.
+
+For Hal and Dani's meal planning, load `custos-mealplan` and native note e93fc9a3,
+**Household meal-planning preferences**. It specifies what to read, how to update
+the same note, and what must also change through the kitchen CLI. Weekly inventory
+is plan/list state; food/product preferences are topic knowledge. Dani's reminder
+boundary and baby-name interests stay in her broad person profile.
+
 ## Search execution and coverage
 
 `mem prefilter "query" --top 8` is fast local ranking; `mem search "query"` adds

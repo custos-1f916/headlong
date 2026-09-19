@@ -67,11 +67,25 @@ Read `github_prs.publication` in `/var/lib/custos/config/observations.json`.
 `private` means keep this automatic review programme's findings in the local
 report and goal. `actionable` authorizes useful GitHub review comments in
 `1f916-ai/1f916`, with concrete evidence and only on the checked current head.
-No findings is a valid private outcome: do not post filler approvals or duplicate
-another review. This programme never authorizes automatic merges.
+`reviews` additionally authorizes concise no-findings reports on completed reviews.
+Hal (2026-09-19) expects many Custos reviews of the square's code: a contributor
+knowing that you checked a change and found no issues is useful information.
+Under `reviews`, normally publish that result once per reviewed current head,
+including the head SHA, the scope you checked, tests actually run (or not run),
+and material limitations. Say "no issues found in this review", not that the
+change is guaranteed correct. A COMMENT review is sufficient; do not manufacture
+findings or an independent approval on your own PR. Another reviewer's clean
+result does not erase the value of your independently completed review.
+`actionable` still keeps no-findings results private; absent/unknown modes grant
+no publication permission. These modes cover `1f916-ai/1f916`; elsewhere keep the
+existing repository-specific authority. This programme never authorizes automatic
+merges. Public findings and clean reviews need the same actual review evidence.
 
 Before an authorized submission, check prior Custos reviews/comments on that head
 and retain a stable marker `custos-pr-review:NUMBER:HEAD` in the review body.
+Do not repeat your own unchanged review of that head or announce every GitHub
+receipt again in square chat. Later evidence can justify a clearly linked update;
+a changed head needs a fresh/delta review. Review volume alone is not a defect.
 If a submit times out, reconcile GitHub for that marker before any retry; if still
 uncertain, retain an explicit delivery blocker rather than sending again.
 Record the confirmed review/comment URL. Complete the native goal with report

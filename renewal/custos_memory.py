@@ -1462,19 +1462,27 @@ an answer needs checking, say so or defer. Be yourself: curious, warm, plain,
 concise. It is fine to ask them something back.
 memories: usually [] ; at most one {"type":"note|fact|lesson","content":"..."}
 when something worth keeping beyond this person came up. Not for policy,
-values, credentials, or facts about people (those go in person).
+values or credentials. Broad facts about people go in person; growing domain
+knowledge goes in the relevant topic note, not a new duplicate on every reply.
+A lasting meal-planning, food or grocery preference from Hal or Dani needs defer
+with a goal to load custos-mealplan, read and merge Household meal-planning
+preferences (native note e93fc9a3), and update/verify kitchen settings if applicable.
+Keep person null when only that domain preference changed. Do not claim it is
+recorded yet. This does not turn a communication/reminder boundary into a task.
 person: null, or {"aliases":["nicknames, handles"],"notes":"your whole updated
 note about THE SENDER of this message: what they care about, how they talk and
 like to be talked to, what you have discussed, what they asked of you, how they
 relate to Hal. Facts and impressions, no secrets, under 1200 characters. Rewrite
-the full note, keeping what still holds."} The note is about the person you are
+the full note, keeping what still holds. Preserve broader interests, relationships,
+communication/consent boundaries and topic-note pointers; never let the latest
+meal or project discussion replace the rest of the person."} The note is about the person you are
 replying to, never about someone they mention; the display name is fixed after
 creation. When several people's messages arrived together, only the verified
 carrier's own words belong in it; the harness keeps the previous note untouched
 whenever more than one person spoke. Do not infer an alias from a later conflicting display proposal:
 only aliases explicitly supplied in `aliases` are accepted.
 Choosing react or no-reply does not mean there is nothing to remember. When the
-sender explicitly sets or corrects a lasting preference, consent boundary, or
+sender explicitly sets or corrects a lasting communication preference, consent boundary, or
 request for fewer reminders/offers, include it in the whole updated person note
 even if the reply is only an emoji or silence. Preserve its scope and source;
 "we will ask when useful" means wait for their request, not schedule another
@@ -2122,9 +2130,9 @@ def response(store, payload):
                     attempt["person_update_warning"] = "oversized_note_candidate_save_failed_previous_kept"
                 else:
                     # The dream reviews proposals days later and edited none of them; the
-                    # facts in a dropped candidate (Dani's grocery rules, 2026-09-18) belong
-                    # in the note now. Hand the merge to the monolith as a small deferred
-                    # task: it has the full note, `mem edit`, and the cap.
+                    # facts in a dropped candidate need the appropriate topic/person note.
+                    # Hand the merge to the monolith: it can read complete notes and split
+                    # domain detail without sacrificing broader person knowledge.
                     try:
                         handoff = store.capture({
                             "request_id": "person-note:" + proposal_id, "sender": "operator:person-note",
@@ -2132,14 +2140,17 @@ def response(store, payload):
                             "content": "The responder's person-note update for " + who_key + " exceeded "
                                        + str(PERSON_NOTE_MAX) + " characters and was kept as a proposal at "
                                        + str(proposal_path) + "; the previous note is unchanged.",
-                            "outcome": "The person note for " + who_key + " carries the new facts from proposal " + proposal_id,
+                            "outcome": "Preserve the new facts from proposal " + proposal_id + " in the right person/topic notes",
                             "next_action": "Read " + str(proposal_path) + " and `mem show` the person note for " + who_key
-                                           + " (custos-memory people-context). `mem edit` the note so it keeps display, aliases and"
-                                           + " routes and includes the candidate's new facts within " + str(PERSON_NOTE_MAX)
-                                           + " characters: drop the oldest dated paragraph first, never the lead paragraph."
-                                           + " Then custos-memory complete with the note id.",
-                            "completion": "The note carries the candidate's new facts within the cap, or an evidence-backed"
-                                          " decision that the candidate held nothing new"}, deferred=True)
+                                           + " (custos-memory people-context). Read custos-memory before merging with `mem edit`."
+                                           + " Keep identity metadata, relationships, interests and communication/consent boundaries;"
+                                           + " never drop a still-valid preference just because it is old. Move growing domain detail"
+                                           + " to a topic note and retain a pointer. For meal/food/grocery preferences, load"
+                                           + " custos-mealplan and merge Household meal-planning preferences (e93fc9a3), including"
+                                           + " kitchen readback when settings change. Keep person prose within " + str(PERSON_NOTE_MAX)
+                                           + " characters. Complete with the person/topic note IDs and what was retained.",
+                            "completion": "The new facts are merged into the appropriate notes, broader person knowledge and"
+                                          " boundaries remain, or evidence shows the candidate held nothing new"}, deferred=True)
                         attempt["person_task"] = handoff.get("goal_id")
                     except (MemoryError, InvalidInput, OSError) as exc:
                         attempt["person_task_warning"] = type(exc).__name__

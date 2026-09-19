@@ -13,6 +13,38 @@ account is Dani's** (since 2026-09-10 evening: her substitutions are set up the 
 and her order history is the household's real record); either Hal or Dani signs in and either
 places the order.
 
+## Preference memory: read and maintain it
+
+Before drafting meals, choosing products/substitutions, or processing a preference
+correction, read `mem show e93fc9a3` (**Household meal-planning preferences**) and
+any relevant linked topic notes, then `mealplan prefs` and the current plan.
+If that ID has been merged, locate the canonical note with
+`mem prefilter "Household meal-planning preferences" --top 5`; follow its pointer,
+not a stale duplicate. A simple dated meal lookup below only needs the calendar.
+
+The topic note holds tastes, meal-planning style, grocery judgment, exceptions and
+their source/date/scope. The kitchen service holds executable constraints, rules,
+staples/counts, pins and weekly plan/list/cart state. Read both: a pantry label is
+not evidence of today's quantity, and a note edit does not alter the kitchen.
+
+When Hal or Dani teaches a lasting preference, read the WHOLE existing topic note
+and `mem edit` that ID with a merged body, retaining unaffected preferences and
+explicitly dating superseded guidance. Use `mealplan learn`, `constraint` or
+`product` for its operational counterpart and verify readback before claiming it
+recorded. A one-week request or 'already have' goes in that week's plan/list;
+do not promote it to a permanent taste or recurring staple. If the topic becomes
+too large, split it into linked planning/food and shopping notes, leaving this ID
+as the short index; read the relevant linked notes on every affected task.
+
+Dani's and Hal's person notes retain identity, relationships, other interests,
+communication preferences and consent/reminder boundaries, plus a short pointer
+here. Do not turn either person note into the grocery log or drop an unrelated
+preference to make food details fit. Keep this skill's workflow stable; learned
+household preferences belong in the notes and kitchen settings, not skill prose.
+In the tool-free responder, defer preference recording to the mind with this
+skill and topic-note ID in the next action; do not claim a memory or kitchen
+update before it happened, and do not stuff the preference into `person`.
+
 ## The first week, and the one rule it taught (2026-09-10)
 
 The first round went well: a full day-by-day draft with links, pregnancy-safe, Dani's "no
@@ -35,7 +67,9 @@ recorded it.** Saying it in Signal is not doing it.
   conversation since the draft went out (`chat history`), and `mealplan plan show`. Every
   "we already have X" → `mealplan list have "X" --note "Dani, Thu"`. Every agreed dinner change
   → `mealplan plan set --dinner DATE=SLUG …` (all dinners, dates from the pickup Saturday).
-  Every "we don't need X" / "we always have X" → `mealplan learn pantry "X"`. Only then
+  A dated "we don't need X" is this week's `list have`, not permanent pantry.
+  An explicit standing pantry correction uses `mealplan learn pantry "X"`, with
+  scope recorded in the preference note; reconfirm quantities that can deplete. Only then
   `cart candidates` / `choose` / `fill`. `mealplan cart fill` and `mealplan plan proposed` refuse
   on their own when Collette Haus messages arrived after the plan was last touched: they print
   the unread lines, you record what they ask, then retry with `--read`. A cart built from a stale
@@ -109,7 +143,7 @@ has replied, and how many dinners are drafted). Three scheduled wakes, all 17:00
   the **questions** they want asked, the **staples with counts**, candidates from the cookbooks scored
   by sale matches/ratings/recency/past orders, each with its recipe **link**, and the sales as a hint.
   Build the draft first: one dinner for each cook night from the pickup Saturday through Friday,
-  honouring the constraints and what you know about Hal and Dani (person notes), and write it down with
+  honouring the constraints and the household preference note (plus communication boundaries in person notes), and write it down with
   `mealplan plan set --dinner DATE=SLUG …` (as many `--dinner` as cook nights). Then send ONE message
   to the `Collette Haus` group (Hal, Dani and you; label from `signal-contacts`), else one each to
   Hal and Dani, in this order and nothing else:
@@ -122,7 +156,7 @@ has replied, and how many dinners are drafted). Three scheduled wakes, all 17:00
   have to assemble.
 - **Replies.** Back and forth about meals and staples is normal and welcome — answer in the
   group, adjust the draft (`mealplan plan set --dinner DATE=SLUG …`, one dinner per day of the
-  week they cook, dates from the pickup Saturday onward), record tastes in person notes, standing
+  week they cook, dates from the pickup Saturday onward), merge tastes into the household preference note, standing
   rules and constraint changes with `mealplan learn rules …` / `mealplan constraint KEY VALUE`. The
   first reply from either of them about the plan → `mealplan plan engaged`. **Declining is a valid
   answer**: "not this week", "skip it", "we're away" → `mealplan plan skip --note "…"`, one-line
@@ -171,13 +205,18 @@ has replied, and how many dinners are drafted). Three scheduled wakes, all 17:00
   new recipes a week" — in the group or in a DM, Dani's word counts exactly like Hal's here —
   change the questions/rules/constraints with `mealplan learn` / `mealplan constraint` and
   confirm in one line. The starting constraints were seeded by the deploy agent, not by them,
-  so treat every one as provisional until they have weighed in. Don't hard-code preferences in your
-  own memory that belong in those lists; the lists are what the brief shows you every week.
+  so treat every one as provisional until they have weighed in. Keep operational values in
+  those lists, which feed the brief; keep their meaning, provenance and exceptions in the
+  household preference note. If they disagree, reconcile against the newest explicit request
+  before acting rather than silently choosing the older value.
 - **Links, always.** Every recipe you name in Signal carries its Mealie link (the `url` in the
   brief, `mealplan recipes`, `mealplan plan show`): `https://recipes.ha1.io/g/home/r/<slug>`, open
   on the LAN without a login. A plan without links is not a plan they can read.
 - Record what you learn (a dish they loved, a brand they prefer, "never again") in
-  person notes and with `mealplan learn`, not in new goals. One goal per planning week; reuse it.
+  the household preference note and with `mealplan learn` where applicable. Update the
+  existing note rather than creating a goal for every fact. A tool-free responder can
+  defer the recording as real work; finish it promptly and retain the note/readback IDs.
+  One planning goal per week; reuse it.
 
 ## The kitchen repo — you own the service (Hal, 2026-09-11: "Like baby name")
 
