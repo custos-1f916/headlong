@@ -97,11 +97,11 @@ class HousekeepingTests(unittest.TestCase):
             (logs / "social.log.1").write_bytes(b"s" * 50)      # leftover plain rotation: compressed
             report = housekeep(now, tmp=tmp, jobs=jobs, logs=logs, log_bytes=100, settled={"300", 301}, clones=root / "none")
             import gzip
-            self.assertFalse((tmp / "pr300-wt").exists()); self.assertFalse((tmp / "pr301-wt").exists())
+            self.assertTrue((tmp / "pr300-wt").exists()); self.assertTrue((tmp / "pr301-wt").exists())
             self.assertFalse((logs / "social.log.1").exists())
             self.assertEqual(gzip.open(logs / "social.log.1.gz").read(), b"s" * 50)
             self.assertEqual([Path(p).name for p in report["compressed"]], ["social.log.1"])
-            self.assertFalse((tmp / "pr172").exists()); self.assertTrue((tmp / "pr262").exists())
+            self.assertTrue((tmp / "pr172").exists()); self.assertTrue((tmp / "pr262").exists())
             self.assertTrue((tmp / "notes").exists())
             self.assertFalse((tmp / "subrun-old.txt").exists()); self.assertTrue((tmp / "subrun-new.txt").exists())
             self.assertFalse((jobs / "20260901T000000Z-aaaa").exists()); self.assertTrue((jobs / "20260917T000000Z-bbbb").exists())
@@ -109,7 +109,7 @@ class HousekeepingTests(unittest.TestCase):
             self.assertEqual(gzip.open(logs / "monolith.log.1.gz").read(), b"m" * 200)
             self.assertFalse((logs / "monolith.log.1").exists())
             self.assertEqual((logs / "small.log").stat().st_size, 10)
-            self.assertEqual(sorted(Path(p).name for p in report["removed"]), ["20260901T000000Z-aaaa", "pr172", "pr300-wt", "pr301-wt", "subrun-old.txt"])
+            self.assertEqual(sorted(Path(p).name for p in report["removed"]), ["20260901T000000Z-aaaa", "subrun-old.txt"])
             self.assertEqual([Path(p).name for p in report["rotated"]], ["monolith.log"])
             # Missing roots are not an error.
             self.assertEqual(housekeep(now, tmp=root / "none", jobs=root / "none", logs=None)["removed"], [])

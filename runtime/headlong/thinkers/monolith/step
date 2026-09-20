@@ -448,6 +448,8 @@ fi
 # shellm writes its run header's step_id here, so a fallback idle can carry
 # run_id and the timeline can pair it with the run that went quiet.
 run_id_file=$(mktemp)
+diagnostic_file=$(mktemp)
+printf '{}\n' > "$diagnostic_file"
 
 # One shellm agentic run (writes to the root trajectory). Model via --model so
 # it cannot be shadowed by env/.env layers (see design/model-resolution.md).
@@ -486,7 +488,7 @@ run_response=$(SHELLM_NO_BANNER=1 \
     SHELLM_MAINTENANCE_WARN="${SHELLM_MAINTENANCE_WARN:-1}" \
     SHELLM_TRIGGER_STEP_ID="$trigger_step_id" \
     SHELLM_WAKE="$wake_reason" \
-    SHELLM_RUN_ID_OUT="$run_id_file" \
+    SHELLM_DIAGNOSTIC_OUT="$diagnostic_file" SHELLM_RUN_ID_OUT="$run_id_file" \
     shellm --model "$THINK_MODEL" --traj "$TRAJ_ID" --context-scope run \
     "${shellm_flags[@]}" \
     --prompt-file "$prompt_file_tmp") || run_rc=$?
@@ -553,12 +555,13 @@ fi
 # Missing records (e.g. SIGKILL) remain unclosed, never inferred successful/live.
 terminal_run_id=$(cat "$run_id_file" 2>/dev/null) || terminal_run_id=""
 if [[ -n "$terminal_run_id" ]]; then
-    jq -nc --arg source "$THINKER_NAME" --arg run_id "$terminal_run_id" \
+    jq -nc --slurpfile diagnostic "$diagnostic_file" --arg source "$THINKER_NAME" --arg run_id "$terminal_run_id" \
         --argjson rc "$run_rc" \
-        '{type:"run-end", source:$source, run_id:$run_id, rc:$rc,
+        '{type:"run-end", source:$source, run_id:$run_id, rc:$rc, failure:(if $rc != 0 then (if $diagnostic[0].stage then $diagnostic[0] else {stage:"launcher",operation:"unknown"} end) else null end),
           content:(if $rc == 0 then "monolith run exited successfully" else "monolith run exited with rc=\($rc)" end)}' \
         | traj append >/dev/null || true
 fi
+rm -f "$diagnostic_file"
 rm -f "$run_id_file"
 
 # ---------------------------------------------------------------------------

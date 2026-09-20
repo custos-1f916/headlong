@@ -7,6 +7,7 @@ Locks and staging files are not a goals database. Origin, evidence, response
 receipts and recovery state all live in the native memory body.
 """
 import argparse
+import http.client
 import custos_signal_targeting as signal_targeting
 import contextlib
 import datetime as dt
@@ -193,10 +194,19 @@ def validate_record(record):
         gate_time(record["not_before"])
     if record.get("waiting"):
         wait = record["waiting"]
-        keys(wait, {"reason", "since", "resume_sender"}, {"check_at"})
+        keys(wait, {"reason", "since", "resume_sender"}, {"check_at", "receipt", "signal_target"})
         text(wait["reason"], "waiting reason", 2000)
         text(wait["resume_sender"], "resume sender", 2048, empty=True)
         gate_time(wait["since"])
+        for field in ('receipt', 'signal_target'):
+            if field in wait:
+                text(wait[field], field, 2048)
+        if wait.get('receipt') and not re.fullmatch(r'(?:outbox|action|square):[A-Za-z0-9:._-]{1,160}', wait['receipt']):
+            raise MemoryError('invalid receipt reference')
+        if wait.get('signal_target') and not re.fullmatch(r'(?:dm|group):[^\s]{1,160}', wait['signal_target']):
+            raise MemoryError('use the fixed target from signal-contacts')
+        if wait.get('receipt') and wait.get('signal_target'):
+            raise MemoryError('wait for one transport condition at a time')
         if wait.get("check_at"):
             gate_time(wait["check_at"])
     if record["status"] != "active":
@@ -571,7 +581,7 @@ class Store:
             return {"goal_id": goal_id, "request_id": origin["request_id"], "created": True}
 
     def wait(self, payload):
-        keys(payload, {"goal_id", "reason"}, {"resume_sender", "check_at", "expected_sha256"})
+        keys(payload, {"goal_id", "reason"}, {"resume_sender", "check_at", "expected_sha256", "receipt", "signal_target"})
         reason = text(payload["reason"], "reason", 2000)
         with self.lock():
             item = self.find(payload["goal_id"]); record = item[4]
@@ -581,6 +591,11 @@ class Store:
                 raise MemoryError("goal changed since inspection; re-read before waiting")
             wait = {"reason": reason, "since": now(),
                     "resume_sender": text(payload.get("resume_sender", record["origin"]["sender"]), "resume_sender", 2048, empty=True)}
+            for field in ('receipt', 'signal_target'):
+                if payload.get(field): wait[field] = text(payload[field], field, 2048)
+            if wait.get('receipt') or wait.get('signal_target'):
+                wait['resume_sender'] = ''
+                wait['check_at'] = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=6)).isoformat()
             if payload.get("check_at"):
                 if gate_time(payload["check_at"]) <= dt.datetime.now(dt.timezone.utc):
                     raise MemoryError("check_at must be in the future")
@@ -626,7 +641,7 @@ class Store:
             "content": "Material correction to goal " + payload["goal_id"] + ". Original receipt: " + receipt + ". Evidence: " + evidence,
             "outcome": "Review and deliver a material correction to " + payload["goal_id"],
             "next_action": "Verify original receipt " + receipt + ", qualify the changed claim, then send with --delivery-kind correction --correction-of " + receipt + ". " + evidence[:1800],
-            "completion": "Correction has a successful transport receipt, or an evidence-backed decision that no correction is needed"}, deferred=True)
+            "completion": "Correction has a successful transport receipt, or an evidence-backed decision that no correction is needed"}, trigger_step=original.get("trigger_step"), deferred=True)
 
     def update(self, payload):
         keys(payload, {"goal_id"}, {"outcome", "next_action", "completion", "evidence", "not_before"})
@@ -714,6 +729,18 @@ class Store:
             with self.lock():
                 item = self.find(payload["goal_id"])
                 record = item[4]
+                if disposition == 'completed' and record['status'] == 'active':
+                    unresolved = unresolved_deliveries(self, record)
+                    if unresolved:
+                        reference, phase = unresolved[-1]
+                        record['events'].append({'at': now(), 'delivery_unresolved': reference, 'phase': phase})
+                        record['goal']['next_action'] = ('Reconcile ' + reference + ' (' + phase + '). A recorded reply is not delivery. '
+                            'For a material correction, inspect the original submitted receipt and use --delivery-kind correction --correction-of; never bypass a spent claim.')
+                        if phase in {'unknown', 'pending', 'queued', 'sending', 'running', 'unavailable'}:
+                            record['waiting'] = {'reason': 'Waiting for transport receipt', 'since': now(), 'resume_sender': '',
+                                'receipt': reference, 'check_at': (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=6)).isoformat()}
+                        self.save(item, record)
+                        raise MemoryError('goal remains active: ' + reference + ' is ' + phase + '; no confirmed delivery')
                 result = {"disposition": disposition, "evidence": evidence}
                 if record["status"] != "active":
                     if record.get("resolution") != result:
@@ -732,6 +759,10 @@ class Store:
                                  "resolves": record["trigger_step"], "request_id": resolution_id,
                                  "goal_id": payload["goal_id"],
                                  "content": "Request " + disposition + ". Evidence/reason: " + evidence})
+            if disposition == 'completed' and os.environ.get('IDENTITY_DIR'):
+                from custos_review_scratch import Registry
+                try: Registry().clean(payload['goal_id'], evidence)
+                except (OSError, ValueError, subprocess.SubprocessError): pass  # completion persists; cleanup is retryable
             return {"goal_id": payload["goal_id"], "status": disposition}
 
     def settle_conversations(self):
@@ -852,7 +883,10 @@ class Store:
                     if wait:
                         event = next((r for r in inbound if r["origin"]["sender"] == wait["resume_sender"]
                                       and gate_time(r["received_at"]) > gate_time(wait["since"])), None)
-                        if event:
+                        transport_event = wait_event(wait)
+                        if transport_event:
+                            self._resume((path, header, body, fields, record), transport_event)
+                        elif event:
                             self._resume((path, header, body, fields, record), "New inbound request " + event["origin"]["request_id"] + "; check whether the gate is satisfied")
                         elif wait.get("check_at") and gate_time(wait["check_at"]) <= context_now:
                             self._resume((path, header, body, fields, record), "Scheduled check time reached; inspect once, then wait again if still gated")
@@ -1443,7 +1477,7 @@ Return one strict JSON object with exactly these fields:
 needs_investigation: decide BEFORE composing a take whether answering requires
 opening/reading an attachment, fetching a link or repository, checking primary
 evidence, running a test, or otherwise investigating beyond this tool-free turn.
-Set it true when that work is needed. A sender's description of a paper, HTML,
+Set it true when that work is needed. Product comparisons, hardware fit, optical specifications, enclosure dimensions and purchase recommendations require checking the exact variants and primary specifications; familiarity with a product name is not inspected evidence. A sender's description of a paper, HTML,
 PDF, dataset, repository or experiment is not your inspection of that subject.
 "Working from your description", "I haven't opened it", and an unavailable-file
 disclaimer do not make a preliminary critique, conclusion, falsifier or proposed
@@ -1785,6 +1819,75 @@ def validate_plan(raw, allow_reaction=True, metadata=None, require_envelope=Fals
                 metadata["reply_to_items"] = []
         metadata["needs_investigation"] = True
     return plan
+
+
+def delivery_status(reference):
+    try:
+        if reference.startswith('square:'):
+            import sqlite3
+            path = os.environ.get('CUSTOS_OBSERVE_DB', '/var/lib/custos-observe/observations.sqlite')
+            db = sqlite3.connect('file:' + path + '?mode=ro', uri=True)
+            try:
+                row = db.execute('SELECT status,receipt FROM outbound WHERE id=?', (reference[7:],)).fetchone()
+                if not row: return {'phase': 'unknown'}
+                return {'phase': row[0], 'receipt': json.loads(row[1]) if row[1] else None}
+            finally: db.close()
+        from custos_actions_client import call
+        status, result = call({'action': 'delivery-status', 'reference': reference}, timeout=3)
+        if status != 200 or not isinstance(result, dict): return {'phase': 'unavailable'}
+        return result
+    except (OSError, ValueError, TimeoutError, sqlite3.Error, http.client.HTTPException):
+        return {'phase': 'unavailable'}
+
+
+def submitted(result):
+    receipt = result.get('receipt') or {}
+    return (result.get('phase') == 'submitted' and isinstance(receipt, dict)
+            and bool(receipt.get('timestamp')) and bool(receipt.get('results'))
+            and all(isinstance(r, dict) and r.get('type') == 'SUCCESS' for r in receipt['results'])
+            and not receipt.get('converted_to_reaction'))
+
+
+def unresolved_deliveries(store, record):
+    if not os.environ.get('TRAJ_ID') or not record.get('trigger_step'):
+        return []
+    outgoing = [r for r in trajectory(store) if r.get('type') == 'message'
+                and r.get('from') == os.environ.get('IDENTITY_NAME', 'custos')
+                and str(r.get('to', '')).startswith('signal')
+                and r.get('reply_to') == record['trigger_step']
+                and r.get('delivery_kind', 'completion') != 'acknowledgment'
+                and not r.get('reaction')]
+    refs = [('action:' + r['request_id']) if r.get('delivered_by') == 'custos-actions'
+            else ('outbox:' + r['step_id']) for r in outgoing]
+    unresolved = []
+    results = [delivery_status(ref) for ref in refs]
+    for i, (reference, result) in enumerate(zip(refs, results)):
+        if submitted(result): continue
+        phase = result.get('phase', 'unknown')
+        if phase in {'suppressed', 'blocked', 'failed'} and any(
+                submitted(later) and outgoing[j].get('delivery_kind') == 'correction'
+                for j, later in enumerate(results) if j > i): continue
+        unresolved.append((reference, phase))
+    return unresolved
+
+
+def wait_event(wait):
+    if wait.get('receipt'):
+        result = delivery_status(wait['receipt'])
+        phase = result.get('phase', 'unknown')
+        if phase in {'submitted', 'suppressed', 'blocked', 'failed', 'uncertain', 'succeeded', 'delivered', 'withdrawn', 'expired'}:
+            return 'Transport receipt changed: ' + wait['receipt'] + ' is ' + phase + '; inspect receipt before closure or another send'
+    elif wait.get('signal_target'):
+        try:
+            from custos_actions_client import social_guard, route_for, call
+            target = wait['signal_target']
+            social_guard(route_for(target))
+            status, lane = call({'action': 'signal-lane-status', 'target': target}, timeout=3)
+            if status != 200 or not lane.get('ok') or lane.get('blocked'): return None
+            return 'Conversation guard is eligible now; recheck host eligibility before sending the staged share'
+        except (ValueError, OSError, subprocess.SubprocessError, http.client.HTTPException):
+            pass
+    return None
 
 
 def trajectory(store):

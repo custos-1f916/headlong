@@ -204,6 +204,23 @@ class Channel:
             with connect(self.state) as db:
                 row = db.execute('SELECT * FROM actions WHERE id=?', (payload['request_id'],)).fetchone()
             return receipt(row) if row else {'ok': False, 'error': 'unknown_request'}
+        if payload.get('action') == 'delivery-status' and set(payload) == {'action', 'reference'}:
+            reference = payload['reference']
+            if not isinstance(reference, str) or not re.fullmatch(r'(?:outbox|action):[A-Za-z0-9:._-]{1,128}', reference):
+                raise ValueError('invalid delivery reference')
+            kind, identifier = reference.split(':', 1)
+            path = self.spool if kind == 'outbox' else self.state
+            # Receipt reads never create a DB, change its journal mode, or reserve a send.
+            db = sqlite3.connect('file:' + str(path) + '?mode=ro', uri=True)
+            try:
+                db.row_factory = sqlite3.Row
+                table = 'outbox' if kind == 'outbox' else 'actions'
+                row = db.execute('SELECT phase,receipt FROM ' + table + ' WHERE id=?', (identifier,)).fetchone()
+            finally:
+                db.close()
+            result = {'ok': bool(row), 'reference': reference, 'phase': row['phase'] if row else 'unknown',
+                      'receipt': json.loads(row['receipt']) if row and row['receipt'] else None}
+            return result
         if payload == {'action': 'automata-status'}:
             return {'ok': True, 'automata': json.loads(run_bounded(
                 ['/usr/sbin/pct','exec','126','--','/usr/bin/python3',

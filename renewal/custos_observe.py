@@ -262,15 +262,6 @@ def housekeep(now, tmp=HOUSEKEEPING_TMP, jobs=HOUSEKEEPING_JOBS, logs=None,
     previous contents survive once as NAME.log.1."""
     import gzip, shutil, subprocess
     report = {"at": now, "removed": [], "rotated": [], "compressed": [], "bytes": 0}
-    # A checkout named for a closed or merged PR is done the moment the review closes,
-    # whatever its age (2026-09-18: 2.4 GB of settled-PR worktrees under /tmp, all
-    # younger than the clone_age rule). `settled` is the PR numbers; a name token of
-    # two to five digits that matches one is the checkout for that PR.
-    settled_numbers = {str(n) for n in settled}
-
-    def settled_checkout(path):
-        return bool(settled_numbers) and any(tok in settled_numbers for tok in re.findall(r"(?<!\d)\d{2,5}(?!\d)", path.name))
-
     def size(path):
         try:
             return sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) if path.is_dir() else path.stat().st_size
@@ -288,7 +279,7 @@ def housekeep(now, tmp=HOUSEKEEPING_TMP, jobs=HOUSEKEEPING_JOBS, logs=None,
         try:
             is_clone = child.is_dir() and not child.is_symlink() and (child / ".git").exists()
             is_report = child.is_file() and child.name.startswith("subrun-") and child.suffix == ".txt"
-            if (is_clone and (stale(child, clone_age) or settled_checkout(child))) or (is_report and stale(child, job_age)):
+            if is_report and stale(child, job_age):
                 report["bytes"] += size(child)
                 shutil.rmtree(child) if child.is_dir() else child.unlink()
                 report["removed"].append(str(child))
@@ -671,7 +662,11 @@ class Observer:
         """Every six hours, the bounded scratch cleanup above; the report is a state key
         (housekeeping:latest), never an observation, so it can never wake the mind."""
         logs = Path(self.native.path).resolve().parents[2] / "run/logs" if getattr(self.native, "path", None) else None
-        self.store.put("housekeeping:latest", housekeep(self.now, logs=logs, settled=self.settled_prs()))
+        report = housekeep(self.now, logs=logs)
+        if os.environ.get('IDENTITY_DIR'):
+            from custos_review_scratch import Registry
+            report['review_scratch'] = Registry().clean()
+        self.store.put("housekeeping:latest", report)
 
     def settled_prs(self):
         """PR numbers whose last github-prs snapshot is closed or merged, so their

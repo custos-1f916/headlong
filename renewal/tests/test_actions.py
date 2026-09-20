@@ -272,7 +272,7 @@ class ActionsClientTests(unittest.TestCase):
             return 200, {'ok': True, 'phase': 'queued', 'request_id': payload['request_id']}
         recorded = []
         body = json.dumps({'request_id': 'signal-test-1', 'target': 'Dani', 'message': 'hello'})
-        with patch.object(self.cac, 'call', side_effect=fake_call), patch.object(self.cac, 'record', side_effect=lambda *a: recorded.append(a)), \
+        with patch.object(self.cac, 'call', side_effect=fake_call), patch.object(self.cac, 'record', side_effect=lambda *a, **kw: recorded.append(a)), \
                 patch.object(sys, 'argv', ['custos-actions', 'signal-send']), patch.object(sys, 'stdin', io.TextIOWrapper(io.BytesIO(body.encode()))), \
                 patch.dict('os.environ', {'CHAT_SOCIAL_BLOCKED': 'not sent: blocked for the test', 'CHAT_DOUBLE_TEXT_GUARD_HOURS': ''}, clear=False), \
                 patch('sys.stdout', new_callable=io.StringIO) as out:
@@ -282,7 +282,7 @@ class ActionsClientTests(unittest.TestCase):
         self.assertEqual([c['action'] for c in calls], ['signal-contacts'])  # resolved the label, never sent
         self.assertEqual(recorded, [])
         calls.clear()
-        with patch.object(self.cac, 'call', side_effect=fake_call), patch.object(self.cac, 'record', side_effect=lambda *a: recorded.append(a)), \
+        with patch.object(self.cac, 'call', side_effect=fake_call), patch.object(self.cac, 'record', side_effect=lambda *a, **kw: recorded.append(a)), \
                 patch.object(sys, 'argv', ['custos-actions', 'signal-send']), patch.object(sys, 'stdin', io.TextIOWrapper(io.BytesIO(body.encode()))), \
                 patch.dict('os.environ', {'CHAT_SOCIAL_BLOCKED': '', 'CHAT_DOUBLE_TEXT_GUARD_HOURS': ''}, clear=False), \
                 patch('sys.stdout', new_callable=io.StringIO) as out:

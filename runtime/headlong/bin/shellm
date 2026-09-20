@@ -2668,7 +2668,19 @@ run_loop() {
     _cleanup_temp="$SHELLM_TEMP_DOCKER"
     _cleanup_ws_name="${_SHELLM_ACTIVE_ENV:-}"
     _cleanup_ctx_pid="${_ctx_summary_pid:-}"
+    _diagnostic_stage=setup
+    _diagnostic_operation=initialize_run
+    _diagnostic_iteration=0
+    _diagnostic_shell_rc=0
     cleanup() {
+        local terminal_rc=$?
+        if [[ -n "${SHELLM_DIAGNOSTIC_OUT:-}" && "$terminal_rc" -ne 0 ]]; then
+            jq -nc --arg stage "$_diagnostic_stage" --arg operation "$_diagnostic_operation" \
+                --argjson rc "$terminal_rc" --argjson iteration "$_diagnostic_iteration" \
+                --argjson shell_rc "$_diagnostic_shell_rc" \
+                '{stage:$stage,operation:$operation,rc:$rc,iteration:$iteration,last_shell_rc:$shell_rc}' \
+                > "$SHELLM_DIAGNOSTIC_OUT" || true
+        fi
         stop_activity_beacon
         # Give run-summary background process time to finish
         if [[ -n "$_cleanup_ctx_pid" ]] && kill -0 "$_cleanup_ctx_pid" 2>/dev/null; then
@@ -2813,6 +2825,7 @@ run_loop() {
         if [[ -n "$SHELLM_CONTEXT_MAX_BYTES" ]]; then
             _ctx_args+=(--max-bytes "$SHELLM_CONTEXT_MAX_BYTES")
         fi
+        _diagnostic_stage=context; _diagnostic_operation=render_context; _diagnostic_iteration=$iteration
         messages_json=$(context "${_ctx_args[@]}") || die "context rendering failed; no model request sent"
 
         # Call Claude (capture thinking/reasoning to file)
@@ -2830,6 +2843,7 @@ run_loop() {
         local _llm_t0
         _llm_t0=$(date +%s)
         local response
+        _diagnostic_stage=gateway; _diagnostic_operation=call_llm
         response=$(call_llm "$system_prompt" "$messages_json" "$thinking_file")
 
         # Read captured thinking/reasoning
@@ -2900,6 +2914,7 @@ run_loop() {
         done
 
         if [[ -z "$response" ]]; then
+            _diagnostic_stage=parse; _diagnostic_operation=empty_response_exhausted
             if [[ -n "$thinking" ]]; then
                 die "Empty response from $SHELLM_MODEL after $empty_retries retries: $(truncate_output "$thinking")"
             fi
@@ -2921,6 +2936,7 @@ run_loop() {
 
         # Extract bash code
         local code
+        _diagnostic_stage=parse; _diagnostic_operation=extract_code
         code=$(extract_code "$response")
 
         if [[ -z "$code" ]]; then
@@ -2952,6 +2968,7 @@ run_loop() {
         # Build wrapped code that captures FINAL/FINAL_FILE after execution
         local wrapped_code
         # shellcheck disable=SC1078,SC1079  # one long double-quoted string, built across lines on purpose
+        _diagnostic_stage=exec; _diagnostic_operation=execute_generated_script
         wrapped_code="$(_shellm_guard_preamble)
 set -x
 $code
@@ -3005,6 +3022,7 @@ exit \$__shellm_rc
             SHELLM_TRIGGER_STEP_ID=""
             SHELLM_LAUNCHED_BY=""
             SHELLM_RUN_ID_OUT=""
+            SHELLM_DIAGNOSTIC_OUT=""
             # traj append stamps this as run_id on steps the executed code
             # writes (observations etc.), linking them to this run exactly
             SHELLM_RUN_STEP_ID="$_run_step_id"
@@ -3159,6 +3177,8 @@ exit \$__shellm_rc
 
         debug "Exit code: $exit_code, timed_out: $timed_out"
 
+        _diagnostic_shell_rc=$exit_code
+        _diagnostic_stage=record; _diagnostic_operation=record_shell_result
         # Show exit status
         if [[ "$timed_out" -eq 1 ]]; then
             if [[ "$kill_reason" == "nested" ]]; then
@@ -3306,6 +3326,7 @@ exit \$__shellm_rc
             if [[ -n "$_stall" ]]; then
                 [[ "$QUIET" -eq 0 ]] && echo >&2
                 progress "\033[1;31mSTALL: agent $_stall (last exit=$exit_code) — aborting run\033[0m"
+                _diagnostic_stage=exec; _diagnostic_operation=stall_guard
                 printf '%s [shellm] STALL: agent %s (last exit=%s); aborting run %s to stop a spin.\n' \
                     "$(date -u +%FT%TZ)" "$_stall" "$exit_code" "$_run_traj_id" >&2
                 jq -nc \
@@ -3328,6 +3349,7 @@ exit \$__shellm_rc
     done
 
     [[ "$QUIET" -eq 0 ]] && echo >&2
+    _diagnostic_stage=control; _diagnostic_operation=iteration_limit
     progress "\033[1;31mMax iterations ($SHELLM_MAX_ITERATIONS) reached without final answer\033[0m"
     # Write thought step to parent traj (even on failure)
     # Skip when using --traj (steps already went to the shared traj)

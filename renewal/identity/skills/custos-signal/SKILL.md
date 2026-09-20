@@ -211,3 +211,20 @@ admission, even under new request IDs. It reports the eligibility event; polling
 reactions, and another error do not refill an exhausted outage budget. Record the
 blocked task with `custos-memory wait`; resume only on eligible new input or an
 explicit operator recovery, and recheck status before attempting delivery.
+
+
+## Researched comparisons
+
+Before recommending hardware or an enclosure, check the exact product variant and
+primary specifications. Keep a field ledger beside the research: variant, named
+field, numeric value, unit, primary URL and the excerpt that supports that field.
+Retain contradictory excerpts and explain their resolution; if unresolved, say so
+or omit that comparison. A keyword match is not evidence for the requested dimension:
+doorway height and total/zenith height are different fields; equivalent and actual
+focal lengths are different fields. Derive focal ratio only from actual focal length
+and aperture in matching units. A retailer's column heading may describe equivalence.
+
+`custos-evidence` reads the ledger JSON on stdin and validates its fields, primary
+links, explicit conflict resolution and ratios. Use `custos-evidence --help` for the schema. A passing ledger checks structure/arithmetic, not source truth;
+read the excerpts. Carry source links and any uncertainty into the answer, and retain
+the ledger path on the goal. Do not let a confident summary erase variant differences.

@@ -31,8 +31,8 @@ import custos_attachments as attachments
 HOST, PORT = '192.168.86.44', 18082
 
 
-def call(payload):
-    connection = http.client.HTTPConnection(HOST, PORT, timeout=40)
+def call(payload, timeout=40):
+    connection = http.client.HTTPConnection(HOST, PORT, timeout=timeout)
     try:
         connection.request('POST', '/v1/actions', body=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
         response = connection.getresponse(); raw = response.read(1048577)
@@ -139,13 +139,15 @@ def guard(route):
             raise ValueError((result.stderr or result.stdout).strip().replace('chat: error: ', '') or 'refused by the conversation guard')
 
 
-def record(route, message, request_id, phase, files=None, reply_to=None, social=False):
+def record(route, message, request_id, phase, files=None, reply_to=None, social=False, delivery_kind="completion", correction_of=None):
     """Append the accepted send to the root trajectory as a message step."""
     root = os.environ.get('ROOT_TRAJ_ID') or os.environ.get('TRAJ_ID')
     if not root:
         return
     step = {'type': 'message', 'from': os.environ.get('IDENTITY_NAME', 'custos'), 'to': route, 'content': message,
             'source': 'custos-actions', 'delivered_by': 'custos-actions', 'request_id': request_id, 'phase': phase}
+    step['delivery_kind'] = delivery_kind
+    if correction_of: step['correction_of'] = correction_of
     if social:
         step['social_intent'] = True
     if files:
@@ -170,7 +172,7 @@ def resolve_reply(step, route):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('action', choices=['signal-lane-status', 'signal-contacts', 'signal-send', 'signal-ask', 'signal-await', 'signal-release', 'automata-status', 'automata-deploy', 'automata-rollback', 'status'])
+    p.add_argument('action', choices=['signal-lane-status', 'signal-contacts', 'signal-send', 'signal-ask', 'signal-await', 'signal-release', 'automata-status', 'automata-deploy', 'automata-rollback', 'status', 'delivery-status'])
     p.add_argument('request_id', nargs='?')
     p.add_argument('--attach', action='append', default=[], metavar='FILE', help='attach a guest file (repeat up to four; 8 MiB total)')
     p.add_argument('--reply-to', metavar='STEP', help='quote a delivered native Signal message (unique step ID/prefix)')
@@ -188,7 +190,10 @@ def main():
             if not isinstance(payload, dict) or 'action' in payload: raise ValueError('object without action required')
         else:
             payload = {}
-        if args.action in ('status', 'signal-await', 'signal-release'):
+        if args.action == 'delivery-status':
+            if not args.request_id: raise ValueError('delivery reference required')
+            payload['reference'] = args.request_id
+        elif args.action in ('status', 'signal-await', 'signal-release'):
             if not args.request_id: raise ValueError('request ID required')
             payload['request_id'] = args.request_id
         elif args.request_id:
@@ -236,9 +241,9 @@ def main():
         if ok and route is not None:
             if payload.get('attachments') or reply_step:
                 record(route, payload['message'], payload['request_id'], result.get('phase', 'queued'),
-                       payload.get('attachments'), reply_step, **({'social': True} if args.social else {}))
+                       payload.get('attachments'), reply_step, social=args.social, delivery_kind=payload.get('delivery_kind', 'completion'), correction_of=payload.get('correction_of'))
             else:
-                record(route, payload['message'], payload['request_id'], result.get('phase', 'queued'), **({'social': True} if args.social else {}))
+                record(route, payload['message'], payload['request_id'], result.get('phase', 'queued'), social=args.social, delivery_kind=payload.get('delivery_kind', 'completion'), correction_of=payload.get('correction_of'))
         return 0 if ok else 1
     except ValueError as error:
         print(json.dumps({'ok': False, 'error': str(error)[:200]}))

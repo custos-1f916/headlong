@@ -148,3 +148,26 @@ submitted action receipt with custos-actions signal-send without reply-to. Close
 only against a successful correction receipt or an evidenced
 judgment that no correction is needed. Recording the new caveat in a fact alone
 is not delivery.
+
+
+## Delivery and eligibility waits
+
+`chat reply` prints the recorded step ID. It means pending transport. Inspect
+`custos-actions delivery-status outbox:STEP_ID` (or `action:REQUEST_ID` for actions).
+Only `submitted` with timestamp and all recipients `SUCCESS` confirms submission.
+Suppressed, blocked, converted-to-reaction and uncertain do not deliver the intended
+text. A completed native task with a correlated Signal send now checks the actual
+receipts; an unresolved send keeps the task active. An uncertain send must be
+reconciled, never retried under a new ID. `--follow-up` does not create a second
+completion slot. Use the original submitted reference with the correction workflow
+above when the message corrects a prior claim.
+
+Park a receipt wait with JSON to `custos-memory wait`:
+`{"goal_id":"actual-id","reason":"Waiting for the recorded result","receipt":"outbox:STEP_ID"}`.
+Square receipts use `square:traj:STEP_ID`. A guarded discretionary share uses
+`{"goal_id":"actual-id","reason":"Staged share awaits an eligible conversation","signal_target":"dm:EXACT_TARGET_FROM_CONTACTS"}`.
+The context builder checks the existing guard and receipt state without a model call,
+resumes on a terminal receipt or eligible lane, and uses a six-hour fallback check.
+Terminal suppression wakes the task for reconciliation, not another send. Keep the
+staged text and original eligibility evidence in the goal; do not repeatedly compute
+reopening times or poll within a wake. The send-time host guard still decides.

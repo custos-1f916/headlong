@@ -35,7 +35,7 @@ _chatrc_get() {
 
 # Append to the root trajectory, not the current (possibly forked) one
 _chat_append() {
-    traj append "${ROOT_TRAJ_ID:-$TRAJ_ID}" >/dev/null
+    traj append "${ROOT_TRAJ_ID:-$TRAJ_ID}"
 }
 
 # Handle --help before env var check
@@ -421,7 +421,7 @@ Use the name of the person you mean to reach: chat reply <their-name> <message>"
          + (if $follow_up == 1 then {follow_up:true} else {} end)' \
         | _chat_append
 
-    printf 'Reply recorded for delivery%s; transport receipt confirms submission.\n' "${OUTBOUND_NOTE:+ ($OUTBOUND_NOTE)}" >&2
+    printf 'Reply recorded for delivery%s; submission is pending. Check custos-actions delivery-status outbox:STEP_ID before claiming delivery.\n' "${OUTBOUND_NOTE:+ ($OUTBOUND_NOTE)}" >&2
 }
 
 cmd_send_file() {
