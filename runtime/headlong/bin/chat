@@ -198,7 +198,7 @@ _send_via_actions() {
         printf 'chat: error: %s\n' "${out:-not sent: custos-actions refused or is unavailable}" >&2
         return 1
     fi
-    printf 'Sent through custos-actions as a new message (not a reply; recorded there): %s\n' "$out" >&2
+    printf 'Recorded through custos-actions as a new message; inspect its phase and receipt: %s\n' "$out" >&2
     return 0
 }
 
@@ -294,7 +294,7 @@ To keep a note for yourself, append a thought step instead of a message."
          + (if $source_url == "" then {} else {source_url:$source_url} end)' \
         | _chat_append
 
-    printf 'Message sent%s.\n' "${OUTBOUND_NOTE:+ ($OUTBOUND_NOTE)}" >&2
+    printf 'Message recorded%s; transport submission is pending.\n' "${OUTBOUND_NOTE:+ ($OUTBOUND_NOTE)}" >&2
 }
 
 cmd_reply() {
@@ -566,7 +566,7 @@ cmd_react() {
          + (if $source_url == "" then {} else {source_url:$source_url} end)' \
         | _chat_append
 
-    printf 'Reaction sent: :%s:\n' "$emoji" >&2
+    printf 'Reaction recorded; transport submission is pending: :%s:\n' "$emoji" >&2
 }
 
 # UTF-8, no NUL: the historical `content=$(cat ...)` shape Slack/web still read.

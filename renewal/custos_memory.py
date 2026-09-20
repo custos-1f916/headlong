@@ -1824,7 +1824,6 @@ def validate_plan(raw, allow_reaction=True, metadata=None, require_envelope=Fals
 def delivery_status(reference):
     try:
         if reference.startswith('square:'):
-            import sqlite3
             path = os.environ.get('CUSTOS_OBSERVE_DB', '/var/lib/custos-observe/observations.sqlite')
             db = sqlite3.connect('file:' + path + '?mode=ro', uri=True)
             try:

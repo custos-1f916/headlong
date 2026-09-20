@@ -42,6 +42,11 @@ class DeliveryTests(MemoryFixture):
             for _ in range(3): self.assertEqual(len(self.store.context()['waiting']), 1)
         self.assertEqual(self.store.find(goal)[4]['waiting'], before)
 
+    def test_unavailable_receipt_lookup_fails_closed(self):
+        import custos_actions_client as client
+        with patch.object(client, 'call', side_effect=OSError('private server detail')):
+            self.assertEqual(cm.delivery_status('outbox:step'), {'phase':'unavailable'})
+
     def test_receipt_failures_never_become_submission(self):
         for result in [{'phase':'unknown'}, {'phase':'uncertain'}, {'phase':'submitted'},
                        {**SUCCESS, 'receipt': {**SUCCESS['receipt'], 'results':[{'type':'FAILURE'}]}},
