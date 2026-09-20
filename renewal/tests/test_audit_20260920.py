@@ -93,6 +93,9 @@ class ReceiptAPITests(unittest.TestCase):
             channel=ca.Channel.__new__(ca.Channel);channel.spool=str(path)
             result=channel.handle({'action':'delivery-status','reference':'outbox:step'})
             self.assertEqual(result['phase'],'suppressed');self.assertNotIn('private message',json.dumps(result))
+            from custos_actions_client import explain_status
+            semantics = explain_status(result)['delivery_state']
+            self.assertTrue(semantics['terminal']);self.assertFalse(semantics['automatic_retry'])
             self.assertEqual(channel.handle({'action':'delivery-status','reference':'outbox:absent'})['phase'],'unknown')
             with self.assertRaises(ValueError): channel.handle({'action':'delivery-status','reference':'outbox:../../secret'})
             with sqlite3.connect(path) as db: self.assertEqual(db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],1)

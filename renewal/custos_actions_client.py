@@ -48,6 +48,10 @@ def explain_status(result):
         return result
     phase = result['phase']
     states = {
+        'suppressed': (False, True, 'Terminal suppressed delivery. The intended text was not submitted and will not retry.',
+                       'Inspect the original receipt and spent claim; use a verified correction when appropriate, never a new ID to bypass suppression.'),
+        'pending': (True, False, 'Recorded in the native transport spool; submission is pending.', 'Wait for its receipt.'),
+        'sending': (False, False, 'Transport attempt is in flight; outcome is not established.', 'Reconcile this reference; do not resend.'),
         'queued': (True, False, 'Host retained the action; queue acceptance is not delivery.',
                    'Wait for a receipt or relevant transport event; do useful other work.'),
         'running': (False, False, 'Action is in progress; acceptance is not established.',
