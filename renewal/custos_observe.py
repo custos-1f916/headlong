@@ -570,7 +570,19 @@ class Observer:
                 return
             if b"<!DOCTYPE" in raw.upper() or b"<!ENTITY" in raw.upper():
                 raise APIError("feed_entity_declarations_refused")
-            root = ET.fromstring(raw)
+            try:
+                root = ET.fromstring(raw)
+            except ET.ParseError:
+                # A transient truncated or malformed body from the upstream CDN
+                # (observed on news.un.org): force one fresh full fetch rather
+                # than failing the whole source and waking the mind.
+                time.sleep(5)
+                raw, etag, status = public_request(url, None)
+                if status == 304:
+                    raise
+                if b"<!DOCTYPE" in raw.upper() or b"<!ENTITY" in raw.upper():
+                    raise APIError("feed_entity_declarations_refused")
+                root = ET.fromstring(raw)
             if root.tag.rsplit("}", 1)[-1] not in ("feed", "rss", "RDF"):
                 raise APIError("unsupported_feed_format")
             entries = root.findall("{http://www.w3.org/2005/Atom}entry") or root.findall("./channel/item") or root.findall("{http://purl.org/rss/1.0/}item")

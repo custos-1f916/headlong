@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import xml.etree.ElementTree as ET
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -284,6 +285,33 @@ class ObservationTests(unittest.TestCase):
             self.observer(None, max_signals_per_run=1).feed(feed)
             self.assertEqual(len(self.native.messages), 2)
             self.assertEqual(request.call_count, 2)
+
+    def test_feed_transient_parse_error_retries_once_and_recovers(self):
+        # A truncated body from the upstream CDN (observed on news.un.org) must
+        # force one fresh full fetch rather than failing the whole source.
+        feed = {"name": "un", "url": "https://news.un.invalid/rss"}
+        malformed = b'<rss><channel><item><guid>one</guid><title>Trunc'
+        good = b'<rss><channel><item><guid>one</guid><title>One</title></item></channel></rss>'
+        observer = self.observer(None)
+        with patch("custos_observe.public_request", side_effect=[(malformed, "a", 200), (good, "b", 200)]) as request, \
+                patch("custos_observe.time.sleep") as sleep:
+            observer.feed(feed)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(sleep.call_count, 1)
+        # The recovered read is the initial baseline, so no message yet.
+        self.assertEqual(self.native.messages, {})
+
+    def test_feed_persistent_parse_error_retries_once_then_fails(self):
+        # A second malformed body must still raise (exactly one retry, not a loop).
+        feed = {"name": "un", "url": "https://news.un.invalid/rss"}
+        malformed = b'<rss><channel><item><guid>one</guid><title>Trunc'
+        observer = self.observer(None)
+        with patch("custos_observe.public_request", side_effect=[(malformed, "a", 200), (malformed, "b", 200)]) as request, \
+                patch("custos_observe.time.sleep") as sleep:
+            with self.assertRaises(ET.ParseError):
+                observer.feed(feed)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(sleep.call_count, 1)
 
     def test_opportunity_excludes_exhausted_unfunded_and_labels_snapshot(self):
         detail = {"listing_id": 20, "title": "Useful source fix", "amount_atomic": "5000000", "chain_id": 8453, "token": "0x" + "a" * 40, "expiry": 5000, "economics": {"available_award_capacity": 0}, "condition": "Check a real fix", "funding_mode": "promise"}
