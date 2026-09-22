@@ -955,6 +955,9 @@ class Observer:
         poll(self, Forum(config=self.config["forum"]), kind)
 
     def run(self):
+        # Local storage gets the first observation slot, before network sources.
+        from custos_disk_space import observe as disk_space
+        self.source("disk-space", 300, lambda: disk_space(self))
         self.source("square-outbox", 60, self.outbox)
         from custos_news import drain as drain_news
         self.source("ai-news-review", 60, lambda: drain_news(self))
