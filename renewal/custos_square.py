@@ -4,6 +4,7 @@ No signing, key management, wallet, listing mutation or payment endpoints.
 An uncertain write is only reconciled by readback, never automatically retried.
 """
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 import custos_square_policy as policy
 
 ORIGIN = "https://1f916.ai"
@@ -80,6 +82,15 @@ def public_request(url, etag=None, method="GET", body=None, bearer=None):
             raw = response.read(MAX_RESPONSE + 1)
             if len(raw) > MAX_RESPONSE:
                 raise APIError("response_too_large")
+            if "gzip" in (response.headers.get("Content-Encoding") or "").casefold():
+                # The CDN may force-gzip without an Accept-Encoding (observed on
+                # news.un.org); decode so consumers parse the payload, not the wire.
+                try:
+                    raw = gzip.decompress(raw)
+                except (OSError, EOFError, zlib.error) as exc:
+                    raise APIError("content_encoding_unreadable") from None
+                if len(raw) > MAX_RESPONSE:
+                    raise APIError("response_too_large")
             return raw, response.headers.get("ETag"), response.status
     except urllib.error.HTTPError as exc:
         if exc.code == 304:
