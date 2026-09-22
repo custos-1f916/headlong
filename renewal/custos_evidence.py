@@ -2,6 +2,7 @@
 JSON: {claims:[{variant,field,value,unit,sources:[{url,quote,primary}],
 conflicts:[{url,quote}],resolution?}], ratios:[{variant,numerator,denominator}]}
 This checks provenance completeness and arithmetic, not whether a quote is true.
+For public PR live checks: custos-evidence live-capture|live-render --help.
 """
 import json
 import math
@@ -43,6 +44,9 @@ def validate(document):
 
 
 def main():
+    if sys.argv[1:2] in (['live-capture'], ['live-render']):
+        from custos_review_evidence import main as live_main
+        return live_main(sys.argv[1:])
     if '--help' in sys.argv[1:]: print(__doc__); return 0
     try:
         raw = sys.stdin.buffer.read(131073)

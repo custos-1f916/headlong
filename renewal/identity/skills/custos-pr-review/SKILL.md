@@ -46,6 +46,44 @@ limitations, and feedback dispositions. Run untrusted PR tests only through
 before publishing or completing; changed code needs a fresh/delta review. Preserve
 old reports and use prior findings to avoid repeating yourself.
 
+### Live observations
+
+A live check is optional. If you did not execute one, omit live-check claims from
+the report and review. Source code, CI, earlier observations and expected behavior
+are not observations of the running deployment. Keep hermetic test results separate.
+
+For a public HTTP check, capture the actual request before drafting its conclusion:
+
+```bash
+custos-evidence live-capture --repo OWNER/REPO --pr NUMBER --head FULL_SHA --url https://PUBLIC_ENDPOINT
+```
+
+This executes a bounded, unauthenticated HTTPS GET, without following redirects.
+It returns a receipt ID, UTC times, HTTP status, response hash and a preview; the
+complete response is retained in the receipt file. Use only public endpoints you
+already have authority to read. Do not supply private data, credential-bearing
+URLs or authenticated/session endpoints. Foreign code/tests still use `hermetic`.
+HTTP errors are observed responses, not passing checks; connection failures and
+oversized/incomplete bodies cannot become completed observations.
+
+Generate the evidence section from that receipt, for the same repo/PR/head:
+
+```bash
+custos-evidence live-render --repo OWNER/REPO --pr NUMBER --head FULL_SHA --receipt RECEIPT_ID --quote-file EXACT_EXCERPT.txt > live-observation.md
+```
+
+The excerpt must be an exact substring of the captured response, not a paraphrase
+or expected output. Omit `--quote-file` for a small complete response. Only append
+the section after a successful render. Retain it in the report and include it with
+any published live-check claim; do not handwrite a substitute execution receipt.
+Explain what the excerpt supports and what remains unverified. A missing field in
+an excerpt is not evidence of absence from the full response. The reviewed head
+does not identify the deployed version. Keep the observation time explicit; after
+a deployment/head change, obtain relevant new evidence or withdraw the live claim.
+If an essential check needs another transport, retain that transport's actual
+timestamped command/result and state its limits; do not pass predicted text to
+this helper. When the executed evidence is unavailable, omit the live claim.
+
 ## When Jev helps
 
 Load `custos-jev`. Jev supplies typed judgments, not code, prose reviews, browsing,
