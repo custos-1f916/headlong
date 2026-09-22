@@ -1,3 +1,4 @@
+import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from custos_observe import Observer, classify_opportunity, housekeep, import_continuity, record_result
-from custos_square import APIError, Square, Store
+from custos_square import APIError, Square, Store, public_request
 
 
 class NativeFixture:
@@ -755,3 +756,58 @@ class ScheduleTests(unittest.TestCase):
         self.config["schedules"] = [{"name": "friday-order", "weekday": "Fri", "at": "09:00", "tz": "America/Denver", "content": "Order."}]
         self.run_at("2026-11-06T09:02:00-07:00")  # after the DST change: 09:00 MST is still 09:00 local
         self.assertEqual(self.emitted(), ["schedule:friday-order:2026-11-06T09:00"])
+
+
+class _Headers:
+    def __init__(self, mapping):
+        self._mapping = mapping
+    def get(self, k, default=None):
+        return self._mapping.get(k, default)
+
+
+class _FakeResponse:
+    def __init__(self, raw, content_encoding=None):
+        self.raw = raw
+        self.headers = _Headers({"Content-Encoding": content_encoding} if content_encoding else {})
+        self.status = 200
+    def read(self, n=None):
+        return self.raw
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+
+class PublicRequestTests(unittest.TestCase):
+    """public_request must return the decoded payload, not the wire bytes.
+
+    The UN CDN force-gzips (Content-Encoding: gzip) without an
+    Accept-Encoding; undecoded, ET.fromstring chokes on the gzip magic and
+    the source fails every interval (un-news, 2026-09-22).
+    """
+
+    def _response(self, raw, content_encoding=None):
+        return _FakeResponse(raw, content_encoding)
+
+    def test_forced_gzip_is_decoded(self):
+        body = b'<rss><channel><item><guid>one</guid><title>One</title></item></channel></rss>'
+        with patch("custos_square.urllib.request.build_opener") as opener:
+            opener.return_value.open.return_value = self._response(gzip.compress(body), "gzip")
+            raw, tag, status = public_request("https://news.un.invalid/rss")
+        self.assertEqual(status, 200)
+        self.assertEqual(raw, body)
+        ET.fromstring(raw)
+
+    def test_plain_body_passes_through(self):
+        body = b'{"ok":true}'
+        with patch("custos_square.urllib.request.build_opener") as opener:
+            opener.return_value.open.return_value = self._response(body)
+            raw, tag, status = public_request("https://1f916.invalid/api")
+        self.assertEqual(raw, body)
+
+    def test_corrupt_gzip_is_content_encoding_unreadable(self):
+        with patch("custos_square.urllib.request.build_opener") as opener:
+            opener.return_value.open.return_value = self._response(b"\x1f\x8b\x08nope", "gzip")
+            with self.assertRaises(APIError) as ctx:
+                public_request("https://news.un.invalid/rss")
+        self.assertEqual(ctx.exception.code, "content_encoding_unreadable")
