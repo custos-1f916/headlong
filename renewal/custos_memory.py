@@ -1878,9 +1878,9 @@ def wait_event(wait):
             return 'Transport receipt changed: ' + wait['receipt'] + ' is ' + phase + '; inspect receipt before closure or another send'
     elif wait.get('signal_target'):
         try:
-            from custos_actions_client import social_guard, route_for, call
+            from custos_actions_client import social_guard, mind_guard, route_for, call
             target = wait['signal_target']
-            social_guard(route_for(target))
+            (mind_guard if wait.get('reason', '').startswith('Local Signal cooldown (mind);') else social_guard)(route_for(target))
             status, lane = call({'action': 'signal-lane-status', 'target': target}, timeout=3)
             if status != 200 or not lane.get('ok') or lane.get('blocked'): return None
             return 'Conversation guard is eligible now; recheck host eligibility before sending the staged share'

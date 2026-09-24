@@ -12,6 +12,8 @@
 # step, the inline form of the same prompt fails on Linux (the bug this
 # guards against), and the two error paths say something useful.
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/isolated-env.sh"
+
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"

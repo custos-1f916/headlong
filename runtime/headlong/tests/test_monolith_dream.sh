@@ -7,6 +7,8 @@
 # shown again next wake, MONOLITH_RELATED_MEMORIES=0 removes the section, the
 # goal-review hint fires on the first wake and not on the next, and the
 # active-goals section lists a todo with its type.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/isolated-env.sh"
+
 set -uo pipefail
 unset IDENTITY_DIR IDENTITY_NAME MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID 2>/dev/null
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(dirname "$HERE")"; STEP="$REPO/thinkers/monolith/step"

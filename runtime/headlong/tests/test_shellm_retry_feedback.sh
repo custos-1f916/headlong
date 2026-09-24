@@ -15,6 +15,8 @@
 #   3. SHELLM_EMPTY_RESPONSE_RETRIES caps the loop (default 8), so a
 #      persistently empty provider ends the run instead of billing forever.
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/isolated-env.sh"
+
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"

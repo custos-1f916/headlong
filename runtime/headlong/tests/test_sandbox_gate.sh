@@ -10,6 +10,8 @@
 # hard-fails instead of silently falling back to the host if the daemon
 # later dies. Docker is a stub here; no real daemon is touched.
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/isolated-env.sh"
+
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"

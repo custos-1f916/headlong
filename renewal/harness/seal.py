@@ -81,6 +81,19 @@ def snapshot(source,dest,profile='offline'):
             shutil.copy2(p,q)
     return {'files':count,'bytes':total}
 
+def clean_dependencies(root):
+    """Only copies under the owning job; preserve source, locks and diagnostics."""
+    removed=[]
+    if not root.is_dir() or root.is_symlink():return removed
+    for parent,dirs,_ in os.walk(root,followlinks=False):
+        for name in list(dirs):
+            path=P(parent)/name
+            if path.is_symlink():dirs.remove(name);continue
+            if name=='node_modules':
+                shutil.rmtree(path);dirs.remove(name);removed.append(str(path))
+    return removed
+
+
 def _run(source,argv,profile='offline',seconds=900,keep=True,subdir='',test_env=None,job_root=STATE):
     if profile not in {'offline','fetch','model'} or not 1<=seconds<=1800:raise ValueError('invalid profile or time bound')
     if not argv or not all(isinstance(x,str) and '\x00' not in x for x in argv):raise ValueError('command required')
@@ -91,39 +104,45 @@ def _run(source,argv,profile='offline',seconds=900,keep=True,subdir='',test_env=
     meminfo=dict((l.split(':',1)[0],int(l.split()[1])) for l in P('/proc/meminfo').read_text().splitlines())
     if meminfo['MemAvailable']<1536*1024:raise RuntimeError('insufficient memory headroom for sealed experiment')
     job_root.mkdir(parents=True,exist_ok=True,mode=0o700);job=job_root/(time.strftime('%Y%m%dT%H%M%SZ',time.gmtime())+'-'+uuid.uuid4().hex[:12]);job.mkdir(mode=0o700)
-    inputs=job/'input';inputs.mkdir();info=snapshot(P(source),inputs,profile)
-    head=subprocess.run(['git','-C',str(source),'rev-parse','HEAD'],capture_output=True,text=True).stdout.strip()
-    spec={'argv':argv,'profile':profile,'seconds':seconds,'subdir':subdir,'test_env':test_env or {},'git_head':head if re.fullmatch('[a-f0-9]{40}',head) else None}
-    (job/'spec.json').write_text(json.dumps(spec));unit='custos-sealed-'+uuid.uuid4().hex[:16]
-    proxy=None
-    if profile!='offline':
-        proxy=Proxy(str(job/'proxy.sock'),ProxyHandler);proxy.profile=profile;proxy.model_lock=threading.Lock();threading.Thread(target=proxy.serve_forever,daemon=True).start()
-    toolchain=P('/var/lib/custos-harness/toolchain')
-    if not all((toolchain/n).is_file() for n in ['root.ext4','vmlinuz','initrd']):raise RuntimeError('sealed VM toolchain is not installed')
-    # Read-only block images expose only copied source and the curated toolchain.
-    # No virtiofs/9p mounts, host directory shares, production sockets or credentials.
-    volume=job/'volume';volume.mkdir();inputs.rename(volume/'input');inputs=volume/'input'
-    shutil.copy2(job/'spec.json',volume/'spec.json')
-    shutil.copy2(P(__file__).with_name('sandbox_entry.py'),volume/'entry.py')
-    disk=job/'input.ext4';size=max(64*1024*1024,info['bytes']+info['files']*8192+32*1024*1024)
-    with disk.open('wb') as f:f.truncate(size)
-    subprocess.run(['mkfs.ext4','-q','-F','-N',str(max(1024,info['files']*2+4096)),'-d',str(volume),str(disk)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=120)
-    args=['qemu-system-x86_64','-machine','q35,accel=kvm','-cpu','host','-smp','1','-m','1536',
-          '-nodefaults','-no-reboot','-display','none','-monitor','none','-serial','stdio',
-          '-kernel',str(toolchain/'vmlinuz'),'-initrd',str(toolchain/'initrd'),
-          '-append','root=/dev/vda ro init=/sbin/custos-sealed-init console=ttyS0 quiet loglevel=0 panic=1',
-          '-drive','file='+str(toolchain/'root.ext4')+',format=raw,if=virtio,readonly=on',
-          '-drive','file='+str(disk)+',format=raw,if=virtio,readonly=on']
-    if profile=='offline':args+=['-nic','none']
-    else:
-        # SLIRP restrict=on denies all normal guest egress/host access. Its only
-        # guestfwd starts a fixed socat bridge to this job's allowlisted proxy.
-        args+=['-netdev','user,id=sealed,restrict=on,guestfwd=tcp:10.0.2.100:18080-cmd:/usr/bin/socat STDIO UNIX-CONNECT:'+str(job/'proxy.sock'),'-device','virtio-net-pci,netdev=sealed']
-    cmd=['systemd-run','--quiet','--pipe','--wait','--collect','--unit',unit,'-p','MemoryMax=2048M','-p','MemorySwapMax=128M','-p','CPUQuota=100%','-p','TasksMax=256','-p','RuntimeMaxSec='+str(seconds+60),'-p','KillMode=control-group','-p','TimeoutStopSec=5',*args]
+    unit='custos-sealed-'+uuid.uuid4().hex[:16]
+    inputs=job/'input';volume=job/'volume';disk=job/'input.ext4'
+    proxy=None;proc=None;result=None;info={};stage='snapshot'
     clean={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8','HOME':'/nonexistent'}
-    result=None;artifact_bytes=log_bytes=0;started=time.monotonic();last_notice=started
-    proc=subprocess.Popen(cmd,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=clean,close_fds=True)
+    # Exists before any copy. Even setup failure has an owner and a receipt.
+    (job/'setup.json').write_text(json.dumps({'source':str(P(source).resolve()),'profile':profile,
+        'pid':os.getpid(),'started_at':time.time(),'unit':unit,'argv':argv})+'\n')
     try:
+        inputs=job/'input';inputs.mkdir();info=snapshot(P(source),inputs,profile)
+        head=subprocess.run(['git','-C',str(source),'rev-parse','HEAD'],capture_output=True,text=True).stdout.strip()
+        spec={'argv':argv,'profile':profile,'seconds':seconds,'subdir':subdir,'test_env':test_env or {},'git_head':head if re.fullmatch('[a-f0-9]{40}',head) else None}
+        (job/'spec.json').write_text(json.dumps(spec));stage='toolchain'
+        if profile!='offline':
+            proxy=Proxy(str(job/'proxy.sock'),ProxyHandler);proxy.profile=profile;proxy.model_lock=threading.Lock();threading.Thread(target=proxy.serve_forever,daemon=True).start()
+        toolchain=P('/var/lib/custos-harness/toolchain')
+        if not all((toolchain/n).is_file() for n in ['root.ext4','vmlinuz','initrd']):raise RuntimeError('sealed VM toolchain is not installed')
+        # Read-only block images expose only copied source and the curated toolchain.
+        # No virtiofs/9p mounts, host directory shares, production sockets or credentials.
+        stage='image';volume.mkdir();inputs.rename(volume/'input');inputs=volume/'input'
+        shutil.copy2(job/'spec.json',volume/'spec.json')
+        shutil.copy2(P(__file__).with_name('sandbox_entry.py'),volume/'entry.py')
+        size=max(64*1024*1024,info['bytes']+info['files']*8192+32*1024*1024)
+        with disk.open('wb') as f:f.truncate(size)
+        subprocess.run(['mkfs.ext4','-q','-F','-N',str(max(1024,info['files']*2+4096)),'-d',str(volume),str(disk)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=120)
+        args=['qemu-system-x86_64','-machine','q35,accel=kvm','-cpu','host','-smp','1','-m','1536',
+              '-nodefaults','-no-reboot','-display','none','-monitor','none','-serial','stdio',
+              '-kernel',str(toolchain/'vmlinuz'),'-initrd',str(toolchain/'initrd'),
+              '-append','root=/dev/vda ro init=/sbin/custos-sealed-init console=ttyS0 quiet loglevel=0 panic=1',
+              '-drive','file='+str(toolchain/'root.ext4')+',format=raw,if=virtio,readonly=on',
+              '-drive','file='+str(disk)+',format=raw,if=virtio,readonly=on']
+        if profile=='offline':args+=['-nic','none']
+        else:
+            # SLIRP restrict=on denies all normal guest egress/host access. Its only
+            # guestfwd starts a fixed socat bridge to this job's allowlisted proxy.
+            args+=['-netdev','user,id=sealed,restrict=on,guestfwd=tcp:10.0.2.100:18080-cmd:/usr/bin/socat STDIO UNIX-CONNECT:'+str(job/'proxy.sock'),'-device','virtio-net-pci,netdev=sealed']
+        cmd=['systemd-run','--quiet','--pipe','--wait','--collect','--unit',unit,'-p','MemoryMax=2048M','-p','MemorySwapMax=128M','-p','CPUQuota=100%','-p','TasksMax=256','-p','RuntimeMaxSec='+str(seconds+60),'-p','KillMode=control-group','-p','TimeoutStopSec=5',*args]
+        clean={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8','HOME':'/nonexistent'}
+        stage='execution';artifact_bytes=log_bytes=0;started=time.monotonic();last_notice=started
+        proc=subprocess.Popen(cmd,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=clean,close_fds=True)
         with (job/'output.log').open('wb') as log,(job/'artifacts.tar.gz').open('wb') as artifacts,(job/'runner.log').open('wb') as diagnostics,selectors.DefaultSelector() as sel:
             sel.register(proc.stdout,selectors.EVENT_READ,'out');sel.register(proc.stderr,selectors.EVENT_READ,'err');buf=b''
             while sel.get_map():
@@ -157,15 +176,43 @@ def _run(source,argv,profile='offline',seconds=900,keep=True,subdir='',test_env=
             rc=proc.wait(timeout=10)
             if rc or result is None:raise RuntimeError('sandbox failed; inspect '+str(job/'runner.log'))
     except BaseException as e:
-        result={'exit_code':125,'reason':type(e).__name__,'error':str(e)}
+        result={'exit_code':125,'reason':type(e).__name__,'stage':stage,'error':str(e)}
     finally:
-        subprocess.run(['systemctl','stop',unit+'.service'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,env=clean,timeout=15)
-        if proc.poll() is None:proc.kill();proc.wait()
-        if proxy:proxy.shutdown();proxy.server_close()
-    result.update(job=str(job),profile=profile,source=str(P(source).resolve()),input=info,unit=unit)
-    (job/'result.json').write_text(json.dumps(result,indent=2)+'\n');print('hermetic: report '+str(job/'result.json'),file=sys.stderr,flush=True)
-    disk.unlink(missing_ok=True)
-    if not keep:shutil.rmtree(volume)
+        cleanup_errors=[]
+        if proc is not None:
+            try:
+                stopped=subprocess.run(['systemctl','stop',unit+'.service'],stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL,env=clean,timeout=15)
+                state=subprocess.run(['systemctl','is-active',unit+'.service'],capture_output=True,text=True,env=clean,timeout=5)
+                if state.stdout.strip() not in {'inactive','failed','unknown'}: cleanup_errors.append('unit stop not confirmed')
+            except (OSError,subprocess.SubprocessError) as e: cleanup_errors.append('unit stop: '+type(e).__name__)
+            if proc.poll() is None:
+                proc.kill()
+                try:proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:cleanup_errors.append('runner did not exit')
+        if proxy:
+            try:proxy.shutdown();proxy.server_close()
+            except OSError as e:cleanup_errors.append('proxy: '+type(e).__name__)
+        if result is None:result={'exit_code':125,'reason':'missing-result','stage':stage}
+        # Do not erase source or evidence after failure. Discard only this job's
+        # reconstructible dependency copies; symlinks are never traversed.
+        removed=[]
+        try:
+            if not cleanup_errors:
+                disk.unlink(missing_ok=True)
+                if result.get('exit_code')==125:
+                    for copied in (inputs,volume/'input'):
+                        removed.extend(clean_dependencies(copied))
+                elif not keep and volume.exists():shutil.rmtree(volume)
+        except OSError as e:cleanup_errors.append('input cleanup: '+type(e).__name__)
+        if cleanup_errors:
+            result['command_exit_code']=result.get('exit_code');result['exit_code']=125
+            result['cleanup_errors']=cleanup_errors
+        result.update(job=str(job),profile=profile,source=str(P(source).resolve()),input=info,
+                      unit=unit,removed_dependency_copies=removed)
+        receipt=job/'result.json.tmp'
+        receipt.write_text(json.dumps(result,indent=2)+'\n');receipt.replace(job/'result.json')
+        print('hermetic: report '+str(job/'result.json'),file=sys.stderr,flush=True)
     return result
 
 def run(*args,**kwargs):
@@ -173,7 +220,14 @@ def run(*args,**kwargs):
     with (STATE/'runner.lock').open('a') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:raise RuntimeError('another sealed job is running; retry after it finishes')
-        return _run(*args,**kwargs)
+        previous=None
+        if threading.current_thread() is threading.main_thread():
+            previous=signal.getsignal(signal.SIGTERM)
+            def interrupted(signum,frame):raise InterruptedError('sealed job terminated')
+            signal.signal(signal.SIGTERM,interrupted)
+        try:return _run(*args,**kwargs)
+        finally:
+            if previous is not None:signal.signal(signal.SIGTERM,previous)
 
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--cwd',default=os.getcwd());p.add_argument('--profile',choices=['offline','fetch','model'],default='offline');p.add_argument('--timeout',type=int,default=900);p.add_argument('--keep',action='store_true');p.add_argument('command',nargs=argparse.REMAINDER);a=p.parse_args()

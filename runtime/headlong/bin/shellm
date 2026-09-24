@@ -162,6 +162,8 @@ SHELLM_REQUIRE_DOCKER="${SHELLM_REQUIRE_DOCKER:-0}"
 SHELLM_TEMP_DOCKER="${SHELLM_TEMP_DOCKER:-0}"
 SHELLM_INACTIVITY_TIMEOUT="${SHELLM_INACTIVITY_TIMEOUT:-30}"
 SHELLM_INACTIVITY_MAX="${SHELLM_INACTIVITY_MAX:-900}"
+# Independent of output and nested-run beacons; one atomic command cannot renew it.
+SHELLM_EXEC_TIMEOUT="${SHELLM_EXEC_TIMEOUT:-2400}"
 SHELLM_BEACON_INTERVAL="${SHELLM_BEACON_INTERVAL:-5}"
 # Spelling autocorrect for the model's scripts: "wrong=right[,wrong=right…]".
 # A sampled model slips one token in a rare name about 1 time in 80 (Custos
@@ -388,6 +390,7 @@ Environment:
   SHELLM_ENV              Named env (execution environment)
   SHELLM_TEMP_DOCKER      Set to 1 to teardown Docker container on exit
   SHELLM_INACTIVITY_TIMEOUT  Seconds before killing idle execution (default: 30)
+  SHELLM_EXEC_TIMEOUT     Absolute command deadline in seconds (default: 2400)
   SHELLM_INACTIVITY_MAX   Seconds before killing execution that is silent but
                           has a live nested shellm run (default: 900)
   SHELLM_BEACON_INTERVAL  Seconds between activity beacon touches (default: 5)
@@ -455,7 +458,7 @@ redact_sensitive() {
 
 extract_reasoning() {
     local response="$1"
-    printf '%s\n' "$response" | awk '
+    awk '
         # Stop at the opening code fence — everything before it is reasoning.
         # The fence may be a lone ``` line OR a tagged ```bash/```sh appended
         # to the end of a prose sentence (some models, e.g. grok, do the
@@ -472,7 +475,7 @@ extract_reasoning() {
             exit
         }
         { print }
-    '
+    ' <<< "$response"
 }
 
 _find_latest_traj() {
@@ -568,6 +571,14 @@ build_inactivity_feedback() {
 
     local last_output
     last_output=$(truncate_output "$output")
+
+    if [[ "$reason" == "deadline" ]]; then
+        printf 'Execution reached its absolute %ss deadline, regardless of output or beacons.\n' "$timeout"
+        printf 'Inspect the saved command and output, checkpoint partial work, and split the remaining task.\n'
+        printf 'Wait only on a PID returned by your own launch ($!), collect its actual wait status, and never infer success from an empty or missing log.\n'
+        printf '\nLast output before timeout:\n%s\n' "$last_output"
+        return 0
+    fi
 
     # A block that ran a nested shellm run was not sitting at a prompt, so the
     # interactive-input advice below would send the model looking for a flag
@@ -1641,7 +1652,7 @@ execute_code() {
         (
             cd "$workspace" || exit 1
             if [[ ${#_patched_vars[@]} -gt 0 ]]; then export "${_patched_vars[@]}"; fi
-            exec bash -e -c "$wrapped_code"
+            exec bash -e /dev/fd/3 3<<< "$wrapped_code"
         ) </dev/null 2>&1
     fi
 }
@@ -1735,11 +1746,11 @@ normalize_toolcall_markup() {
         *"<tool_call>"*|*"<function="*|*"<bash>"*) ;;
         *) printf '%s' "$response"; return 1 ;;
     esac
-    if printf '%s\n' "$response" | grep -qE '^```|```(bash|shell|sh)[[:space:]]*$'; then
+    if grep -qE '^```|```(bash|shell|sh)[[:space:]]*$' <<< "$response"; then
         printf '%s' "$response"; return 1
     fi
     local lifted
-    lifted=$(printf '%s\n' "$response" | awk '
+    lifted=$(awk '
         BEGIN { started = 0 }
         !started {
             if ($0 ~ /^[[:space:]]*<(tool_call|function=[A-Za-z_]+|parameter=[A-Za-z_]+|bash)>[[:space:]]*$/) { started = 1 }
@@ -1749,7 +1760,7 @@ normalize_toolcall_markup() {
             if ($0 ~ /^[[:space:]]*<\/(tool_call|function|parameter|bash)>[[:space:]]*$/) { exit }
             if ($0 ~ /^[[:space:]]*<(function=[A-Za-z_]+|parameter=[A-Za-z_]+|bash)>[[:space:]]*$/) { next }
             print
-        }')
+        }' <<< "$response")
     if [[ "$lifted" =~ [^[:space:]] ]]; then
         printf '%s' $'```bash\n'"$lifted"$'\n```'
         return 0
@@ -1776,7 +1787,7 @@ extract_code() {
     local truncation_file
     truncation_file=$(mktemp)
     local code
-    code=$(printf '%s\n' "$response" | awk -v sq="'" -v run_all="${SHELLM_RUN_ALL_BLOCKS:-0}" '
+    code=$(awk -v sq="'" -v run_all="${SHELLM_RUN_ALL_BLOCKS:-0}" '
         # ── try_open_heredocs: queue supported redirections in source order.
         # This is deliberately not a Bash parser: it does not distinguish
         # operators in shell strings/comments or parse every shell-word form.
@@ -1919,7 +1930,7 @@ extract_code() {
             try_open_heredocs($0)
             emit($0)
         }
-    ' 2>"$truncation_file")
+    ' <<< "$response" 2>"$truncation_file")
 
     local truncation_signal
     truncation_signal=$(cat "$truncation_file" 2>/dev/null || true)
@@ -2332,13 +2343,18 @@ ${combined}"
 
     # Write run-summary step to the trajectory
     local summary_json
+    local summary_tldr_file summary_full_file
+    summary_tldr_file=$(mktemp); summary_full_file=$(mktemp)
+    printf '%s' "${tldr:-(summary generation failed)}" > "$summary_tldr_file"
+    printf '%s' "$full_summary" > "$summary_full_file"
     summary_json=$(jq -nc \
-        --arg tldr "${tldr:-(summary generation failed)}" \
-        --arg full "$full_summary" \
+        --rawfile tldr "$summary_tldr_file" \
+        --rawfile full "$summary_full_file" \
         --arg run_id "$run_step_id" \
         --arg model "$summary_model" \
         '{type:"run-summary", tldr:$tldr, full_summary:$full, run_id:$run_id, model:$model}')
     printf '%s' "$summary_json" | traj append --traj_dir "$traj_dir" "$traj_id" >/dev/null 2>/dev/null || true
+    rm -f "$summary_tldr_file" "$summary_full_file"
 }
 
 # Byte cursor, bounded formatting before Bash ever sees command output.
@@ -2618,13 +2634,14 @@ run_loop() {
         --arg max_iter "${SHELLM_MAX_ITERATIONS:-}" \
         --arg max_tok "${SHELLM_MAX_TOKENS:-}" \
         --arg inactivity_timeout "$SHELLM_INACTIVITY_TIMEOUT" \
+        --arg exec_timeout "$SHELLM_EXEC_TIMEOUT" \
         --argjson ctx "$_ctx_files_json" \
         --argjson env "$_env_json" \
         --argjson resumed "$(if [[ -n "$_use_traj" ]]; then echo true; else echo false; fi)" \
         --arg trigger "${SHELLM_TRIGGER_STEP_ID:-}" \
         --arg launched_by "${SHELLM_LAUNCHED_BY:-}" \
         --arg wake "${SHELLM_WAKE:-}" \
-        '{type:"shellm-run", command:$cmd, workdir:$wd, model:$model, effort:$effort, max_iterations:$max_iter, max_tokens:$max_tok, inactivity_timeout:$inactivity_timeout, context_files:$ctx, env:$env, resumed:$resumed}
+        '{type:"shellm-run", command:$cmd, workdir:$wd, model:$model, effort:$effort, max_iterations:$max_iter, max_tokens:$max_tok, inactivity_timeout:$inactivity_timeout, exec_timeout:$exec_timeout, context_files:$ctx, env:$env, resumed:$resumed}
          + (if $trigger == "" then {} else {trigger_step: $trigger} end)
          + (if $launched_by == "" then {} else {launched_by: $launched_by} end)
          + (if $wake == "" then {} else {wake: $wake} end)')
@@ -2943,7 +2960,9 @@ run_loop() {
             debug "No code extracted, treating full response as final answer"
             progress "No code block found — returning response as answer"
             # Record as a final step with no cmd
-            printf '%s' "$(jq -n --arg t "$reasoning" --arg f "$response" --arg run_id "$_run_step_id" \
+            printf '%s' "$reasoning" > "$rundir/reasoning.txt"
+            printf '%s' "$response" > "$rundir/response.txt"
+            printf '%s' "$(jq -n --rawfile t "$rundir/reasoning.txt" --rawfile f "$rundir/response.txt" --arg run_id "$_run_step_id" \
                 --argjson llm_s "$_llm_s" --argjson usage "$_usage_extra" \
                 '{type:"final",thought:$t,content:$f,run_id:$run_id,llm_s:$llm_s} + $usage')" \
                 | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
@@ -3004,6 +3023,7 @@ exit \$__shellm_rc
             LLM_MODEL_ALLOWLIST="${LLM_MODEL_ALLOWLIST:-}"
             LLM_EFFORT_ALLOWLIST="${LLM_EFFORT_ALLOWLIST:-}"
             SHELLM_INACTIVITY_TIMEOUT="$SHELLM_INACTIVITY_TIMEOUT"
+            SHELLM_EXEC_TIMEOUT="$SHELLM_EXEC_TIMEOUT"
             SHELLM_MAX_TOKENS="$SHELLM_MAX_TOKENS"
             SHELLM_MAX_ITERATIONS="$SHELLM_MAX_ITERATIONS"
             SHELLM_EFFORT="$SHELLM_EFFORT"
@@ -3071,6 +3091,23 @@ exit \$__shellm_rc
         local exit_code=0
         local timed_out=0
 
+        # Persist intent before side effects; an interrupted command remains auditable.
+        [[ "$SHELLM_EXEC_TIMEOUT" =~ ^[1-9][0-9]{0,4}$ ]] || die "SHELLM_EXEC_TIMEOUT must be a positive integer up to 99999"
+        printf '%s' "$reasoning" > "$rundir/reasoning.txt"
+        printf '%s' "$code" > "$rundir/command.txt"
+        # Record reasoning step (assistant role in multi-turn)
+        local reasoning_json
+        reasoning_json=$(jq -n \
+            --rawfile thought "$rundir/reasoning.txt" \
+            --rawfile cmd "$rundir/command.txt" \
+            --arg execution_id "$_run_step_id:$iteration" \
+            --argjson timeout "$SHELLM_EXEC_TIMEOUT" \
+            --arg run_id "$_run_step_id" \
+            --argjson llm_s "$_llm_s" \
+            --argjson usage "$_usage_extra" \
+            '{type:"reasoning", thought:$thought, cmd:$cmd, run_id:$run_id, llm_s:$llm_s, execution_started:true, execution_timeout:$timeout, execution_id:$execution_id} + $usage')
+        printf '%s' "$reasoning_json" | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
+
         # Background: run execute_code, capture PID
         local _exec_t0
         _exec_t0=$(date +%s)
@@ -3111,7 +3148,10 @@ exit \$__shellm_rc
                     last_beacon="$cur_beacon"
                     stale_seconds=0
                 fi
-                if [[ "$stale_seconds" -ge "$SHELLM_INACTIVITY_TIMEOUT" ]]; then
+                if [[ $(( $(date +%s) - _exec_t0 )) -ge "$SHELLM_EXEC_TIMEOUT" ]]; then
+                    kill_reason="deadline"
+                    kill_limit="$SHELLM_EXEC_TIMEOUT"
+                elif [[ "$stale_seconds" -ge "$SHELLM_INACTIVITY_TIMEOUT" ]]; then
                     kill_reason="idle"
                     kill_limit="$SHELLM_INACTIVITY_TIMEOUT"
                 elif [[ "$quiet_seconds" -ge "$SHELLM_INACTIVITY_MAX" ]]; then
@@ -3181,7 +3221,9 @@ exit \$__shellm_rc
         _diagnostic_stage=record; _diagnostic_operation=record_shell_result
         # Show exit status
         if [[ "$timed_out" -eq 1 ]]; then
-            if [[ "$kill_reason" == "nested" ]]; then
+            if [[ "$kill_reason" == "deadline" ]]; then
+                progress "KILLED — absolute command deadline (${kill_limit}s)"
+            elif [[ "$kill_reason" == "nested" ]]; then
                 progress "\033[1;31mKILLED — sub-run silent for ${kill_limit}s\033[0m"
             else
                 progress "\033[1;31mKILLED — inactivity timeout (${kill_limit}s)\033[0m"
@@ -3212,17 +3254,6 @@ exit \$__shellm_rc
         local _stdout_tmp
         _stdout_tmp=$(mktemp)
         printf '%s' "$clean_output" > "$_stdout_tmp"
-
-        # Record reasoning step (assistant role in multi-turn)
-        local reasoning_json
-        reasoning_json=$(jq -n \
-            --arg thought "$reasoning" \
-            --arg cmd "$code" \
-            --arg run_id "$_run_step_id" \
-            --argjson llm_s "$_llm_s" \
-            --argjson usage "$_usage_extra" \
-            '{type:"reasoning", thought:$thought, cmd:$cmd, run_id:$run_id, llm_s:$llm_s} + $usage')
-        printf '%s' "$reasoning_json" | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
 
         # Record shell-output step (user role in multi-turn)
         local output_json
@@ -3270,9 +3301,10 @@ exit \$__shellm_rc
             progress "Final answer received"
             local final_answer
             final_answer=$(cat "$final_path")
+            printf '%s' "$final_answer" > "$rundir/final-answer.txt"
             rm -f "$final_path"
             printf '%s' "$(jq -n \
-                --arg content "$final_answer" \
+                --rawfile content "$rundir/final-answer.txt" \
                 --arg run_id "$_run_step_id" \
                 '{type:"final", content:$content, run_id:$run_id}')" \
                 | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
@@ -3289,7 +3321,7 @@ exit \$__shellm_rc
                 _child_dir_name=$(basename "$run_name")
                 _from_traj_ref="$_child_dir_name"
                 jq -nc \
-                    --arg content "$final_answer" \
+                    --rawfile content "$rundir/final-answer.txt" \
                     --arg from_traj "$_run_traj_id" \
                     --arg from_step "${_last_step_id:-}" \
                     --arg from_traj_ref "$_from_traj_ref" \

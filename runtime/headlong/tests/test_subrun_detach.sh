@@ -9,6 +9,8 @@
 # now detaches anything above SUBRUN_SYNC_MAX_ITER, prints where the report
 # will land, and returns at once. Same llm stub as the beacon test.
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/isolated-env.sh"
+
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"

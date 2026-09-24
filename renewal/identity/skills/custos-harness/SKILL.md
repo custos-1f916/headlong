@@ -31,8 +31,8 @@ The default profile boots a disposable KVM machine with no network and no live
 filesystem mounts. HOME, application state, processes and credentials are separate.
 Jobs have memory/CPU/time/output/storage bounds; inspect the printed result JSON
 and artifacts under `/var/lib/custos-harness/jobs`. Exit status is the test status;
-125 means the runner failed, not that tests passed. Timed-out descendants die with
-the VM. Never rerun bare in the activated identity to get around a seal failure.
+125 means the runner failed, not that tests passed. Setup failures also retain a result receipt and source/lockfiles; copied dependency trees may be removed. A killed setup leaves `setup.json` for operator recovery. Timed-out descendants die with
+the VM. Never rerun bare in the activated identity to get around a seal failure. Runtime fixtures clear inherited trajectory and run-report variables as a second defense; this does not replace the seal.
 
 `--profile fetch` exposes only package manifests/locks and an allowlisted HTTPS
 proxy. Use frozen locks and disable install hooks, then run builds offline.

@@ -9,6 +9,8 @@
 # block whose nested run outlives SHELLM_INACTIVITY_MAX gets killed with
 # feedback that names the sub-run instead of guessing at a prompt.
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/isolated-env.sh"
+
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"

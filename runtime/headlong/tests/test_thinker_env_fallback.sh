@@ -16,6 +16,8 @@
 # environment (deploy/thinkers-service.sh, the web _ENV_WRAPPER) must always
 # beat a file.
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/isolated-env.sh"
+
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 

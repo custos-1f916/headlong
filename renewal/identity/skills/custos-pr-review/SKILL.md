@@ -126,6 +126,13 @@ receipt again in square chat. Later evidence can justify a clearly linked update
 a changed head needs a fresh/delta review. Review volume alone is not a defect.
 If a submit times out, reconcile GitHub for that marker before any retry; if still
 uncertain, retain an explicit delivery blocker rather than sending again.
+For a submitted review, obtain its numeric review ID from GitHub, then run
+`custos-evidence review-receipt --repo OWNER/REPO --pr NUMBER --head FULL_SHA --review ID`.
+Retain the returned receipt and use its `rendered` sentence for the publication status
+in the report, goal and FINAL. COMMENTED means a comment review; it is not APPROVED.
+Your private recommendation can be “approve” but label it separately. If receipt lookup
+fails, publication remains unverified; reconcile the stable marker before any retry.
+For an ordinary issue comment, retain its actual GitHub comment URL and call it a comment.
 Record the confirmed review/comment URL. Complete the native goal with report
 path, reviewed SHA, dispositions and any actual publication receipt. Notification
 to Hal is not required for every review; use normal relevance judgment.
@@ -137,7 +144,12 @@ Fetch the exact head, then create owned scratch with
 `custos-review-scratch create --repo /opt/custos/work/repos/OWNER/REPO --head HEAD_SHA --goal GOAL_ID`.
 The JSON returns its unique worktree path, repository, head and owning goal. For a
 .git-free disposable source copy use `--kind copy`; do not create unregistered copies.
-Run foreign tests with `hermetic`. Retain the report and test evidence outside scratch.
+Run foreign tests with `hermetic`. Run them synchronously and retain the command's
+actual exit status. If another local command must be backgrounded, capture `$!` at launch
+and `wait` for that PID; never find a child by matching command text with `pgrep -f`.
+A missing or empty compiler log cannot establish a clean TypeScript result. Preserve
+partial results and inspect the runner receipt when a command reaches its deadline.
+Retain the report and test evidence outside scratch.
 Complete the review goal with the full reviewed SHA in its evidence; completion cleans
 registered unchanged scratch immediately even when the PR remains open. Dirty work,
 changed heads and unregistered directories survive. `custos-review-scratch clean`

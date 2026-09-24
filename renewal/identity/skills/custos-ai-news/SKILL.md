@@ -48,6 +48,18 @@ messages about the same paper/model across blog, model-card and follow-up source
 native goals and inspect recent delivery evidence when grouping. News work belongs to the
 monolith; the social thinker need not take it away from the review goal.
 
+## Check numeric comparisons
+
+Before sending prices, percentages or benchmark deltas, put each compared field in
+`custos-evidence` claims with its variant, value, unit and exact primary-source excerpt.
+Add `comparisons` entries `{ "field":"input_price", "old_variant":"prior model",
+"new_variant":"new model", "direction":"decrease" }`. The helper validates units
+and direction and renders old → new plus the percentage and named baseline. Use the
+successful `comparisons[].rendered` values when composing; do not reverse them by hand.
+A capability comparator and a cost baseline can be different models: name each.
+A reported typical-workload saving is distinct from individual input/output/cache rates.
+The helper checks arithmetic and field provenance, not whether the excerpt is true.
+
 ## Deliver and settle
 
 For a selected item, send **Hal a Signal DM** using the existing `custos-actions` channel:
@@ -62,7 +74,7 @@ For a selected item, send **Hal a Signal DM** using the existing `custos-actions
 Resolve Hal through `custos-actions signal-contacts`; do not guess destination IDs. Use a stable
 request ID derived from the reviewed event IDs (sort IDs for a group, then hash). Save the exact
 message and action request ID in the goal scratchpad before sending. Consult `custos-signal`
-for the send/status contract. `queued` is not delivery; require `submitted` plus the accepted
+for the send/status contract. Send with `custos-actions signal-send --goal GOAL_ID` so a known local cooldown parks this goal and retains its exact request. For grouped news, park the other included goals with the same fixed Signal target and a reason starting `Local Signal cooldown (mind);`. Leave parked tasks alone until the context resumes them on eligibility or a scheduled check; requested urgent replies retain their own priority and correlation. `queued` is not delivery; require `submitted` plus the accepted
 Signal receipt before completing a selected item's goal. For uncertain sends, reconcile the
 same action ID and never mint a second ID to retry. A grouped message's one receipt can settle
 each included goal, naming the included source URL in each completion's evidence.

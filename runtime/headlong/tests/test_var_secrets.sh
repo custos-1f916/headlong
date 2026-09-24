@@ -16,6 +16,8 @@
 # tests/test_inactivity_beacon.sh. Local execution is pinned: shellm would
 # otherwise enter Docker mode wherever `docker info` works.
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/isolated-env.sh"
+
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"

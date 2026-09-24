@@ -13,6 +13,8 @@
 # sends only this run's steps with no history from earlier runs in the same
 # trajectory; the default traj scope still carries the earlier run.
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/isolated-env.sh"
+
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"

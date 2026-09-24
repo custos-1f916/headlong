@@ -39,11 +39,28 @@ def validate(document):
         if ratio.get('kind') == 'focal_ratio' and (ratio['numerator'] != 'actual_focal_length' or ratio['denominator'] != 'aperture'):
             raise ValueError('focal ratio requires actual_focal_length / aperture')
         ratios.append({**ratio, 'value': numerator['value'] / denominator['value']})
-    return {'ready': not unresolved, 'unresolved': unresolved, 'claims': claims, 'ratios': ratios,
+    comparisons = []
+    for comparison in document.get('comparisons', []):
+        field = comparison['field']
+        old = index[(comparison['old_variant'], field)]
+        new = index[(comparison['new_variant'], field)]
+        if old['variant'] == new['variant']: raise ValueError('comparison needs distinct old/new variants')
+        if old['unit'] != new['unit']: raise ValueError('comparison requires matching units')
+        if old['value'] <= 0: raise ValueError('positive baseline required for percentage comparison')
+        direction = 'decrease' if new['value'] < old['value'] else 'increase' if new['value'] > old['value'] else 'unchanged'
+        if comparison.get('direction', direction) != direction: raise ValueError('claimed direction contradicts old/new values')
+        percent = (new['value'] - old['value']) / old['value'] * 100
+        comparisons.append({**comparison, 'old': old['value'], 'new': new['value'], 'unit': old['unit'],
+                            'direction': direction, 'change_percent': percent,
+                            'rendered': f"{field}: {old['variant']} {old['value']:g} → {new['variant']} {new['value']:g} {old['unit']} ({abs(percent):g}% {direction} versus {old['variant']})"})
+    return {'ready': not unresolved, 'unresolved': unresolved, 'claims': claims, 'ratios': ratios, 'comparisons': comparisons,
             'limit': 'Human/model must verify excerpts support these exact fields; validation is not independent source verification.'}
 
 
 def main():
+    if sys.argv[1:2] == ['review-receipt']:
+        from custos_publication_evidence import main as publication_main
+        return publication_main(sys.argv[2:])
     if sys.argv[1:2] in (['live-capture'], ['live-render']):
         from custos_review_evidence import main as live_main
         return live_main(sys.argv[1:])

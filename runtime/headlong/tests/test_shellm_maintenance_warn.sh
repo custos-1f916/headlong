@@ -9,6 +9,8 @@
 # yield is immediate, as before. A live nested sub-run is stopped at the
 # yield and named in the handoff step. Same llm stub as the beacon test.
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/isolated-env.sh"
+
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"

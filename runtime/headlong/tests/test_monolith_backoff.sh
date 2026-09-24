@@ -14,6 +14,8 @@
 #   BASE=5 FACTOR=2 CAP=40 HOLD=1 THOUGHT_CAP=7
 #   delay(level): 0, 5, 10, 20, 40, 40, ...
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/isolated-env.sh"
+
 set -uo pipefail
 unset IDENTITY_DIR IDENTITY_NAME MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID 2>/dev/null
 

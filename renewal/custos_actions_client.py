@@ -27,6 +27,7 @@ from pathlib import Path
 import subprocess
 import sys
 import custos_attachments as attachments
+from custos_memory import MemoryError as GoalMemoryError
 
 HOST, PORT = '192.168.86.44', 18082
 
@@ -143,6 +144,43 @@ def guard(route):
             raise ValueError((result.stderr or result.stdout).strip().replace('chat: error: ', '') or 'refused by the conversation guard')
 
 
+def mind_guard(route):
+    """Use the same current mind window when the observer checks a parked goal."""
+    policy = json.loads((Path(os.environ['IDENTITY_DIR']) / 'social-policy.json').read_text())
+    hours = policy.get('mind_double_text_hours', 2)
+    if type(hours) is not int or hours < 0: raise ValueError('invalid mind double-text window')
+    previous = {k: os.environ.get(k) for k in ('CHAT_DOUBLE_TEXT_GUARD_HOURS', 'CHAT_GUARD_CROSS_ROOM')}
+    try:
+        os.environ['CHAT_DOUBLE_TEXT_GUARD_HOURS'] = str(hours)
+        os.environ['CHAT_GUARD_CROSS_ROOM'] = '0'
+        guard(route)
+    finally:
+        for key, value in previous.items():
+            if value is None: os.environ.pop(key, None)
+            else: os.environ[key] = value
+
+
+def park_cooldown(goal_id, payload, target, social, refusal):
+    """Persist the exact unsent request and park only a known local cooldown."""
+    if not goal_id or 'you spoke last' not in str(refusal): return None
+    from custos_memory import Store
+    store = Store()
+    directory = Path(os.environ['IDENTITY_DIR']) / '.state' / 'staged-signal'
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    path = directory / (hashlib.sha256(payload['request_id'].encode()).hexdigest() + '.json')
+    try:
+        with path.open('xb') as f: f.write(raw)
+    except FileExistsError:
+        if path.read_bytes() != raw: raise ValueError('staged request ID has a different payload; reconcile it before sending')
+    store.note({'goal_id': goal_id, 'text': 'Not sent: local Signal cooldown. Exact request staged at ' + str(path)
+        + '; request_id=' + payload['request_id'] + '; sha256=' + digest
+        + '. Reuse this ID and payload after eligibility resumes; no host action was queued.'})
+    return store.wait({'goal_id': goal_id, 'reason': 'Local Signal cooldown (' + ('social' if social else 'mind') + '); staged request ' + payload['request_id'],
+                       'signal_target': target})
+
+
 def record(route, message, request_id, phase, files=None, reply_to=None, social=False, delivery_kind="completion", correction_of=None):
     """Append the accepted send to the root trajectory as a message step."""
     root = os.environ.get('ROOT_TRAJ_ID') or os.environ.get('TRAJ_ID')
@@ -180,12 +218,13 @@ def main():
     p.add_argument('request_id', nargs='?')
     p.add_argument('--attach', action='append', default=[], metavar='FILE', help='attach a guest file (repeat up to four; 8 MiB total)')
     p.add_argument('--reply-to', metavar='STEP', help='quote a delivered native Signal message (unique step ID/prefix)')
+    p.add_argument('--goal', help='active deferred goal to park on a local Signal cooldown')
     p.add_argument('--social', action='store_true', help='unsolicited conversation: honor proactive policy and cross-room silence')
     p.add_argument('--delivery-kind', choices=['acknowledgment', 'completion', 'correction'])
     p.add_argument('--correction-of', help='original submitted outbox:STEP or action:ID')
     args = p.parse_args()
     try:
-        if (args.social or args.attach or args.reply_to or args.delivery_kind or args.correction_of) and args.action != 'signal-send':
+        if (args.goal or args.social or args.attach or args.reply_to or args.delivery_kind or args.correction_of) and args.action != 'signal-send':
             raise ValueError('--attach and --reply-to are for signal-send')
         if args.action in ('signal-lane-status', 'signal-send', 'signal-ask', 'automata-deploy', 'automata-rollback'):
             raw = sys.stdin.buffer.read(32769)
@@ -212,6 +251,15 @@ def main():
         if args.action == 'signal-send':
             if not isinstance(payload.get('message'), str) or not isinstance(payload.get('request_id'), str):
                 raise ValueError('signal-send needs request_id, target and message')
+            if args.goal:
+                from custos_memory import Store, is_task
+                record_goal = Store().find(args.goal)[4]
+                if not record_goal or record_goal['status'] != 'active' or not is_task(record_goal):
+                    raise ValueError('--goal must name an active deferred task')
+            if args.goal:
+                staged = Path(os.environ['IDENTITY_DIR']) / '.state' / 'staged-signal' / (hashlib.sha256(payload['request_id'].encode()).hexdigest() + '.json')
+                if staged.exists() and staged.read_bytes() != json.dumps(payload, sort_keys=True, ensure_ascii=False).encode():
+                    raise ValueError('staged request ID has a different payload; reconcile before sending')
             target = payload.get('target')
             if not (isinstance(target, str) and target.startswith(('dm:', 'group:'))):
                 status, contacts = call({'action': 'signal-contacts'})
@@ -225,7 +273,8 @@ def main():
                 elif payload.get('delivery_kind') != 'correction':
                     guard(route)
             except ValueError as refusal:
-                print(json.dumps({'ok': False, 'error': 'not sent: ' + str(refusal), 'request_id': payload['request_id']}))
+                waiting = park_cooldown(args.goal, payload, target, args.social, refusal)
+                print(json.dumps({'ok': False, 'error': 'not sent: ' + str(refusal), 'request_id': payload['request_id'], 'goal_wait': waiting}))
                 return 1
             if args.attach:
                 if 'attachments' in payload:
@@ -249,7 +298,7 @@ def main():
             else:
                 record(route, payload['message'], payload['request_id'], result.get('phase', 'queued'), social=args.social, delivery_kind=payload.get('delivery_kind', 'completion'), correction_of=payload.get('correction_of'))
         return 0 if ok else 1
-    except ValueError as error:
+    except (ValueError, GoalMemoryError) as error:
         print(json.dumps({'ok': False, 'error': str(error)[:200]}))
         return 2
     except (OSError, http.client.HTTPException, RecursionError, subprocess.SubprocessError):
