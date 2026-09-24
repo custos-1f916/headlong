@@ -1,11 +1,27 @@
 ---
 name: custos-pr-review
-description: Review 1f916-ai/1f916 pull requests and triage activity on Custos's public PRs from deferred GitHub goals; use Jev for bounded judgments when useful.
+description: Review 1f916-ai/1f916 pull requests and triage activity on Custos's public PRs from a discretionary observation queue; use Jev for bounded judgments when useful.
 ---
 
 # Public PR reviews and feedback
 
-Hal requested this work on 2026-09-17. The deterministic observer discovers
+Hal changed this programme on 2026-09-24 after your Signal discussion: PR reviews
+are observational and self-paced. Choose when and which to review. No standing
+review goals, review quota, or automatic obligation per PR. At each act wake,
+notice the queue and items older than a day, then choose a useful batch or leave
+them for later. Age is a cue to notice, not an automatic deadline or priority over
+human asks. Interleave reviews with make and explore. A direct request to review
+a specific PR remains an ordinary directed ask with its own goal and evidence.
+
+The queue is in the observer's existing SQLite state; it is not a task scheduler.
+`python3 /opt/custos/current/renewal/custos_github_prs.py --queue --offset 0 --limit 10`
+shows pending observations, age, batch IDs, current heads, legacy note pointers
+and coverage health. Page through `total`; a failed/stale monitor is not an empty
+queue. A bounded summary is supplied to every monolith wake. New heads/feedback
+remain visible until deliberately dispositioned; one chosen old batch never
+clears later activity.
+
+The original 2026-09-17 discovery scope remains. The deterministic observer discovers
 Custos's public authored PRs across repositories (including closed/merged ones),
 and every open PR in `1f916-ai/1f916`, plus future PRs. Historical closed site PRs
 are a discovery baseline, not a request to review the entire old archive.
@@ -13,16 +29,17 @@ It reconciles comments, reviews, inline comments, timeline events and checks/sta
 on the actual PR head. Polling can miss activity created and deleted between polls.
 Captured changes retain bounded body excerpts (2,000 characters, with a truncation
 flag) and fingerprints, including the previous version of edits/deletions. Inspect
-a batch ID from the goal with
+a batch ID from the queue with
 `python3 /opt/custos/current/renewal/custos_github_prs.py --evidence BATCH_ID --offset 0 --limit 10`;
 page through `total_events`. Running without arguments shows coverage health.
-Later activity coalesces into the same active goal's scratchpad; a completed goal
-gets a new follow-up. Read those updates before completing. A quiet initial authored
-PR may only need a recorded no-action disposition.
+Later activity coalesces into the PR's current observation, with full batch evidence
+retained. Old automatic goals were retired as abandoned obligations, not completed
+reviews; their scratchpads, checklists and reports remain available through the
+queue's `legacy_goal` pointer. Reuse that evidence before repeating work.
 
 Load `custos-repositories` for account, checkout, contribution and hermetic test
-rules. This is deferred engineering work; pace it alongside other goals. It does
-not require repeated square reading, a public comment quota, or an immediate reply.
+rules. You can review directly from an observation without creating a goal. If you
+choose a larger multi-wake project, an ordinary self-chosen goal is optional.
 
 ## Review and retain evidence
 
@@ -102,12 +119,12 @@ it. Jev confidence alone never warrants a bug report, approval or merge.
 ## Publication
 
 Read `github_prs.publication` in `/var/lib/custos/config/observations.json`.
-`private` means keep this automatic review programme's findings in the local
-report and goal. `actionable` authorizes useful GitHub review comments in
+`private` means keep chosen reviews in the local report. `actionable` authorizes useful GitHub review comments in
 `1f916-ai/1f916`, with concrete evidence and only on the checked current head.
 `reviews` additionally authorizes concise no-findings reports on completed reviews.
-Hal (2026-09-19) expects many Custos reviews of the square's code: a contributor
-knowing that you checked a change and found no issues is useful information.
+The 2026-09-19 publication permission remains: a contributor knowing that you
+checked a chosen change and found no issues is useful information. The later
+2026-09-24 pace decision removes any expectation to review every PR.
 Under `reviews`, normally publish that result once per reviewed current head,
 including the head SHA, the scope you checked, tests actually run (or not run),
 and material limitations. Say "no issues found in this review", not that the
@@ -129,20 +146,31 @@ uncertain, retain an explicit delivery blocker rather than sending again.
 For a submitted review, obtain its numeric review ID from GitHub, then run
 `custos-evidence review-receipt --repo OWNER/REPO --pr NUMBER --head FULL_SHA --review ID`.
 Retain the returned receipt and use its `rendered` sentence for the publication status
-in the report, goal and FINAL. COMMENTED means a comment review; it is not APPROVED.
+in the report and FINAL (and a directed goal if one exists). COMMENTED means a comment review; it is not APPROVED.
 Your private recommendation can be “approve” but label it separately. If receipt lookup
 fails, publication remains unverified; reconcile the stable marker before any retry.
 For an ordinary issue comment, retain its actual GitHub comment URL and call it a comment.
-Record the confirmed review/comment URL. Complete the native goal with report
-path, reviewed SHA, dispositions and any actual publication receipt. Notification
+Record the confirmed review/comment URL. After rechecking the current head,
+retain a report containing the full SHA and record the chosen batch's disposition:
+
+```bash
+python3 /opt/custos/current/renewal/custos_github_prs.py --ack BATCH_ID --head FULL_SHA --report /absolute/report.md --disposition reviewed
+```
+
+Use `no-action` with an honest reason in the report for a deliberate no-action
+choice. Leaving an item for later needs no acknowledgment. This is your recorded
+assessment, not independent proof of testing or publication. Old-head completion
+never acknowledges a newer batch. Complete a separate directed goal only when
+its actual request is satisfied, with the same report and receipt evidence. Notification
 to Hal is not required for every review; use normal relevance judgment.
 
 ## Checkouts
 
 One clone per repository, reused across reviews: `/opt/custos/work/repos/OWNER/REPO`.
 Fetch the exact head, then create owned scratch with
-`custos-review-scratch create --repo /opt/custos/work/repos/OWNER/REPO --head HEAD_SHA --goal GOAL_ID`.
-The JSON returns its unique worktree path, repository, head and owning goal. For a
+`custos-review-scratch create --repo /opt/custos/work/repos/OWNER/REPO --head HEAD_SHA --review BATCH_ID`.
+For an explicit directed review, the existing `--goal GOAL_ID` ownership is also supported.
+The JSON returns its unique worktree path, repository, head and owning observation batch (or goal). For a
 .git-free disposable source copy use `--kind copy`; do not create unregistered copies.
 Run foreign tests with `hermetic`. Run them synchronously and retain the command's
 actual exit status. If another local command must be backgrounded, capture `$!` at launch
@@ -150,8 +178,12 @@ and `wait` for that PID; never find a child by matching command text with `pgrep
 A missing or empty compiler log cannot establish a clean TypeScript result. Preserve
 partial results and inspect the runner receipt when a command reaches its deadline.
 Retain the report and test evidence outside scratch.
-Complete the review goal with the full reviewed SHA in its evidence; completion cleans
-registered unchanged scratch immediately even when the PR remains open. Dirty work,
+For an observation-owned checkout, finish it with
+`custos-review-scratch finish --review BATCH_ID --head FULL_SHA --report /absolute/report.md`.
+The report must be retained outside scratch. This cleans registered unchanged
+scratch even while the PR remains open; queue disposition is recorded separately
+above. A directed review goal still cleans its scratch when completed with the
+full reviewed SHA in its evidence. Dirty work,
 changed heads and unregistered directories survive. `custos-review-scratch clean`
 retries cleanup of completed entries; preserve valuable edits durably before cleanup.
 The 2 GiB admission budget for registered scratch does not evict active/dirty reviews.

@@ -366,6 +366,13 @@ if command -v custos-dream >/dev/null 2>&1; then
     dream_section=$(custos-dream due) || dream_section="Memory dream schedule check failed; inspect the helper before editing memories."
 fi
 
+# Persistent discretionary PR attention survives the recent-stream window. This
+# read is local, bounded, and creates neither goals nor inference/network calls.
+pr_section=""
+if [[ -f /opt/custos/current/renewal/custos_github_prs.py ]]; then
+    pr_section=$(python3 /opt/custos/current/renewal/custos_github_prs.py --context 2>/dev/null) || pr_section="PR observation queue unavailable; inspect custos-pr-review before assuming it is empty."
+fi
+
 route_prompt="<context>
 $system_prompt
 
@@ -379,6 +386,8 @@ $recent_context
 ${related_section}Routing signals:
 $hints
 $dream_section
+
+$pr_section
 
 $think_prompt
 </context>

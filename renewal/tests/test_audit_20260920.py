@@ -123,6 +123,31 @@ class ScratchTests(unittest.TestCase):
             self.registry.clean('1234abcd',self.head);self.assertTrue(p.exists())
     def test_clean_archive_copy_is_removed(self):
         p=self.create('copy');self.assertIn(str(p),self.registry.clean('1234abcd',self.head)['removed'])
+
+    def test_observation_review_needs_no_goal_and_cleanup_requires_exact_owner_head_report(self):
+        batch='github-pr:example/repo#17:2'
+        row=self.registry.create(str(self.repo),self.head,None,'worktree',review=batch)
+        self.paths.append(row['path']); p=Path(row['path'])
+        self.assertFalse(row['goal']); self.assertEqual(row['review'],batch)
+        self.assertEqual(self.registry.clean()['removed'],[])
+        report=self.root/'report.md'; report.write_text('Reviewed '+self.head)
+        self.assertEqual(self.registry.finish_review('github-pr:example/repo#17:1',self.head,report)['removed'],[])
+        with self.assertRaises(ValueError): self.registry.finish_review(batch,'b'*40,report)
+        inside=p/'report.md'; inside.write_text(report.read_text())
+        with self.assertRaises(ValueError): self.registry.finish_review(batch,self.head,inside)
+        inside.unlink()
+        self.assertEqual(self.registry.finish_review(batch,self.head,report)['removed'],[str(p)])
+        self.assertTrue(report.exists())
+
+    def test_observation_dirty_scratch_and_goal_owned_scratch_survive(self):
+        goal_path=self.create()
+        batch='github-pr:example/repo#18:1'
+        row=self.registry.create(str(self.repo),self.head,None,'copy',review=batch)
+        self.paths.append(row['path']); p=Path(row['path']); (p/'file').write_text('retain edits')
+        report=self.root/'report.md'; report.write_text('Reviewed '+self.head)
+        result=self.registry.finish_review(batch,self.head,report)
+        self.assertEqual(result['preserved'],[str(p)])
+        self.assertTrue(goal_path.exists())
     def test_unregistered_path_and_budget(self):
         p=self.root/'pr1234';p.mkdir();self.registry.clean('1234abcd',self.head);self.assertTrue(p.exists())
         self.registry.budget=1

@@ -49,10 +49,12 @@ class Registry:
         staging.write_text(json.dumps(row, sort_keys=True))
         staging.replace(path)
 
-    def create(self, repo, head, goal, kind):
+    def create(self, repo, head, goal, kind, review=None):
         import re
-        if not re.fullmatch('[0-9a-f]{8}', goal) or kind not in {'worktree', 'copy'}:
-            raise ValueError('native goal ID and worktree/copy kind required')
+        if (bool(goal) == bool(review) or kind not in {'worktree', 'copy'}
+                or (goal and not re.fullmatch('[0-9a-f]{8}', goal))
+                or (review and not re.fullmatch(r'github-pr:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*:[1-9][0-9]*', review))):
+            raise ValueError('one native goal or observation batch owner, and worktree/copy kind required')
         repo = Path(repo).resolve(strict=True)
         head = run('git', '-C', str(repo), 'rev-parse', '--verify', head + '^{commit}')
         with self.locked():
@@ -64,8 +66,9 @@ class Registry:
                 raise ValueError('source snapshot exceeds scratch budget; use a smaller review scope')
             path = Path(tempfile.mkdtemp(prefix='custos-review-'))
             token = uuid.uuid4().hex
-            row = {'path': str(path), 'repo': str(repo), 'head': head, 'goal': goal, 'kind': kind,
+            row = {'path': str(path), 'repo': str(repo), 'head': head, 'goal': goal or '', 'kind': kind,
                    'device': path.stat().st_dev, 'inode': path.stat().st_ino, 'completed': False}
+            if review: row['review'] = review
             # Register before population: a crash leaves a preserved, diagnosable entry.
             record = self.root / (token + '.json'); self.save(record, row)
             if kind == 'worktree':
@@ -104,11 +107,26 @@ class Registry:
             self.save(record, row)
             return row
 
+    def finish_review(self, review, head, report):
+        path = Path(report).resolve(strict=True)
+        raw = path.read_bytes()
+        if not raw or len(raw) > 1024*1024 or head not in raw.decode():
+            raise ValueError('retain a report containing the full reviewed head')
+        with self.locked():
+            rows = [item for item in self.rows() if item[1].get('review') == review and item[1]['head'] == head]
+            if any(path.is_relative_to(Path(row['path']).resolve()) for _, row in rows):
+                raise ValueError('report must be retained outside disposable scratch')
+            for record, row in rows:
+                row['completed'] = True
+                row['completion_evidence'] = {'report': str(path), 'sha256': hashlib.sha256(raw).hexdigest()}
+                self.save(record, row)
+        return self.clean()
+
     def clean(self, goal=None, evidence=''):
         result = {'removed': [], 'preserved': []}
         with self.locked():
             for record, row in self.rows():
-                if goal is None and self.managed and not row['completed']:
+                if goal is None and self.managed and row.get('goal') and not row['completed']:
                     from custos_memory import Store, MemoryError
                     try:
                         store = Store()
@@ -146,13 +164,21 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest='action', required=True)
     create = sub.add_parser('create')
-    for arg in ('repo', 'head', 'goal'): create.add_argument('--' + arg, required=True)
+    for arg in ('repo', 'head'): create.add_argument('--' + arg, required=True)
+    owner = create.add_mutually_exclusive_group(required=True)
+    owner.add_argument('--goal')
+    owner.add_argument('--review')
     create.add_argument('--kind', choices=['worktree', 'copy'], default='worktree')
+    finish = sub.add_parser('finish')
+    for arg in ('review', 'head', 'report'): finish.add_argument('--' + arg, required=True)
     sub.add_parser('clean')
     args = p.parse_args()
     try:
         registry = Registry()
-        print(json.dumps(registry.create(args.repo, args.head, args.goal, args.kind) if args.action == 'create' else registry.clean()))
+        if args.action == 'create': result = registry.create(args.repo, args.head, args.goal, args.kind, args.review)
+        elif args.action == 'finish': result = registry.finish_review(args.review, args.head, args.report)
+        else: result = registry.clean()
+        print(json.dumps(result))
         return 0
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         print(json.dumps({'error': str(error)})); return 1
