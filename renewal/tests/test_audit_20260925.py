@@ -5,12 +5,14 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import custos_brain_client as client
 import custos_memory as memory
 import custos_receipt_text as receipt
@@ -54,6 +56,17 @@ class LiteralAndBudget(ShellRuntime):
 
 
 class Policies(unittest.TestCase):
+    def test_audited_search_with_headings_cd_and_redirection_gets_short_budget(self):
+        script = '''echo "heading" >&2
+cd /tmp/asban
+grep -oiE '"datePublished"[^,]*|<time[^>]*datetime="[^"]*"' marcus.html | head
+grep -rilE '10\\^?25|1025 ?ops|develop, deploy|acquire, possess, fund' /tmp 2>/dev/null | head
+grep -rilE 'ban artificial superintelligence act' /root/.headlong/app/.identities/custos/workdir 2>/dev/null | grep -viE 'node_modules|uv.lock' | head
+find /tmp -iname '*.pdf' -o -iname '*bill*' 2>/dev/null | head
+rg nothing named-file 2>/dev/null || true
+'''
+        self.assertEqual(policy.inspect(script)['timeout'],60)
+        self.assertEqual(policy.inspect(script+'make build\n')['timeout'],2400)
     def test_search_and_build_budgets(self):
         for script in ['rg needle repo | head -20', 'grep -R needle /tmp', 'find repo -name file']:
             self.assertEqual(policy.inspect(script)['timeout'],60,script)

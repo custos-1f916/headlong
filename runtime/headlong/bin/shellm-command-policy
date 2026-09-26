@@ -17,19 +17,35 @@ def inspect(script, maximum=2400, search=60):
         budget, kind = min(maximum, int(directive[1])), "explicit"
     else:
         try:
-            lexer = shlex.shlex(script, posix=True, punctuation_chars="|&;()\n")
+            # Keep quotes: a '>' inside an HTML regex is data, not redirection.
+            lexer = shlex.shlex(script, posix=False, punctuation_chars="|&;()\n<>")
             lexer.whitespace = " \t\r"
             tokens = list(lexer)
+            clean, index, unsafe_redirect = [], 0, False
+            while index < len(tokens):
+                token = tokens[index]
+                if token in (">", ">&"):
+                    target = tokens[index+1] if index+1 < len(tokens) else ""
+                    if (token == ">" and target == "/dev/null") or (token == ">&" and target in ("1", "2")):
+                        if clean and clean[-1] in ("1", "2"):
+                            clean.pop()
+                        index += 2
+                        continue
+                    unsafe_redirect = True
+                if token in ("<", "<<", ">>", "&", "|&", "(", ")"):
+                    unsafe_redirect = True
+                clean.append(token)
+                index += 1
             starts, at_start = [], True
-            for token in tokens:
-                if token in ("|", "&&", ";", "\n"):
+            for token in clean:
+                if token in ("|", "||", "&&") or set(token) <= set(";\n"):
                     at_start = True
                 elif at_start:
                     starts.append(token)
                     at_start = False
-            reads = {"rg", "grep", "egrep", "fgrep", "find", "head", "tail", "cut", "sort", "uniq", "wc", "cat", "pwd", "ls"}
+            reads = {"rg", "grep", "egrep", "fgrep", "find", "head", "tail", "cut", "sort", "uniq", "wc", "cat", "pwd", "ls", "cd", "echo", "printf", "true"}
             if (starts and set(starts) <= reads and set(starts) & {"rg", "grep", "egrep", "fgrep", "find"}
-                    and not any(x in script for x in ("$(", "`", "-exec", "-delete", "-ok", ">"))):
+                    and not unsafe_redirect and not any(x in script for x in ("$(", "`", "-exec", "-delete", "-ok"))):
                 budget, kind = min(maximum, search), "search"
         except ValueError:
             pass  # bash supplies syntax diagnostics; do not guess at unknown code
