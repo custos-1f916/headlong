@@ -58,6 +58,9 @@ def validate(document):
 
 
 def main():
+    if sys.argv[1:2] == ['receipt-text']:
+        from custos_receipt_text import main as receipt_main
+        return receipt_main(sys.argv[2:])
     if sys.argv[1:2] == ['review-receipt']:
         from custos_publication_evidence import main as publication_main
         return publication_main(sys.argv[2:])

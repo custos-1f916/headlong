@@ -164,6 +164,7 @@ SHELLM_INACTIVITY_TIMEOUT="${SHELLM_INACTIVITY_TIMEOUT:-30}"
 SHELLM_INACTIVITY_MAX="${SHELLM_INACTIVITY_MAX:-900}"
 # Independent of output and nested-run beacons; one atomic command cannot renew it.
 SHELLM_EXEC_TIMEOUT="${SHELLM_EXEC_TIMEOUT:-2400}"
+SHELLM_SEARCH_TIMEOUT="${SHELLM_SEARCH_TIMEOUT:-60}"
 SHELLM_BEACON_INTERVAL="${SHELLM_BEACON_INTERVAL:-5}"
 # Spelling autocorrect for the model's scripts: "wrong=right[,wrong=right…]".
 # A sampled model slips one token in a rare name about 1 time in 80 (Custos
@@ -2136,8 +2137,10 @@ You can also re-render context with different options:
 
 ## Signaling completion
 When you have the answer, set one of these in your bash code:
-- `FINAL="your answer"` — set the final answer as a string
+- `shellm-final <<'FINAL_TEXT'` followed by literal text and a line `FINAL_TEXT` — preferred final report; dollars, quotes and newlines are preserved
+- `FINAL='short literal answer'` — only for simple text; never put currency in double quotes
 - `FINAL_FILE=path/to/file` — set the final answer from a file
+- Ordinary grep/rg/find-only blocks have a 60-second bound and retain partial output on timeout. Search a named repo/file; avoid recursive scans of /tmp or all worktrees. Keep searches separate from builds. An explicit first-line `# shellm: timeout=SECONDS` chooses a budget up to the outer command limit; use a larger budget only for a deliberately scoped large search/build.
 
 ## ShellLM reference
 SYSPROMPT
@@ -2984,13 +2987,22 @@ run_loop() {
             final_path="$workdir/.shellm_final"
         fi
 
+        local command_policy execution_timeout execution_kind policy_error execution_code
+        command_policy=$(printf '%s' "$code" | "$(dirname "$shellm_path")/shellm-command-policy" "$SHELLM_EXEC_TIMEOUT" "$SHELLM_SEARCH_TIMEOUT")
+        execution_timeout=$(printf '%s' "$command_policy" | jq -r .timeout)
+        execution_kind=$(printf '%s' "$command_policy" | jq -r .kind)
+        policy_error=$(printf '%s' "$command_policy" | jq -r '.error // empty')
+        execution_code="$code"
+        if [[ -n "$policy_error" ]]; then
+            printf -v execution_code 'printf "%%s\\n" %q >&2; false' "$policy_error"
+        fi
         # Build wrapped code that captures FINAL/FINAL_FILE after execution
         local wrapped_code
         # shellcheck disable=SC1078,SC1079  # one long double-quoted string, built across lines on purpose
         _diagnostic_stage=exec; _diagnostic_operation=execute_generated_script
         wrapped_code="$(_shellm_guard_preamble)
 set -x
-$code
+$execution_code
 set +x"$'\n'"
 __shellm_rc=\$?
 set +e
@@ -3050,6 +3062,7 @@ exit \$__shellm_rc
             TRAJ_ID="$_run_traj_id"
             ROOT_TRAJ_ID="${ROOT_TRAJ_ID:-$_run_traj_id}"
             SHELLM_RUNDIR="$rundir"
+            SHELLM_FINAL_PATH="$final_path"
             _SHELLM_ROOT_RUNDIR="$_SHELLM_ROOT_RUNDIR"
             SHELLM_ACTIVITY_FILE="$rundir/.activity"
             PATH="$(dirname "$shellm_path"):$PATH"
@@ -3101,11 +3114,13 @@ exit \$__shellm_rc
             --rawfile thought "$rundir/reasoning.txt" \
             --rawfile cmd "$rundir/command.txt" \
             --arg execution_id "$_run_step_id:$iteration" \
-            --argjson timeout "$SHELLM_EXEC_TIMEOUT" \
+            --argjson timeout "$execution_timeout" \
+            --arg budget_kind "$execution_kind" \
+            --arg rejected "$policy_error" \
             --arg run_id "$_run_step_id" \
             --argjson llm_s "$_llm_s" \
             --argjson usage "$_usage_extra" \
-            '{type:"reasoning", thought:$thought, cmd:$cmd, run_id:$run_id, llm_s:$llm_s, execution_started:true, execution_timeout:$timeout, execution_id:$execution_id} + $usage')
+            '{type:"reasoning", thought:$thought, cmd:$cmd, run_id:$run_id, llm_s:$llm_s, execution_started:($rejected == ""), execution_rejected:$rejected, execution_timeout:$timeout, execution_budget:$budget_kind, execution_id:$execution_id} + $usage')
         printf '%s' "$reasoning_json" | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
 
         # Background: run execute_code, capture PID
@@ -3148,9 +3163,9 @@ exit \$__shellm_rc
                     last_beacon="$cur_beacon"
                     stale_seconds=0
                 fi
-                if [[ $(( $(date +%s) - _exec_t0 )) -ge "$SHELLM_EXEC_TIMEOUT" ]]; then
+                if [[ $(( $(date +%s) - _exec_t0 )) -ge "$execution_timeout" ]]; then
                     kill_reason="deadline"
-                    kill_limit="$SHELLM_EXEC_TIMEOUT"
+                    kill_limit="$execution_timeout"
                 elif [[ "$stale_seconds" -ge "$SHELLM_INACTIVITY_TIMEOUT" ]]; then
                     kill_reason="idle"
                     kill_limit="$SHELLM_INACTIVITY_TIMEOUT"

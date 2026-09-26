@@ -169,11 +169,22 @@ else
     bad "failed run: error step, immediate descent" "level=$(lvl) delay=$(delay)"
 fi
 
+# A reactive failure is still a failure; it must not reset to a zero-delay loop.
+reset_state
+echo fail > "$STUB_MODE_FILE"
+run_step "$REACTIVE"
+if [[ "$(lvl)" = 1 ]]; then
+    ok "reactive failed run descends instead of immediately retrying"
+else
+    bad "reactive failed run descends instead of immediately retrying" "level=$(lvl)"
+fi
+
 # --- 7. share nudge: every N spontaneous wakes, then counter resets ----------
 reset_state
 echo thought > "$STUB_MODE_FILE"
 SHARE_EVERY=2
-hint='shared anything outward'
+printf '%s\n' '{"proactive":true}' > "$ID/social-policy.json"
+hint='Optional social invitation'
 run_step "$WAKE"
 h1=$(grep -c "$hint" "$STUB_CAPTURE" 2>/dev/null || true)
 run_step "$WAKE"

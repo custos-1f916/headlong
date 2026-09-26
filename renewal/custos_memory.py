@@ -124,6 +124,21 @@ def read_input(maximum=MAX_INPUT):
     return strict_json(raw.decode("utf-8"))
 
 
+class CommandFailure(MemoryError):
+    def __init__(self, command, rc, stderr):
+        codes = ("unsupported_model", "unsupported_reasoning_effort", "invalid_completion_request",
+                 "invalid_request_error", "context_length_exceeded", "request_body_too_large",
+                 "backend_busy_or_unavailable", "custos_request_in_flight", "busy_observation_unavailable",
+                 "operator_paused", "request_walltime_limit")
+        self.code = next((code for code in codes if code in stderr), "command_failed")
+        status = re.search(r"HTTP (\d{3})", stderr)
+        self.details = {"command": Path(command).name, "rc": rc,
+                        "http_status": int(status[1]) if status else None, "error_code": self.code}
+        self.deterministic = (self.code in codes[:6] or
+                              (status is not None and 400 <= int(status[1]) < 500 and int(status[1]) not in (408, 429)))
+        super().__init__("command failed: " + Path(command).name + f" (rc={rc}, reason={self.code}, http_status={self.details['http_status']})")
+
+
 def run(argv, content=None, timeout=30):
     try:
         process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -141,17 +156,7 @@ def run(argv, content=None, timeout=30):
     except OSError as exc:
         raise MemoryError("command failed: " + Path(argv[0]).name) from exc
     if process.returncode:
-        # Only reflect fixed, recognized failure codes; model/provider stderr
-        # can contain request text or credentials. Keep failures diagnosable
-        # without dumping it into the public timeline.
-        codes = ("backend_busy_or_unavailable", "custos_request_in_flight",
-                 "busy_observation_unavailable", "operator_paused",
-                 "invalid_completion_request", "request_body_too_large",
-                 "request_walltime_limit", "unsupported_model",
-                 "unsupported_reasoning_effort")
-        reason = next((code for code in codes if code in stderr), "unclassified")
-        raise MemoryError("command failed: " + Path(argv[0]).name +
-                          f" (rc={process.returncode}, reason={reason})")
+        raise CommandFailure(argv[0], process.returncode, stderr)
     return stdout
 
 
@@ -1937,6 +1942,24 @@ RESPONSE_RETRY_SECONDS = 30
 AMBIENT_REPLY_MAX_AGE = 300
 
 
+def inference_signature():
+    """Only a verified route/configuration change re-arms a deterministic failure."""
+    status = brain_client.brain_status()
+    if not status:
+        return None
+    import hashlib
+    config = {k: status.get(k) for k in ("mode", "window_id", "effective_model", "local_route", "contract_version", "configuration_id", "request_model")}
+    config.update(model=os.environ.get("MONOLITH_REPLY_MODEL", os.environ.get("THINK_MODEL", "qwen3.8-27b")),
+                  effort=RESPONSE_EFFORT, max_tokens=RESPONSE_MAX_TOKENS,
+                  client=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    return hashlib.sha256(encode(config).encode()).hexdigest()
+
+
+def configuration_changed(previous, signature):
+    return bool(previous.get("configuration_failure") and signature and
+                previous.get("inference_signature") and signature != previous["inference_signature"])
+
+
 class ResponseFailure(MemoryError):
     def __init__(self, stage, code, reported=False):
         self.stage, self.code, self.reported = stage, code, reported
@@ -1945,6 +1968,8 @@ class ResponseFailure(MemoryError):
 
 def failure_code(error):
     # Values come from our code, never model text/provider stderr.
+    if isinstance(error, CommandFailure):
+        return error.code
     value = str(error)
     known = {"invalid JSON": "invalid_json", "duplicate JSON key": "duplicate_json_key",
              "invalid object fields": "invalid_schema", "future work requires defer and a goal": "missing_commitment",
@@ -1964,10 +1989,13 @@ def failure_code(error):
 @contextlib.contextmanager
 def response_attempt(store, goal_id, incoming, trigger, metrics):
     """Serialize attempts, record failures while still holding the request lock."""
+    signature = inference_signature()
     with store.lock("reply:" + incoming["request_id"]):
         with store.lock():
             item = store.find(goal_id)
             previous = item[4].get("responder_attempt") or {}
+            if configuration_changed(previous, signature):
+                previous = {}  # Original message/goal and any delivery receipt remain intact.
             terminal = (item[4].get("response") or {}).get("state") in {"sent", "no-reply"}
             blocked = (previous.get("state") == "failed" and
                        (not previous.get("retryable") or previous.get("count", 0) >= RESPONSE_ATTEMPTS))
@@ -1994,12 +2022,16 @@ def response_attempt(store, goal_id, incoming, trigger, metrics):
             yield attempt
         except (MemoryError, OSError, UnicodeError, KeyError, ValueError, TypeError) as error:
             stage, code = attempt["stage"], failure_code(error)
-            diagnostic = record_invalid_response(attempt["raw"], stage + ": " + code, trigger)
+            details = error.details if isinstance(error, CommandFailure) else {}
+            diagnostic = record_invalid_response(attempt["raw"], stage + ": " + code + " " + encode(details), trigger)
             retryable = stage in {"context", "inference", "prepare", "memory-apply", "native-enqueue", "settle"}
-            retryable = retryable and attempt["count"] < RESPONSE_ATTEMPTS
+            deterministic = isinstance(error, CommandFailure) and error.deterministic
+            retryable = retryable and not deterministic and attempt["count"] < RESPONSE_ATTEMPTS
             state = {"state": "failed", "stage": stage, "code": code, "count": attempt["count"],
                      "started_at": attempt["started_at"], "at": now(), "retryable": retryable,
-                     "retry_at": time.time() + RESPONSE_RETRY_SECONDS, "diagnostic": diagnostic}
+                     "retry_at": time.time() + RESPONSE_RETRY_SECONDS, "diagnostic": diagnostic,
+                     "inference_details": details, "configuration_failure": deterministic,
+                     "inference_signature": signature}
             persisted = True
             try:
                 with store.lock():
@@ -2492,6 +2524,8 @@ def replay_unanswered(store, older_than=900, limit=3):
         return {"queued": [], "reason": "no dispatcher"}
     cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=older_than)).isoformat()
     candidates = []
+    signature = None
+    signature_checked = False
     with store.lock():
         for path, header, body, fields, record in store.files():
             if not record or record["status"] != "active" or not record.get("trigger_step"):
@@ -2502,8 +2536,11 @@ def replay_unanswered(store, older_than=900, limit=3):
             attempt = record.get("responder_attempt") or {}
             if attempt:
                 if attempt.get("state") == "failed":
-                    if (not attempt.get("retryable") or attempt.get("count", 0) >= RESPONSE_ATTEMPTS
-                            or attempt.get("retry_at", 0) > time.time()):
+                    if attempt.get("configuration_failure") and not signature_checked:
+                        signature, signature_checked = inference_signature(), True
+                    changed = configuration_changed(attempt, signature)
+                    if not changed and (not attempt.get("retryable") or attempt.get("count", 0) >= RESPONSE_ATTEMPTS
+                                        or attempt.get("retry_at", 0) > time.time()):
                         continue
                 elif attempt.get("state") == "running":
                     # Outer responder timeout is 650s; never race an active call.

@@ -309,7 +309,10 @@ class Brain:
     # -- routing ------------------------------------------------------------------------------
 
     def accepted_models(self):
-        return set(self.p["routes"]) - {"*"} | set(self.p["tiers"].values()) | {self.p["local_model"]}
+        # Labels are public request aliases, never backend URLs or destinations.
+        # Local routing still follows admission policy, irrespective of the alias.
+        aliases = {self.p["local_model"], self.tycho_model(), self.tycho_label(), self.backup_model()}
+        return (set(self.p["routes"]) - {"*"} | set(self.p["tiers"].values()) | aliases) - {None, ""}
 
     def route(self, model, effort):
         tier = self.p["routes"].get(model, self.p["routes"]["*"])

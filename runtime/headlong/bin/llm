@@ -1459,6 +1459,12 @@ _admission_failure() {
     esac
     return 1
 }
+_deterministic_error() {
+    case "$1" in
+        *unsupported_model*|*unsupported_reasoning_effort*|*invalid_completion_request*|*invalid_request_error*|*context_length_exceeded*|*request_body_too_large*) return 0 ;;
+    esac
+    return 1
+}
 _admission_wait() {  # seconds to wait before an admission retry (denial retry_after when present)
     local ra
     ra=$(printf '%s' "$1" | grep -oE 'retry_after_seconds"?[^0-9]*[0-9]+' | grep -oE '[0-9]+$' | head -1)
@@ -1488,11 +1494,12 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
         _attempt=$(( _attempt + 1 ))
         _block=""
         _curl_err=$(mktemp)
+        _curl_headers=$(mktemp)
         LLM_RETRY_ERR=$(mktemp)
         LLM_DATA_MARKER="${LLM_RETRY_ERR}.emitted"
         LLM_STOP_MARKER="${LLM_RETRY_ERR}.stopped"
         _rc=0
-        ( "stream_${LLM_PROVIDER}" < <(curl -sS -N ${_net_args[@]+"${_net_args[@]}"} "${headers[@]}" -d @"$payload_file" "$url" 2>"$_curl_err") ) || _rc=$?
+        ( "stream_${LLM_PROVIDER}" < <(curl -sS -N -D "$_curl_headers" ${_net_args[@]+"${_net_args[@]}"} "${headers[@]}" -d @"$payload_file" "$url" 2>"$_curl_err") ) || _rc=$?
 
         _emitted=0
         [[ -e "$LLM_DATA_MARKER" ]] && _emitted=1
@@ -1505,7 +1512,13 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
         [[ -s "$_curl_err" ]] && _ce=$(cat "$_curl_err")
         _retry_msg=""
         [[ -s "$LLM_RETRY_ERR" ]] && _retry_msg=$(cat "$LLM_RETRY_ERR")
-        rm -f "$_curl_err" "$LLM_RETRY_ERR" "$LLM_DATA_MARKER" "$LLM_STOP_MARKER"
+        http_code=$(awk '/^HTTP\// {code=$2} END {print code}' "$_curl_headers")
+        rm -f "$_curl_err" "$_curl_headers" "$LLM_RETRY_ERR" "$LLM_DATA_MARKER" "$LLM_STOP_MARKER"
+        # An unchanged invalid request cannot improve with another attempt.
+        if [[ "$_emitted" -eq 0 ]] && { [[ "$http_code" =~ ^4[0-9][0-9]$ && "$http_code" != 408 && "$http_code" != 429 ]] || _deterministic_error "$_retry_msg"; }; then
+            _llm_note error "$http_code" "$_retry_msg"
+            die "API error (HTTP ${http_code:-unknown}): ${_retry_msg:-request rejected}"
+        fi
 
         if [[ -n "$_stopped" && "$_rc" -eq 0 && "$_emitted" -eq 1 ]]; then
             [[ "$_stopped" =~ ^[0-9]+$ ]] && write_usage "" "$(( (_stopped + 3) / 4 ))" "" "" estimated
@@ -1539,7 +1552,7 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
             continue
         fi
         # Exhausted or output already emitted: fail like before
-        [[ -n "$_retry_msg" ]] && { _llm_note error "" "$_retry_msg"; die "$_retry_msg"; }
+        [[ -n "$_retry_msg" ]] && { _llm_note error "$http_code" "$_retry_msg"; die "$_retry_msg${http_code:+ (HTTP $http_code)}"; }
         [[ -n "$_ce" ]] && { _llm_note error "" "curl error: $_ce"; die "curl error: $_ce"; }
         exit "$_rc"   # mid-stream die already printed its message
     done
@@ -1586,7 +1599,7 @@ else
             fi
             if [[ -n "$embedded_err" ]]; then
                 rm -f "$local_resp"
-                if [[ "$_attempt" -lt "$_max_attempts" ]]; then
+                if [[ "$_attempt" -lt "$_max_attempts" ]] && ! _deterministic_error "$embedded_err"; then
                     echo "llm: transient API failure (attempt $_attempt/$_max_attempts): $embedded_err — retrying" >&2
                     sleep $(( LLM_RETRY_BACKOFF * _attempt ))
                     continue

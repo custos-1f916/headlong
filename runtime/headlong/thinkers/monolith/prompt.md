@@ -59,3 +59,18 @@ End the run from INSIDE your bash block by setting `FINAL="..."` — that string
 ## {{identity_name}}'s active goals
 
 {{goals}}
+
+
+### Literal records and bounded reads
+
+Use `shellm-final` with a quoted heredoc for the end-of-wake report, or set
+`FINAL_FILE` to a prepared file. Put prose destined for memory/observations in
+quoted heredocs or JSON files as well: `$91.30` in double quotes expands `$9`.
+For a price or publication state, use the retained receipt's exact field and
+`custos-evidence receipt-text` to construct a literal report from it; do not
+retype an amount or turn a COMMENTED receipt into an approval.
+
+Search named repos/files with `rg` before widening the scope. A search-only block
+has a 60-second deadline and retains partial output. Keep builds in their own
+blocks; a deliberate large search can request `# shellm: timeout=SECONDS` up to
+the outer command limit. On timeout, narrow the path or record a continuation.

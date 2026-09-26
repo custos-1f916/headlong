@@ -350,7 +350,7 @@ class CloudWireTests(unittest.IsolatedAsyncioTestCase):
         status, _, body = await self.request("GET", "/brain")
         self.assertEqual(json.loads(body)["mode"], "cloud")
         status, _, body = await self.request("GET", "/v1/models")
-        self.assertEqual(sorted(m["id"] for m in json.loads(body)["data"]), ["gpt-5.6-terra", "gpt-6-astra", "qwen3.8-27b"])
+        self.assertEqual(sorted(m["id"] for m in json.loads(body)["data"]), sorted(self.brain.accepted_models()))
         status, _, body = await self.request("POST", "/v1/chat/completions", self.chat(model="gpt-9"))
         self.assertEqual(status, 400); self.assertEqual(json.loads(body)["error"]["code"], "unsupported_model")
 
@@ -388,7 +388,26 @@ class CloudWireTests(unittest.IsolatedAsyncioTestCase):
         status, _, body = await self.request("GET", "/health")
         self.assertEqual(json.loads(body)["scope"], "tycho_fallback_ready")
         status, _, body = await self.request("GET", "/v1/models")
-        self.assertEqual(status, 200); self.assertEqual(len(json.loads(body)["data"]), 3)
+        self.assertEqual(status, 200); self.assertEqual({x["id"] for x in json.loads(body)["data"]}, self.brain.accepted_models())
+
+    async def test_advertised_local_names_roundtrip_through_real_client(self):
+        import custos_brain_client as client
+        self.brain.flip_local("test")
+        self.busy.stale = True
+        for stream in (True, False):
+            for effort in ("medium", "xhigh"):
+                status, _, body = await self.request("GET", "/brain")
+                document = json.loads(body)
+                resolved = client.resolve_model("gpt-6-astra" if stream else "gpt-5.6-terra", status=document)
+                self.assertIn(resolved, self.brain.accepted_models())
+                request = self.chat(model=resolved, stream=stream, effort=effort)
+                request["max_tokens"] = 65536
+                status, _, body = await self.request("POST", "/v1/chat/completions", request)
+                self.assertEqual(status, 200, body)
+                self.assertEqual(self.tycho_model, "qwen3.8-27b")
+        status, _, body = await self.request("GET", "/brain")
+        self.assertEqual(json.loads(body)["request_health"]["tycho"]["completed"], 4)
+        self.assertEqual(self.openrouter_calls, [])
 
     async def test_backend_contention_waits_for_johan_instead_of_using_backup(self):
         self.brain.flip_local("test")

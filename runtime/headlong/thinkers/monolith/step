@@ -576,7 +576,7 @@ rm -f "$run_id_file"
 # ---------------------------------------------------------------------------
 # Backoff decision — sets next_delay for the EXIT trap.
 # ---------------------------------------------------------------------------
-if [[ "$wake_mode" == "reactive" || "$did_visible" -eq 1 ]]; then
+if [[ "$run_errored" -eq 0 && ( "$wake_mode" == "reactive" || "$did_visible" -eq 1 ) ]]; then
     # Engaged, or the run did real work → reset to no pause; think again at once.
     level=0
     ticks_at_level=0

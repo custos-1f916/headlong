@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Save literal final text from stdin, without shell expansion or argument limits.
+
+Usage: shellm-final <<'FINAL_TEXT'
+The total is $91.30.
+FINAL_TEXT
+"""
+import os
+from pathlib import Path
+import sys
+
+destination = os.environ.get("SHELLM_FINAL_PATH")
+if not destination:
+    sys.exit("shellm-final must run inside a shellm command")
+raw = sys.stdin.buffer.read(1048577)
+if len(raw) > 1048576:
+    sys.exit("final text exceeds 1 MiB; retain the report in a file and summarize it")
+path = Path(destination)
+temp = path.with_name(path.name + "." + str(os.getpid()))
+with temp.open("xb") as stream:
+    stream.write(raw)
+temp.chmod(0o600)
+os.replace(temp, path)

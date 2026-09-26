@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Conservative command budgets and a guard for the observed FINAL currency bug.
+
+This is a correctness aid, not a shell security parser. Unknown/mixed scripts keep
+the outer build budget. Explicit timeout comments can only shorten that budget.
+"""
+import json
+import re
+import shlex
+import sys
+
+
+def inspect(script, maximum=2400, search=60):
+    budget, kind, error = maximum, "command", None
+    directive = re.search(r"(?m)^# shellm: timeout=([1-9][0-9]*)\s*$", script)
+    if directive:
+        budget, kind = min(maximum, int(directive[1])), "explicit"
+    else:
+        try:
+            lexer = shlex.shlex(script, posix=True, punctuation_chars="|&;()\n")
+            lexer.whitespace = " \t\r"
+            tokens = list(lexer)
+            starts, at_start = [], True
+            for token in tokens:
+                if token in ("|", "&&", ";", "\n"):
+                    at_start = True
+                elif at_start:
+                    starts.append(token)
+                    at_start = False
+            reads = {"rg", "grep", "egrep", "fgrep", "find", "head", "tail", "cut", "sort", "uniq", "wc", "cat", "pwd", "ls"}
+            if (starts and set(starts) <= reads and set(starts) & {"rg", "grep", "egrep", "fgrep", "find"}
+                    and not any(x in script for x in ("$(", "`", "-exec", "-delete", "-ok", ">"))):
+                budget, kind = min(maximum, search), "search"
+        except ValueError:
+            pass  # bash supplies syntax diagnostics; do not guess at unknown code
+    # Skip here-document bodies. Literal prose belongs in a quoted heredoc piped
+    # to shellm-final or in FINAL_FILE; do not silently rewrite shell semantics.
+    here = None
+    for line in script.splitlines():
+        if here is not None:
+            if line.lstrip("\t") == here:
+                here = None
+            continue
+        declaration = re.search(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z_0-9]*)\1", line)
+        if declaration:
+            here = declaration[2]
+        if re.search(r'''(?:^|[;\s])(?:export\s+)?FINAL="(?:[^"\\]|\\.)*(?<!\\)\$[0-9]''', line):
+            error = "FINAL contains expandable dollar-number text. Use shellm-final with a quoted heredoc or FINAL_FILE; the block was not executed."
+            break
+    return {"timeout": budget, "kind": kind, "error": error}
+
+
+if __name__ == "__main__":
+    print(json.dumps(inspect(sys.stdin.read(), int(sys.argv[1]), int(sys.argv[2]))))

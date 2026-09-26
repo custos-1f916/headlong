@@ -204,6 +204,27 @@ class Gateway:
         self.slot = asyncio.Lock()
         self.connections = 0
         self.tasks = set()
+        # Bounded counters contain no request content, response text or credentials.
+        self.request_health = {}
+        import hashlib
+        # Stable across requests/restarts, changes with router code or policy.
+        configuration = json.dumps({"gateway": policy, "brain": getattr(brain, "p", None)}, sort_keys=True).encode()
+        code = Path(__file__).read_bytes() + Path(__file__).with_name("custos_brain.py").read_bytes()
+        self.configuration_id = hashlib.sha256(configuration + code).hexdigest()
+
+    def note_request(self, route, status, code=""):
+        row = self.request_health.setdefault(route, {"completed": 0, "failed": 0, "consecutive_failures": 0})
+        ok = 200 <= status < 300
+        row["completed" if ok else "failed"] += 1
+        row["consecutive_failures"] = 0 if ok else row["consecutive_failures"] + 1
+        row.update(last_at=self.clock(), last_status=status, last_code=code)
+        if ok:
+            row["last_completed_at"] = self.clock()
+        else:
+            row["last_failed_at"] = self.clock()
+        # Journal each outcome; operators can reconstruct counters across restarts.
+        print("custos-gateway: request-outcome " + json.dumps({"route": route, **row}), flush=True)
+
 
     def check_pause(self):
         if Path(self.p["pause_file"]).exists():
@@ -233,9 +254,10 @@ class Gateway:
             eof.cancel()
             await asyncio.gather(eof, return_exceptions=True)
 
-    async def proxy(self, writer, method, path, body, sent, upstream=None):
+    async def proxy(self, writer, method, path, body, sent, upstream=None, route="johan"):
         upstream_writer = None
         upstream = upstream or self.upstream
+        status = 502
         try:
             reader, upstream_writer = await asyncio.wait_for(
                 asyncio.open_connection(*upstream, limit=self.p["max_header_bytes"]),
@@ -316,6 +338,12 @@ class Gateway:
                     raise Denied(502, "invalid_upstream_chunk_ending")
             writer.write(b"0\r\n\r\n")
             await asyncio.wait_for(writer.drain(), self.p["io_timeout_seconds"])
+            if method == "POST":
+                self.note_request(route, status, "upstream_http_error" if status >= 400 else "")
+        except BaseException:
+            if method == "POST":
+                self.note_request(route, 502, "incomplete_or_unavailable")
+            raise
         finally:
             await close_writer(upstream_writer)
 
@@ -366,11 +394,20 @@ class Gateway:
 
     async def cloud_completion(self, writer, chat, sent):
         """One completion through the time-bounded Codex cloud tier."""
-        await self.brain_completion(writer, chat, sent, self.brain.complete)
+        await self.measured_brain_completion(writer, chat, sent, self.brain.complete, "cloud")
 
     async def backup_completion(self, writer, chat, sent):
         """One completion through OpenRouter after local failure is established."""
-        await self.brain_completion(writer, chat, sent, self.brain.complete_backup)
+        await self.measured_brain_completion(writer, chat, sent, self.brain.complete_backup, "openrouter")
+
+    async def measured_brain_completion(self, writer, chat, sent, complete, route):
+        try:
+            await self.brain_completion(writer, chat, sent, complete)
+        except BaseException as error:
+            self.note_request(route, error.status if isinstance(error, Denied) else 502,
+                              "brain_request_failed")
+            raise
+        self.note_request(route, 200)
 
     async def upstream_healthy(self, upstream):
         """Bounded local health probe used only to label/select the Tycho fallback."""
@@ -412,7 +449,7 @@ class Gateway:
         tycho = self.brain.tycho_upstream()
         if tycho:
             try:
-                await self.proxy(writer, method, path, body, sent, upstream=tycho)
+                await self.proxy(writer, method, path, body, sent, upstream=tycho, route="tycho")
                 self.brain.note_local_route("tycho", reason)
                 return
             except (Denied, OSError, ValueError, asyncio.TimeoutError,
@@ -516,7 +553,12 @@ class Gateway:
             if path == "/brain":
                 if self.brain:
                     document = self.brain.status()
+                    document["contract_version"] = "local-aliases-v2"
+                    document["configuration_id"] = self.configuration_id
+                    document["request_health"] = self.request_health
+                    document["request_health_scope"] = "completed HTTP transfers since gateway start; not model quality"
                     if document["mode"] == "local":
+                        document["request_model"] = document["local_model"]
                         route = await self.local_route(now)
                         document["effective_model"] = ({"tycho": self.brain.tycho_label(),
                                                         "openrouter": self.brain.backup_model()}.get(
@@ -580,6 +622,9 @@ class Gateway:
                 await jobs[1]
             await jobs[0]
         except Denied as denial:
+            if not jobs:
+                route = "admission"  # No backend has been selected for a rejected envelope.
+                self.note_request(route, denial.status, denial.code)
             for job in jobs:
                 job.cancel()
             await asyncio.gather(*jobs, return_exceptions=True)
