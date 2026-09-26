@@ -2933,10 +2933,23 @@ run_loop() {
             debug "No code extracted, treating full response as final answer"
             progress "No code block found — returning response as answer"
             # Record as a final step with no cmd
-            printf '%s' "$(jq -n --arg t "$reasoning" --arg f "$response" --arg run_id "$_run_step_id" \
+            # --rawfile, not --arg: a full-budget prose final answer with no code
+            # block can exceed the kernel's 128KB per-argument cap and kill jq
+            # with "Argument list too long" (rc=126), same class as the main
+            # loop's final record below.
+            local _final_thought_tmp _final_content_tmp
+            _final_thought_tmp=$(mktemp)
+            _final_content_tmp=$(mktemp)
+            printf '%s' "$reasoning" > "$_final_thought_tmp"
+            printf '%s' "$response" > "$_final_content_tmp"
+            printf '%s' "$(jq -n \
+                --rawfile t "$_final_thought_tmp" \
+                --rawfile f "$_final_content_tmp" \
+                --arg run_id "$_run_step_id" \
                 --argjson llm_s "$_llm_s" --argjson usage "$_usage_extra" \
                 '{type:"final",thought:$t,content:$f,run_id:$run_id,llm_s:$llm_s} + $usage')" \
                 | traj append --traj_dir "$_run_traj_dir" "$_run_traj_id" >/dev/null
+            rm -f "$_final_thought_tmp" "$_final_content_tmp"
             echo "$response"
             return 0
         fi

@@ -135,5 +135,39 @@ bash "$WORK/driver_final.sh" 2>"$WORK/final_err" || true
 check_record "oversized final recorded via rawfile" final '.type' "final"
 check_record "final content intact" final '(.content | length)' 200000
 
+# ── case 4: no-code-block final path (2936) goes via --rawfile ─────────────
+# The "no code block, treat full response as final answer" path recorded the
+# final with `jq -n --arg t "$reasoning" --arg f "$response"` — both
+# model-sized — so a full-budget prose final died rc=126 before it was
+# recorded. Same fix: --rawfile.
+ncstart=$(grep -n 'debug "No code extracted, treating full response as final answer"' "$SHELLM" | head -1 | cut -d: -f1)
+ncend=$(awk -v s="$ncstart" 'NR>=s && /return 0/ {print NR; exit}' "$SHELLM")
+sed -n "${ncstart},${ncend}p" "$SHELLM" > "$WORK/nocode_block.txt"
+cat > "$WORK/driver_nocode.sh" <<'DRV'
+set -e
+debug() { :; }
+progress() { :; }
+progress_dim() { :; }
+redact_sensitive() { :; }
+QUIET=1
+_run_step_id=t3
+_run_traj_dir="$WORK/traj"; _run_traj_id=tr3
+_llm_s=0
+_usage_extra='{}'
+response=$(cat "$WORK/response.txt")
+reasoning=$(cat "$WORK/thought.txt")
+eval "_nc() {
+$(cat "$WORK/nocode_block.txt")
+}"
+_nc
+DRV
+head -c 200000 /dev/zero | tr '\0' y > "$WORK/thought.txt"
+head -c 200000 /dev/zero | tr '\0' q > "$WORK/response.txt"
+: > "$STUB_STDIN"; : > "$STUB_ARGV"
+bash "$WORK/driver_nocode.sh" >"$WORK/nocode_out" 2>"$WORK/nocode_err" || true
+check_record "no-code-block oversized final recorded via rawfile" final '.type' "final"
+check_record "no-code-block final content intact" final '(.content | length)' 200000
+check_record "no-code-block final thought intact" final '(.thought | length)' 200000
+
 r=$((pass+fail)); printf '\n%d checks: %d ok, %d failed\n' "$r" "$pass" "$fail"
 [[ $fail -eq 0 ]]
