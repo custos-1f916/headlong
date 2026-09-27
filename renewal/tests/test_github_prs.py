@@ -242,6 +242,29 @@ class PRTests(MemoryFixture):
         self.assertEqual(len(list(self.store.files())), 0)
         self.assertIsNone(self.state.get(gp.PREFIX+"pr:missing/repo#1"))
         self.assertGreater(self.state.get(gp.PREFIX+"inventory")["missing/repo#1"]["retry_at"], self.observer.now)
+    def test_transient_failure_keeps_entry_at_front_of_rotation(self):
+        # Regression: a failed attempt must not advance last_attempt, or the entry
+        # sinks to the back of the (last_attempt, key) rotation (~3h for 235
+        # entries) while its 15-min retry_at backoff governs the retry.
+        self.monitor.inventory("missing/repo", 1, "authored")
+        original = self.api.get
+        def failing(endpoint, **params):
+            if endpoint.startswith("repos/missing/repo"):
+                raise APIError("github_pr_api_failed")
+            return original(endpoint, **params)
+        self.api.get = failing
+        self.monitor.run()
+        inv = self.state.get(gp.PREFIX+"inventory")
+        self.assertEqual(inv["missing/repo#1"]["last_attempt"], 0)
+        self.assertGreater(inv["missing/repo#1"]["retry_at"], self.observer.now)
+        # The successful sibling DID advance: the bump is not disabled, only
+        # not sticky on failure.
+        self.assertEqual(inv[self.key]["last_attempt"], self.observer.now)
+        # Second tick: retry_at not yet elapsed, entry is skipped, error persists.
+        self.monitor.run()
+        inv = self.state.get(gp.PREFIX+"inventory")
+        self.assertEqual(inv["missing/repo#1"]["last_attempt"], 0)
+        self.assertEqual(inv["missing/repo#1"]["error"], "github_pr_api_failed")
     def test_discovery_overflow_is_visible_not_a_truncated_success(self):
         original = self.api.get
         def incomplete(endpoint, **params):

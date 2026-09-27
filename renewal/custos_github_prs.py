@@ -259,6 +259,12 @@ class Monitor:
         for key, entry in sorted(inventory.items(), key=lambda x: (x[1].get("last_attempt", 0), x[0])):
             if entry.get("retry_at", 0) > self.now:
                 continue
+            # A transient failure is not a rotation attempt: restore the prior
+            # last_attempt so the 15-min retry_at backoff (not the ~3h full
+            # rotation) governs the retry. A failed entry otherwise sinks to the
+            # back of the (last_attempt, key) order and its error sits in the
+            # health signature until the rotation reaches it again.
+            previous_attempt = entry.get("last_attempt", 0)
             try:
                 current = self.store.get(PREFIX+"inventory", {})
                 current[key]["last_attempt"] = self.now
@@ -273,6 +279,7 @@ class Monitor:
                 current[key]["retry_at"] = self.now+900
                 current[key]["last_error"] = self.now
                 current[key]["error"] = getattr(exc, "code", type(exc).__name__)
+                current[key]["last_attempt"] = previous_attempt
                 self.store.put(PREFIX+"inventory", current)
         inventory = self.store.get(PREFIX+"inventory", {})
         failures = [key+":"+entry["error"] for key, entry in inventory.items() if entry.get("error")]
