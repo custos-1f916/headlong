@@ -1,5 +1,6 @@
 import copy
 import json
+import unittest
 from pathlib import Path
 import sys
 from unittest.mock import Mock
@@ -312,3 +313,28 @@ class PRTests(MemoryFixture):
         self.api.events[endpoint][0]["reactions"]["total_count"] = 1
         self.scan()
         self.assertTrue(self.record()["pending"]["summary"]["authored_feedback"])
+
+
+class APIErrorClassificationTests(unittest.TestCase):
+    """The 404-vs-transient seam: gh reports the status on stderr, and the
+    monitor must keep the bounded class, not one flat error string."""
+
+    def test_classify_gh_error_maps_status_to_bounded_code(self):
+        self.assertEqual(gp.classify_gh_error("gh: Not Found (HTTP 404)", 1), "github_pr_not_found")
+        self.assertEqual(gp.classify_gh_error("gh: rate limited (HTTP 429)", 1), "github_pr_rate_limited")
+        self.assertEqual(gp.classify_gh_error("gh: Internal Server Error (HTTP 500)", 1), "github_pr_server_error")
+        self.assertEqual(gp.classify_gh_error("gh: Bad Gateway (HTTP 502)", 1), "github_pr_server_error")
+        self.assertEqual(gp.classify_gh_error("gh: Bad credentials (HTTP 401)", 1), "github_pr_api_failed")
+        self.assertEqual(gp.classify_gh_error("gh: Forbidden (HTTP 403)", 1), "github_pr_api_failed")
+        # unparseable / no status line stays the flat code
+        self.assertEqual(gp.classify_gh_error("gh: connection reset", 1), "github_pr_api_failed")
+        self.assertEqual(gp.classify_gh_error("", 1), "github_pr_api_failed")
+        # a status line with rc==0 is not a failure
+        self.assertEqual(gp.classify_gh_error("gh: Not Found (HTTP 404)", 0), "github_pr_api_failed")
+
+    def test_retry_warranted_splits_permanent_from_transient(self):
+        self.assertFalse(gp.retry_warranted("github_pr_not_found"))
+        self.assertTrue(gp.retry_warranted("github_pr_server_error"))
+        self.assertTrue(gp.retry_warranted("github_pr_rate_limited"))
+        self.assertTrue(gp.retry_warranted("github_pr_api_failed"))
+        self.assertTrue(gp.retry_warranted("github_pr_timeout"))

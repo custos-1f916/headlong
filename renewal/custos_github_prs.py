@@ -13,6 +13,36 @@ from custos_square import APIError, canonical, digest
 
 PREFIX = "github-prs:"
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_GH_STATUS = re.compile(r"\(HTTP (\d{3})\)")
+
+
+def classify_gh_error(stderr, rc):
+    """Map a failed `gh api` to a bounded error code from its HTTP status.
+
+    gh reports the status on stderr as `gh: <msg> (HTTP <code>)`; the code is
+    the only server-controlled fact we keep. A 404 (object hidden/renamed/
+    deleted) is permanent and not worth retrying; a 429 or 5xx is transient.
+    Anything unparseable stays the flat github_pr_api_failed.
+    """
+    m = _GH_STATUS.search(stderr or "")
+    if m and rc:
+        code = int(m.group(1))
+        if code == 404:
+            return "github_pr_not_found"
+        if code == 429:
+            return "github_pr_rate_limited"
+        if 500 <= code <= 599:
+            return "github_pr_server_error"
+    return "github_pr_api_failed"
+
+
+RETRYABLE = frozenset(("github_pr_server_error", "github_pr_rate_limited",
+                       "github_pr_timeout", "github_pr_api_failed"))
+
+
+def retry_warranted(code):
+    """True when a recorded error is transient and a retry can clear it."""
+    return code in RETRYABLE
 STAGES = ("comments", "reviews", "review_comments", "timeline", "checks", "statuses")
 
 
@@ -35,9 +65,10 @@ class API:
                 capture_output=True, text=True, timeout=min(15, max(1, self.deadline-time.monotonic())))
         except subprocess.TimeoutExpired:
             raise APIError("github_pr_timeout") from None
-        # Never relay gh stderr, credentials or server-controlled errors to memory.
+        # Never relay gh stderr, credentials or server-controlled errors to memory;
+        # keep only the bounded HTTP-status class (404 vs 429 vs 5xx vs unparseable).
         if result.returncode:
-            raise APIError("github_pr_api_failed")
+            raise APIError(classify_gh_error(result.stderr, result.returncode))
         if len(result.stdout) > 8 * 1024 * 1024:
             raise APIError("github_pr_response_too_large")
         return json.loads(result.stdout)
@@ -290,9 +321,13 @@ class Monitor:
         episode = previous.get("episode", 0)+(signature != previous.get("signature"))
         alerted = previous.get("alerted", False) if signature == previous.get("signature") else False
         if not alerted and (failures or previous.get("failures")):
+            transient = [f for f in failures if retry_warranted(f.rsplit(":", 1)[-1])]
+            permanent = [f for f in failures if not retry_warranted(f.rsplit(":", 1)[-1])]
+            detail = ("retrying " + ", ".join(transient)[:1500] if transient
+                      else "not retrying " + ", ".join(permanent)[:1500]) if failures else ""
             alerted = self.observer.emit("github-pr-health:"+str(episode),
-                "GitHub PR monitor: "+("partial coverage; retrying " + ", ".join(failures)[:1500]
-                                      if failures else "coverage recovered; scans continuing"))
+                "GitHub PR monitor: " + (("partial coverage; " + detail)
+                    if failures else "coverage recovered; scans continuing"))
         self.store.put(PREFIX+"health", {"checked_at": self.now, "tracked": len(inventory),
             "failures": failures, "signature": signature, "episode": episode, "alerted": alerted,
             "pending": sum(bool(self.store.get(PREFIX+"pr:"+k, {}).get("pending")) for k in inventory)})
