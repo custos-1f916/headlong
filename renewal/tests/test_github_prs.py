@@ -266,6 +266,28 @@ class PRTests(MemoryFixture):
         inv = self.state.get(gp.PREFIX+"inventory")
         self.assertEqual(inv["missing/repo#1"]["last_attempt"], 0)
         self.assertEqual(inv["missing/repo#1"]["error"], "github_pr_api_failed")
+    def test_permanent_failure_gets_long_quarantine_backoff(self):
+        # A non-retryable failure (e.g. a 404 on a hidden/renamed object) must be
+        # probed on the long quarantine backoff, not the 15-min transient one, so a
+        # dead org stops burning a scan every cycle. The unblocking event is
+        # unchanged: the target returns 200 again.
+        self.assertEqual(gp.PERMANENT_RETRY, 6 * 3600)
+        self.monitor.inventory("missing/repo", 1, "authored")
+        original = self.api.get
+        def failing(endpoint, **params):
+            if endpoint.startswith("repos/missing/repo"):
+                raise APIError("github_pr_not_found")
+            return original(endpoint, **params)
+        self.api.get = failing
+        self.monitor.run()
+        inv = self.state.get(gp.PREFIX+"inventory")
+        entry = inv["missing/repo#1"]
+        self.assertEqual(entry["error"], "github_pr_not_found")
+        self.assertEqual(entry["retry_at"], self.observer.now + gp.PERMANENT_RETRY)
+        # The permanent entry is held at the long backoff, not the 15-min one; the
+        # successful sibling still advances on success.
+        self.assertNotEqual(entry["retry_at"], self.observer.now + 900)
+        self.assertEqual(inv[self.key]["last_attempt"], self.observer.now)
     def test_discovery_overflow_is_visible_not_a_truncated_success(self):
         original = self.api.get
         def incomplete(endpoint, **params):

@@ -43,6 +43,11 @@ RETRYABLE = frozenset(("github_pr_server_error", "github_pr_rate_limited",
 def retry_warranted(code):
     """True when a recorded error is transient and a retry can clear it."""
     return code in RETRYABLE
+
+# A non-retryable failure (e.g. a 404 on a hidden/renamed object) is probed on
+# this long quarantine backoff instead of the 15-min transient one, so a dead
+# org stops burning a scan every cycle. 6h = two full rotations (~3h each).
+PERMANENT_RETRY = 6 * 3600
 STAGES = ("comments", "reviews", "review_comments", "timeline", "checks", "statuses")
 
 
@@ -307,9 +312,14 @@ class Monitor:
                 break
             except (APIError, ValueError, KeyError, TypeError) as exc:
                 current = self.store.get(PREFIX+"inventory", {})
-                current[key]["retry_at"] = self.now+900
+                code = getattr(exc, "code", type(exc).__name__)
+                # A permanent failure (e.g. a 404 on a hidden/renamed object) is
+                # probed on the long quarantine backoff, not the 15-min transient
+                # one, so a dead org stops burning a scan every cycle. The
+                # unblocking event is unchanged: the target returns 200 again.
+                current[key]["retry_at"] = self.now + (900 if retry_warranted(code) else PERMANENT_RETRY)
                 current[key]["last_error"] = self.now
-                current[key]["error"] = getattr(exc, "code", type(exc).__name__)
+                current[key]["error"] = code
                 current[key]["last_attempt"] = previous_attempt
                 self.store.put(PREFIX+"inventory", current)
         inventory = self.store.get(PREFIX+"inventory", {})
